@@ -45,6 +45,7 @@ constexpr int kMaxJumpableStep = 12288;
 constexpr int kActionScanRange = 1024;
 constexpr int kActionApproachRange = 2048;
 constexpr int kUseStopRange = kActionApproachRange;
+constexpr int kInteractionTimeoutTicks = 6 * kTicsPerSec;
 
 enum ObjectKind
 {
@@ -73,6 +74,12 @@ struct Portal
     int x = 0;
     int y = 0;
     int z = 0;
+    int floorZ = 0;
+    int ceilingZ = 0;
+    int x1 = 0;
+    int y1 = 0;
+    int x2 = 0;
+    int y2 = 0;
     int key = 0;
     int openingWidth = 0;
     int floorDelta = 0;
@@ -85,6 +92,10 @@ struct Portal
     bool jumpable = false;
     bool traversable = false;
     bool locked = false;
+    int wallState = -1;
+    int wallBusy = 0;
+    int sectorState = -1;
+    int sectorBusy = 0;
 };
 
 struct Observation
@@ -220,6 +231,12 @@ static Observation observeWorld()
             portal.x = midX;
             portal.y = midY;
             portal.z = midZ;
+            portal.floorZ = toFloor;
+            portal.ceilingZ = toCeiling;
+            portal.x1 = wallRecord.x;
+            portal.y1 = wallRecord.y;
+            portal.x2 = nextWall.x;
+            portal.y2 = nextWall.y;
             portal.visible = visible;
             portal.openingWidth = openingWidth;
             portal.floorDelta = floorDelta;
@@ -234,6 +251,8 @@ static Observation observeWorld()
                 portal.wallPush = extra.triggerPush != 0;
                 portal.key = extra.key;
                 portal.locked = extra.locked != 0;
+                portal.wallState = extra.state;
+                portal.wallBusy = extra.busy;
             }
             if (sector[portal.to].extra > 0 && sector[portal.to].extra < kMaxXSectors)
             {
@@ -242,6 +261,8 @@ static Observation observeWorld()
                     portal.key = extra.Key;
                 portal.locked = extra.locked != 0;
                 portal.sectorPush = extra.Wallpush != 0;
+                portal.sectorState = extra.state;
+                portal.sectorBusy = extra.busy;
                 if (extra.damageType != 0 || sector[portal.to].type == kSectorDamage)
                 {
                     portal.walkable = false;
@@ -322,11 +343,23 @@ struct LLMapperBot::Impl
             kStructurallyBlocked,
         };
 
+        enum InteractionState
+        {
+            kIdle,
+            kWaiting,
+            kOpening,
+            kOpen,
+            kFailed,
+        };
+
         int id = -1;
         Portal portal;
         int attempts = 0;
         Availability availability = kActionable;
         bool opened = false;
+        InteractionState interaction = kIdle;
+        int interactionStartedTick = -1;
+        int interactionDeadlineTick = -1;
     };
 
     FILE *telemetry = nullptr;
@@ -338,7 +371,7 @@ struct LLMapperBot::Impl
     int stallSeconds = kDefaultStallSeconds;
     int lastObservationTick = -1;
     int lastTrajectoryTick = -1;
-    int lastProgressTick = 0;
+    int lastSemanticProgressTick = 0;
     int lastStateLocation = -1;
     std::string lastStateGoal;
     int lastStateTarget = -1;
@@ -358,6 +391,7 @@ struct LLMapperBot::Impl
     std::set<int> knownKeys;
     std::set<int> seenEdges;
     std::set<int> visitedEdges;
+    std::map<int, int> failedEdges;
     std::set<int> openedRoutes;
     std::map<int, std::vector<Portal>> knownGraph;
     Portal routePortal;
@@ -376,6 +410,7 @@ struct LLMapperBot::Impl
     int movementTargetY = 0;
     int movementTargetSector = -1;
     int movementTargetId = -1;
+    int movementTargetFrom = -1;
     std::string movementTargetGoal;
     int targetLastX = 0;
     int targetLastY = 0;
@@ -389,6 +424,10 @@ struct LLMapperBot::Impl
     int lastUsedDoorFrom = -1;
     int lastUsedDoorTo = -1;
     int lastUsedDoorTick = -1;
+    int portalWaypointWall = -1;
+    int portalWaypointX = 0;
+    int portalWaypointY = 0;
+    bool portalWaypointActive = false;
 
     void openFiles()
     {
@@ -429,6 +468,18 @@ struct LLMapperBot::Impl
         observedSectors.insert(observation.visibleSectors.begin(), observation.visibleSectors.end());
         const int previousSector = lastObservedSector;
         const bool sectorChanged = observation.sector != lastObservedSector;
+        if (sectorChanged && previousSector >= 0 && movementTargetFrom == previousSector
+            && movementTargetSector == observation.sector && movementTargetId >= 0)
+        {
+            const int edgeId = movementTargetId * 65536 + observation.sector;
+            visitedEdges.insert(edgeId);
+            failedEdges.erase(edgeId);
+            char detail[128];
+            snprintf(detail, sizeof(detail), "from=%d to=%d wall=%d", previousSector,
+                     observation.sector, movementTargetId);
+            event("portal_traversed", detail);
+            lastSemanticProgressTick = observation.tick;
+        }
         if (sectorChanged && movementTargetSector == observation.sector)
         {
             movementTargetActive = false;
@@ -440,8 +491,13 @@ struct LLMapperBot::Impl
             && observation.tick - lastUsedDoorTick <= 4 * kTicsPerSec)
         {
             auto door = doors.find(lastUsedDoor);
-            if (door != doors.end() && !door->second.portal.key && !door->second.portal.locked)
+            if (door != doors.end())
             {
+                const bool alreadyOpen = door->second.interaction == DoorMemory::kOpen;
+                door->second.interaction = DoorMemory::kOpen;
+                door->second.interactionDeadlineTick = -1;
+                if (!alreadyOpen)
+                    event("door_open", "response=sector_crossing");
                 visitedEdges.insert(lastUsedDoor * 65536 + lastUsedDoorTo);
                 openedRoutes.insert(lastUsedDoorFrom * 65536 + lastUsedDoorTo);
                 openedRoutes.insert(lastUsedDoorTo * 65536 + lastUsedDoorFrom);
@@ -464,7 +520,7 @@ struct LLMapperBot::Impl
                 snprintf(detail, sizeof(detail), "door=%d from=%d to=%d", lastUsedDoor,
                          lastUsedDoorFrom, lastUsedDoorTo);
                 event("door_traversed", detail);
-                lastProgressTick = observation.tick;
+                lastSemanticProgressTick = observation.tick;
             }
             lastUsedDoor = -1;
         }
@@ -507,7 +563,7 @@ struct LLMapperBot::Impl
         }
         if (observedSectors.size() != oldSectors)
         {
-            lastProgressTick = observation.tick;
+            lastSemanticProgressTick = observation.tick;
             event("discovered_sector");
         }
 
@@ -516,7 +572,14 @@ struct LLMapperBot::Impl
             const int edgeId = portal.wall * 65536 + portal.to;
             const bool newEdge = seenEdges.insert(edgeId).second;
             if (newEdge)
+            {
                 ++knowledgeRevision;
+                lastSemanticProgressTick = observation.tick;
+                char detail[96];
+                snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d", portal.wall,
+                         portal.from, portal.to);
+                event("discovered_frontier", detail);
+            }
             if (portal.traversable || portal.jumpable)
             {
                 auto &edges = knownGraph[portal.from];
@@ -545,7 +608,36 @@ struct LLMapperBot::Impl
                              portal.directUse ? 1 : 0);
                     event("discovered_door", detail);
                 }
+                const Portal previousPortal = door.portal;
+                const bool hadPortal = door.id >= 0;
+                const bool response = hadPortal
+                    && (previousPortal.wallState != portal.wallState
+                        || previousPortal.wallBusy != portal.wallBusy
+                        || previousPortal.sectorState != portal.sectorState
+                        || previousPortal.sectorBusy != portal.sectorBusy
+                        || previousPortal.floorZ != portal.floorZ
+                        || previousPortal.ceilingZ != portal.ceilingZ
+                        || previousPortal.floorDelta != portal.floorDelta
+                        || previousPortal.traversable != portal.traversable);
                 door.portal = portal;
+                if (response && (door.interaction == DoorMemory::kWaiting
+                                 || door.interaction == DoorMemory::kOpening))
+                {
+                    if (door.interaction == DoorMemory::kWaiting)
+                    {
+                        door.interaction = DoorMemory::kOpening;
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "door=%d wall_busy=%d sector_busy=%d",
+                                 portal.wall, portal.wallBusy, portal.sectorBusy);
+                        event("door_opening", detail);
+                    }
+                    lastSemanticProgressTick = observation.tick;
+                    if (!portal.directUse && portal.traversable && !portal.wallBusy && !portal.sectorBusy)
+                    {
+                        door.interaction = DoorMemory::kOpen;
+                        event("door_open", "response=authoritative_traversable");
+                    }
+                }
                 if (portal.key && !hasKey(portal.key))
                     door.availability = DoorMemory::kMissingKey;
                 else if (portal.key || portal.locked || blockedInteractivePortal || portal.traversable)
@@ -566,7 +658,7 @@ struct LLMapperBot::Impl
                 snprintf(detail, sizeof(detail), "sprite=%d kind=%s category=%s sector=%d type=%d",
                          object.sprite, objectName(object.kind), category ? category : "none", object.sector, object.type);
                 event("observed_object", detail);
-                lastProgressTick = observation.tick;
+                lastSemanticProgressTick = observation.tick;
                 ++knowledgeRevision;
             }
         }
@@ -578,7 +670,7 @@ struct LLMapperBot::Impl
                 char detail[64];
                 snprintf(detail, sizeof(detail), "key=%d", key);
                 event("acquired_key", detail);
-                lastProgressTick = observation.tick;
+                lastSemanticProgressTick = observation.tick;
                 ++inventoryRevision;
             }
         }
@@ -586,6 +678,15 @@ struct LLMapperBot::Impl
         for (auto &entry : doors)
         {
             DoorMemory &door = entry.second;
+            if ((door.interaction == DoorMemory::kWaiting || door.interaction == DoorMemory::kOpening)
+                && door.interactionDeadlineTick >= 0 && observation.tick > door.interactionDeadlineTick)
+            {
+                door.interaction = DoorMemory::kFailed;
+                char detail[96];
+                snprintf(detail, sizeof(detail), "door=%d waited_ticks=%d", door.id,
+                         observation.tick - door.interactionStartedTick);
+                event("interaction_failed", detail);
+            }
             if (door.portal.key && hasKey(door.portal.key) && door.availability == DoorMemory::kMissingKey)
             {
                 door.availability = DoorMemory::kActionable;
@@ -602,6 +703,8 @@ struct LLMapperBot::Impl
             if (door != doors.end() && door->second.portal.key && !hasKey(door->second.portal.key))
             {
                 door->second.availability = DoorMemory::kMissingKey;
+                door->second.interaction = DoorMemory::kFailed;
+                event("interaction_failed", "reason=missing_key");
                 char detail[96];
                 snprintf(detail, sizeof(detail), "door=%d key=%d", pendingUse, door->second.portal.key);
                 event("blocked_key_required", detail);
@@ -615,6 +718,12 @@ struct LLMapperBot::Impl
         return key <= 0 || (key < 8 && gMe && gMe->hasKey[key]);
     }
 
+    bool edgeFailed(int edgeId) const
+    {
+        auto failed = failedEdges.find(edgeId);
+        return failed != failedEdges.end() && failed->second == knowledgeRevision;
+    }
+
     const Portal *selectPortal()
     {
         const bool avoidBacktrack = repeatedBacktrackCount >= 2
@@ -623,7 +732,9 @@ struct LLMapperBot::Impl
         {
             for (const Portal &portal : observation.portals)
             {
-                if (portal.wall == currentGoalTarget && (portal.traversable || portal.jumpable)
+                const int edgeId = portal.wall * 65536 + portal.to;
+                if (portal.wall == currentGoalTarget && !edgeFailed(edgeId)
+                    && (portal.traversable || portal.jumpable)
                     && (!portal.key || hasKey(portal.key))
                     && (!avoidBacktrack || portal.to != lastTransitionFrom))
                     return &portal;
@@ -634,7 +745,9 @@ struct LLMapperBot::Impl
             {
                 for (const Portal &portal : known->second)
                 {
-                    if (portal.wall == currentGoalTarget && (!portal.key || hasKey(portal.key))
+                    const int edgeId = portal.wall * 65536 + portal.to;
+                    if (portal.wall == currentGoalTarget && !edgeFailed(edgeId)
+                        && (!portal.key || hasKey(portal.key))
                         && (!avoidBacktrack || portal.to != lastTransitionFrom))
                         return &portal;
                 }
@@ -647,6 +760,7 @@ struct LLMapperBot::Impl
             if ((portal.traversable || portal.jumpable)
                 && (!portal.key || hasKey(portal.key))
                 && !visitedEdges.count(portal.wall * 65536 + portal.to)
+                && !edgeFailed(portal.wall * 65536 + portal.to)
                 && !openedRoutes.count(portal.from * 65536 + portal.to)
                 && (!avoidBacktrack || portal.to != lastTransitionFrom))
             {
@@ -664,6 +778,8 @@ struct LLMapperBot::Impl
             if (avoidBacktrack && portal.to == lastTransitionFrom)
                 continue;
             const int edgeId = portal.wall * 65536 + portal.to;
+            if (edgeFailed(edgeId))
+                continue;
             const bool alreadyExplored = visitedEdges.count(edgeId)
                 || openedRoutes.count(portal.from * 65536 + portal.to);
             if (unvisitedAvailable && alreadyExplored)
@@ -788,6 +904,7 @@ struct LLMapperBot::Impl
         movementTargetY = y;
         movementTargetSector = targetSector;
         movementTargetId = targetId;
+        movementTargetFrom = observation.sector;
         movementTargetGoal = currentGoal;
         targetLastX = observation.x;
         targetLastY = observation.y;
@@ -822,8 +939,6 @@ struct LLMapperBot::Impl
             targetLastY = observation.y;
             targetLastZ = observation.z;
             targetLastProgressTick = observation.tick;
-            if (horizontalProgress || sectorProgress)
-                lastProgressTick = observation.tick;
         }
     }
 
@@ -833,6 +948,55 @@ struct LLMapperBot::Impl
             && observation.tick >= jumpCooldownTick
             && observation.tick - targetLastProgressTick >= kMovementStuckTicks
             && distance2(observation.x, observation.y, movementTargetX, movementTargetY) > 4096;
+    }
+
+    void preparePortalWaypoint(const Portal &portal)
+    {
+        portalWaypointWall = portal.wall;
+        portalWaypointActive = false;
+        portalWaypointX = portal.x;
+        portalWaypointY = portal.y;
+
+        const int dx = portal.x2 - portal.x1;
+        const int dy = portal.y2 - portal.y1;
+        const int length = int(std::sqrt(double(int64_t(dx) * dx + int64_t(dy) * dy)));
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        const int safeHalf = length / 2 - std::max(128, radius + 64);
+        if (safeHalf <= 256 || length <= 0)
+            return;
+
+        const double tangentX = double(dx) / length;
+        const double tangentY = double(dy) / length;
+        const int offset = safeHalf / 2;
+        const int candidates[2] = { offset, -offset };
+        for (int side : candidates)
+        {
+            const int candidateX = portal.x + int(std::lround(tangentX * side));
+            const int candidateY = portal.y + int(std::lround(tangentY * side));
+            if (!cansee(observation.x, observation.y, observation.z, observation.sector,
+                        candidateX, candidateY, observation.z, observation.sector))
+                continue;
+            portalWaypointX = candidateX;
+            portalWaypointY = candidateY;
+            portalWaypointActive = true;
+            return;
+        }
+    }
+
+    GINPUT steerPortal(const Portal &portal)
+    {
+        if (portalWaypointWall != portal.wall)
+            preparePortalWaypoint(portal);
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        if (portalWaypointActive
+            && distance2(observation.x, observation.y, portalWaypointX, portalWaypointY)
+                <= std::max(512, radius * 2) * std::max(512, radius * 2))
+        {
+            portalWaypointActive = false;
+        }
+        const int targetX = portalWaypointActive ? portalWaypointX : portal.x;
+        const int targetY = portalWaypointActive ? portalWaypointY : portal.y;
+        return steerTo(targetX, targetY, false, false, portal.wall, portal.to);
     }
 
     GINPUT steerTo(int x, int y, bool use, bool shoot, int targetId = -1, int targetSector = -1)
@@ -872,6 +1036,21 @@ struct LLMapperBot::Impl
             ++jumpAttempts;
             jumpCooldownTick = observation.tick + kJumpCooldownTicks;
             event("jump_attempt", detail);
+        }
+        else if (currentGoal == "EXPLORE_FRONTIER" && movementTargetActive
+                 && jumpAttempts >= kMaxJumpAttemptsPerTarget && movementTargetId >= 0
+                 && movementTargetSector >= 0)
+        {
+            const int edgeId = movementTargetId * 65536 + movementTargetSector;
+            if (!edgeFailed(edgeId))
+            {
+                failedEdges[edgeId] = knowledgeRevision;
+                char detail[96];
+                snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d attempts=%d",
+                         movementTargetId, movementTargetFrom, movementTargetSector, jumpAttempts);
+                event("frontier_failed", detail);
+            }
+            movementTargetActive = false;
         }
         return input;
     }
@@ -917,32 +1096,50 @@ struct LLMapperBot::Impl
             const bool atDoor = distance2(observation.x, observation.y, door->x, door->y)
                 < kActionApproachRange * kActionApproachRange
                 && std::abs(angleDelta(doorAngle, observation.angle)) < 96;
+            auto doorMemory = doors.find(door->wall);
+            if (doorMemory == doors.end())
+            {
+                setGoal("REVISIT_LOCKED_DOOR", door->wall);
+                return steerPortal(*door);
+            }
+
+            DoorMemory &memory = doorMemory->second;
             const bool missingKey = atDoor && door->key && !hasKey(door->key);
             setGoal(missingKey ? "TRY_LOCKED_DOOR" : "REVISIT_LOCKED_DOOR", door->wall);
+            bool issueUse = false;
             if (atDoor)
             {
-                pendingUse = door->wall;
-                pendingUseTick = observation.tick;
-                ++doors[door->wall].attempts;
-                if (lastDoorActionEventTick < 0
-                    || observation.tick - lastDoorActionEventTick >= kTicsPerSec)
+                const bool waiting = memory.interaction == DoorMemory::kWaiting
+                    || memory.interaction == DoorMemory::kOpening;
+                const bool retryAllowed = memory.interaction == DoorMemory::kIdle
+                    || memory.interaction == DoorMemory::kFailed;
+                if (!waiting && retryAllowed && !(missingKey && memory.attempts > 0))
                 {
+                    memory.interaction = DoorMemory::kWaiting;
+                    memory.interactionStartedTick = observation.tick;
+                    memory.interactionDeadlineTick = observation.tick + kInteractionTimeoutTicks;
+                    ++memory.attempts;
+                    issueUse = true;
                     char detail[160];
                     snprintf(detail, sizeof(detail),
                              "door=%d from=%d sector=%d target_sector=%d key=%d locked=%d wall_push=%d sector_push=%d attempt=%d",
                              door->wall, door->from, observation.sector, door->to, door->key,
                              door->locked ? 1 : 0, door->wallPush ? 1 : 0,
-                             door->sectorPush ? 1 : 0, doors[door->wall].attempts);
+                             door->sectorPush ? 1 : 0, memory.attempts);
+                    event("interaction_started", detail);
+                    event("use_pulse", detail);
+                    event("interaction_waiting", detail);
                     event("door_use_attempt", detail);
                     lastDoorActionEventTick = observation.tick;
+                    pendingUse = door->wall;
+                    pendingUseTick = observation.tick;
+                    lastUsedDoor = door->wall;
+                    lastUsedDoorFrom = door->from;
+                    lastUsedDoorTo = door->to;
+                    lastUsedDoorTick = observation.tick;
                 }
-                lastUsedDoor = door->wall;
-                lastUsedDoorFrom = door->from;
-                lastUsedDoorTo = door->to;
-                lastUsedDoorTick = observation.tick;
             }
-            const bool needsUse = door->directUse || door->key || door->locked;
-            return steerTo(door->x, door->y, needsUse, false, door->wall, door->to);
+            return steerTo(door->x, door->y, issueUse, false, door->wall, door->to);
         }
         if (const Portal *portal = selectPortal())
         {
@@ -956,8 +1153,7 @@ struct LLMapperBot::Impl
                          portal->jumpable ? 1 : 0, portal->openingWidth, portal->floorDelta, portal->clearance);
                 event("frontier_target", detail);
             }
-            visitedEdges.insert(portal->wall * 65536 + portal->to);
-            return steerTo(portal->x, portal->y, false, false, portal->wall, portal->to);
+            return steerPortal(*portal);
         }
 
         // A short deterministic turn-and-walk probe resolves frontiers that
@@ -986,7 +1182,7 @@ struct LLMapperBot::Impl
 
     void detectStall()
     {
-        if (observation.tick - lastProgressTick > stallSeconds * kTicsPerSec)
+        if (observation.tick - lastSemanticProgressTick > stallSeconds * kTicsPerSec)
         {
             result = "STALLED";
             failureReason = "no meaningful world or knowledge progress";
