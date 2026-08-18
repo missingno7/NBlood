@@ -34,6 +34,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "globals.h"
 #include "levels.h"
 #include "map2d.h"
+#include "network.h"
 #include "view.h"
 #include "llmapper/bot/bot.h"
 
@@ -153,6 +154,12 @@ void ctrlGetInput(void)
 {
     if (gLLMapperBot.Enabled() && gGameStarted && gInputMode == INPUT_MODE_0)
     {
+        // In realtime visible mode, the render loop can call ctrlGetInput
+        // before the next network tick is due. Preserve the pending bot input
+        // instead of replacing a one-frame jump/use pulse with a later idle
+        // decision before netGetInput() consumes it.
+        if (!gLLMapperBot.Fast() && totalclock < gNetFifoClock)
+            return;
         gInput = gLLMapperBot.GetInput();
         return;
     }

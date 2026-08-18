@@ -406,6 +406,13 @@ _DEMOPLAYBACK:
                 gNetFifoTail = 0;
                 //memcpy(connectpoint2, aimHeight.connectPoints, sizeof(aimHeight.connectPoints));
                 memcpy(&gGameOptions, &m_gameOptions, sizeof(GAMEOPTIONS));
+                if (strchr(m_gameOptions.zLevelName, '\\')
+                    || strchr(m_gameOptions.zLevelName, '/')
+                    || strchr(m_gameOptions.zLevelName, ':'))
+                {
+                    LOG_F(INFO, "Registering external demo map %s", m_gameOptions.zLevelName);
+                    levelAddUserMap(m_gameOptions.zLevelName);
+                }
                 gGameOptions.nDifficultyQuantity = gGameOptions.nDifficulty;
                 gGameOptions.nDifficultyHealth = gGameOptions.nDifficulty;
                 gSkill = gGameOptions.nDifficulty;

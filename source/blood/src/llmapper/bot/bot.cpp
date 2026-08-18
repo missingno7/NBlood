@@ -860,11 +860,12 @@ struct LLMapperBot::Impl
         {
             char detail[256];
             snprintf(detail, sizeof(detail),
-                     "goal=%s target=%d sector=%d target_sector=%d distance=%d dx=%d dy=%d dz=%d forward=%d turn=%d jump_attempts=%d",
+                     "goal=%s target=%d sector=%d target_sector=%d distance=%d dx=%d dy=%d dz=%d forward=%d turn=%d jump_attempts=%d height=%d cant_jump=%d posture=%d",
                      currentGoal.c_str(), movementTargetId, observation.sector, movementTargetSector,
                      int(std::sqrt(double(distance2(observation.x, observation.y, movementTargetX, movementTargetY)))),
                      observation.x - targetLastX, observation.y - targetLastY, observation.z - targetLastZ,
-                     int(input.forward), int(input.q16turn), jumpAttempts);
+                     int(input.forward), int(input.q16turn), jumpAttempts,
+                     gMe->pXSprite ? gMe->pXSprite->height : -1, gMe->cantJump, gMe->posture);
             event("movement_stuck", detail);
             input.buttonFlags.jump = 1;
             input.forward = 2047;
