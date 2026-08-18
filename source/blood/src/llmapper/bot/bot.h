@@ -31,6 +31,9 @@ public:
     GINPUT GetInput();
     // Called after one real ProcessFrame() has completed.
     void OnFrame();
+    // Called by ProcessInput after the real engine action scan and trigger
+    // dispatch have resolved a gameplay USE pulse.
+    void OnActionResolved(int hit, int target, int extra, bool accepted, int key);
     // Called by the normal level-exit event path.
     void OnLevelExit(int exitType);
     // Called during shutdown/restart to flush telemetry and the demo.

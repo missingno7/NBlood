@@ -36,6 +36,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gib.h"
 #include "globals.h"
 #include "levels.h"
+#include "llmapper/bot/bot.h"
 #include "loadsave.h"
 #include "map2d.h"
 #include "network.h"
@@ -1472,7 +1473,7 @@ void CheckPickUp(PLAYER *pPlayer)
     }
 }
 
-int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
+static int ActionScanTarget(PLAYER *pPlayer, int *a2, int *a3, bool applySideEffects)
 {
     *a2 = 0;
     *a3 = 0;
@@ -1489,7 +1490,7 @@ int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
         case 3:
             *a2 = gHitInfo.hitsprite;
             *a3 = sprite[*a2].extra;
-            if (*a3 > 0 && sprite[*a2].statnum == kStatThing)
+            if (applySideEffects && *a3 > 0 && sprite[*a2].statnum == kStatThing)
             {
                 spritetype *pSprite = &sprite[*a2];
                 XSPRITE *pXSprite = &xsprite[*a3];
@@ -1503,7 +1504,7 @@ int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
             }
             if (*a3 > 0 && xsprite[*a3].Push)
                 return 3;
-            if (sprite[*a2].statnum == kStatDude)
+            if (applySideEffects && sprite[*a2].statnum == kStatDude)
             {
                 spritetype *pSprite = &sprite[*a2];
                 XSPRITE *pXSprite = &xsprite[*a3];
@@ -1547,6 +1548,16 @@ int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
     if (*a3 > 0 && xsector[*a3].Push)
         return 6;
     return -1;
+}
+
+int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
+{
+    return ActionScanTarget(pPlayer, a2, a3, true);
+}
+
+int ActionScanPreview(PLAYER *pPlayer, int *a2, int *a3)
+{
+    return ActionScanTarget(pPlayer, a2, a3, false);
 }
 
 inline void playerDropHand(PLAYER *pPlayer)
@@ -1746,20 +1757,25 @@ void ProcessInput(PLAYER *pPlayer)
     {
         int a2, a3;
         int hit = ActionScan(pPlayer, &a2, &a3);
+        bool accepted = false;
+        int key = 0;
         switch (hit)
         {
         case 6:
             if (a3 > 0 && a3 < kMaxXSectors)
             {
                 XSECTOR *pXSector = &xsector[a3];
-                int key = pXSector->Key;
+                key = pXSector->Key;
                 if (pXSector->locked && pPlayer == gMe)
                 {
                     viewSetMessage("It's locked");
                     sndStartSample(3062, 255, 2, 0);
                 }
                 if (!key || pPlayer->hasKey[key])
+                {
+                    accepted = true;
                     trTriggerSector(a2, pXSector, kCmdSpritePush, pPlayer->nSprite);
+                }
                 else if (pPlayer == gMe)
                 {
                     viewSetMessage("That requires a key.");
@@ -1770,7 +1786,7 @@ void ProcessInput(PLAYER *pPlayer)
         case 0:
         {
             XWALL *pXWall = &xwall[a3];
-            int key = pXWall->key;
+            key = pXWall->key;
             if (pXWall->locked && pPlayer == gMe)
             {
                 viewSetMessage("It's locked");
@@ -1778,6 +1794,7 @@ void ProcessInput(PLAYER *pPlayer)
             }
             if (!key || pPlayer->hasKey[key])
             {
+                accepted = true;
                 trTriggerWall(a2, pXWall, kCmdWallPush, pPlayer->nSprite);
             }
             else if (pPlayer == gMe)
@@ -1790,11 +1807,14 @@ void ProcessInput(PLAYER *pPlayer)
         case 3:
         {
             XSPRITE *pXSprite = &xsprite[a3];
-            int key = pXSprite->key;
+            key = pXSprite->key;
             if (pXSprite->locked && pPlayer == gMe && pXSprite->lockMsg)
                 trTextOver(pXSprite->lockMsg);
             if (!key || pPlayer->hasKey[key])
+            {
+                accepted = true;
                 trTriggerSprite(a2, pXSprite, kCmdSpritePush, pPlayer->nSprite);
+            }
             else if (pPlayer == gMe)
             {
                 viewSetMessage("That requires a key.");
@@ -1803,6 +1823,8 @@ void ProcessInput(PLAYER *pPlayer)
             break;
         }
         }
+        if (pPlayer == gMe)
+            gLLMapperBot.OnActionResolved(hit, a2, a3, accepted, key);
         if (pPlayer->handTime > 0)
             pPlayer->handTime = ClipLow(pPlayer->handTime-kTicsPerFrame*(6-gGameOptions.nDifficulty), 0);
         if (pPlayer->handTime <= 0 && pPlayer->hand) // if hand enemy successfully thrown off

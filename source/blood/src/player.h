@@ -343,6 +343,7 @@ char        PickupWeapon(PLAYER *pPlayer, spritetype *pWeapon);
 void        PickUp(PLAYER *pPlayer, spritetype *pSprite);
 void        CheckPickUp(PLAYER *pPlayer);
 int         ActionScan(PLAYER *pPlayer, int *a2, int *a3);
+int         ActionScanPreview(PLAYER *pPlayer, int *a2, int *a3);
 void        ProcessInput(PLAYER *pPlayer);
 void        playerProcess(PLAYER *pPlayer);
 spritetype *playerFireMissile(PLAYER *pPlayer, int a2, int a3, int a4, int a5, int a6);

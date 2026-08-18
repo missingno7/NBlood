@@ -104,6 +104,7 @@ struct Portal
     int clearance = 0;
     bool wallPush = false;
     bool sectorPush = false;
+    bool sectorPushCurrent = false;
     bool directUse = false;
     bool visible = false;
     bool localGeometry = false;
@@ -372,14 +373,16 @@ static Observation observeWorld()
                     portal.capability = kTraversalCurrentlyUnavailable;
                 }
             }
-            portal.interactionAffordance = portal.wallPush || portal.sectorPush;
+            if (sector[portal.from].extra > 0 && sector[portal.from].extra < kMaxXSectors)
+                portal.sectorPushCurrent = xsector[sector[portal.from].extra].Push != 0;
+            portal.interactionAffordance = portal.wallPush || portal.sectorPush || portal.sectorPushCurrent;
             portal.currentlyAvailable = portal.traversable || portal.interactionAffordance;
             if (!portal.currentlyAvailable)
             {
                 portal.capability = kTraversalCurrentlyUnavailable;
                 portal.unavailableReason = (wallRecord.cstat & 1) ? 1 : 2;
             }
-            portal.directUse = (portal.wallPush || portal.sectorPush)
+            portal.directUse = (portal.wallPush || portal.sectorPush || portal.sectorPushCurrent)
                 && (!portal.traversable || std::abs(portal.floorDelta) > kMaxWalkableStep);
 
             if (!visible && !portal.traversable)
@@ -472,6 +475,7 @@ struct LLMapperBot::Impl
         InteractionState interaction = kIdle;
         int interactionStartedTick = -1;
         int interactionDeadlineTick = -1;
+        int unavailableFromSector = -1;
     };
 
     FILE *telemetry = nullptr;
@@ -540,6 +544,9 @@ struct LLMapperBot::Impl
     int jumpAttempts = 0;
     int searchAngle = -1;
     int lastDoorActionEventTick = -1;
+    int lastUseProbeDoor = -1;
+    int lastUseProbeTick = -1;
+    std::string lastUseProbeStatus;
     int lastUsedDoor = -1;
     int lastUsedDoorFrom = -1;
     int lastUsedDoorTo = -1;
@@ -567,6 +574,17 @@ struct LLMapperBot::Impl
             fprintf(telemetry, ",\"detail\":\"%s\"", detail);
         fprintf(telemetry, "}\n");
         fflush(telemetry);
+    }
+
+    void actionResolved(int hit, int target, int extra, bool accepted, int key)
+    {
+        const char *kind = hit == 0 ? "wall" : hit == 3 ? "sprite" : hit == 6 ? "sector" : "none";
+        char detail[256];
+        snprintf(detail, sizeof(detail),
+                 "source=gameplay_tick hit=%d kind=%s target=%d extra=%d trigger_dispatched=%d key=%d goal=%s selected_door=%d",
+                 hit, kind, target, extra, accepted ? 1 : 0, key,
+                 currentGoal.c_str(), selectedDoorId);
+        event("engine_use_resolved", detail);
     }
 
     void trajectorySample()
@@ -619,6 +637,26 @@ struct LLMapperBot::Impl
                      observation.sector, movementTargetId);
             event("portal_traversed", detail);
             lastSemanticProgressTick = observation.tick;
+        }
+        if (sectorChanged && previousSector >= 0 && movementTargetId >= 0)
+        {
+            auto door = doors.find(movementTargetId);
+            if (door != doors.end() && door->second.portal.interactionAffordance
+                && door->second.portal.from == previousSector
+                && door->second.portal.to == observation.sector)
+            {
+                const bool usedRecently = lastUsedDoor == movementTargetId
+                    && lastUsedDoorFrom == previousSector
+                    && lastUsedDoorTo == observation.sector
+                    && observation.tick - lastUsedDoorTick <= 4 * kTicsPerSec;
+                if (!usedRecently)
+                {
+                    door->second.opened = true;
+                    door->second.interaction = DoorMemory::kOpen;
+                    door->second.unavailableFromSector = -1;
+                    event("door_open", "response=authoritative_traversable_without_use");
+                }
+            }
         }
         if (sectorChanged && movementTargetSector == observation.sector)
         {
@@ -780,9 +818,13 @@ struct LLMapperBot::Impl
                         event("door_open", "response=authoritative_traversable");
                     }
                 }
+                const bool unavailableFromThisSide = door.unavailableFromSector == observation.sector
+                    && portal.from == observation.sector;
                 const DoorMemory::Availability oldAvailability = door.availability;
                 if (portal.key && !hasKey(portal.key))
                     door.availability = DoorMemory::kMissingKey;
+                else if (unavailableFromThisSide)
+                    door.availability = DoorMemory::kCurrentlyUnavailable;
                 else if (portal.key || portal.locked || blockedInteractivePortal || portal.traversable)
                     door.availability = DoorMemory::kActionable;
                 else
@@ -837,8 +879,8 @@ struct LLMapperBot::Impl
                 && door.interactionDeadlineTick >= 0 && observation.tick > door.interactionDeadlineTick)
             {
                 door.interaction = DoorMemory::kFailed;
-                char detail[96];
-                snprintf(detail, sizeof(detail), "door=%d waited_ticks=%d", door.id,
+                char detail[144];
+                snprintf(detail, sizeof(detail), "door=%d waited_ticks=%d reason=INTERACTION_VALID_BUT_NO_RESPONSE", door.id,
                          observation.tick - door.interactionStartedTick);
                 event("interaction_failed", detail);
             }
@@ -1109,6 +1151,38 @@ struct LLMapperBot::Impl
             event("ranged_weapon_selected", detail);
         }
         return input;
+    }
+
+    bool actionTargetMatches(const Portal &portal, int hit, int target) const
+    {
+        if (portal.wallPush && hit == 0 && target == portal.wall)
+            return true;
+        if (portal.sectorPush && hit == 6 && target == portal.to)
+            return true;
+        if (portal.sectorPushCurrent && hit == 6 && target == portal.from)
+            return true;
+        return false;
+    }
+
+    void emitUseProbe(const Portal &portal, const DoorMemory &memory, bool atDoor,
+                      int hit, int target, int extra, const char *status)
+    {
+        if (lastUseProbeDoor == portal.wall && lastUseProbeStatus == status
+            && observation.tick - lastUseProbeTick < kTicsPerSec)
+            return;
+        lastUseProbeDoor = portal.wall;
+        lastUseProbeTick = observation.tick;
+        lastUseProbeStatus = status;
+        const int targetAngle = getangle(portal.x - observation.x, portal.y - observation.y);
+        char detail[320];
+        snprintf(detail, sizeof(detail),
+                 "status=%s at_door=%d goal=%s selected_door=%d expected_wall=%d expected_from=%d expected_sector=%d expected_wall_push=%d expected_sector_push=%d expected_current_sector_push=%d hit=%d target=%d extra=%d distance=%d angle_delta=%d key=%d locked=%d interaction=%d attempts=%d",
+                 status, atDoor ? 1 : 0, currentGoal.c_str(), selectedDoorId, portal.wall, portal.from, portal.to, portal.wallPush ? 1 : 0,
+                 portal.sectorPush ? 1 : 0, portal.sectorPushCurrent ? 1 : 0, hit, target, extra,
+                 int(std::sqrt(double(distance2(observation.x, observation.y, portal.x, portal.y)))),
+                 angleDelta(targetAngle, observation.angle), portal.key, portal.locked ? 1 : 0,
+                 int(memory.interaction), memory.attempts);
+        event("use_probe", detail);
     }
 
     const Portal *selectKnownDoor()
@@ -1496,20 +1570,67 @@ struct LLMapperBot::Impl
         }
         if (const Portal *door = selectKnownDoor())
         {
-            const int doorAngle = getangle(door->x - observation.x, door->y - observation.y);
-            const bool atDoor = distance2(observation.x, observation.y, door->x, door->y)
-                < kActionApproachRange * kActionApproachRange
-                && std::abs(angleDelta(doorAngle, observation.angle)) < 96;
-            auto doorMemory = doors.find(door->wall);
+            const int actualDoorId = selectedDoorId;
+            auto doorMemory = doors.find(actualDoorId);
             if (doorMemory == doors.end())
             {
-                setGoal("REVISIT_LOCKED_DOOR", door->wall);
+                setGoal("NAVIGATE_TO_DOOR", actualDoorId);
                 return steerPortal(*door);
             }
 
             DoorMemory &memory = doorMemory->second;
-            const bool missingKey = atDoor && door->key && !hasKey(door->key);
-            setGoal(missingKey ? "TRY_LOCKED_DOOR" : "REVISIT_LOCKED_DOOR", door->wall);
+            // selectKnownDoor() may return an intermediate route portal. Do
+            // not probe or mutate the route as if it were the remembered
+            // interaction target; only the actual selected door may receive
+            // a USE pulse.
+            if (door->wall != actualDoorId)
+            {
+                setGoal("NAVIGATE_TO_DOOR", actualDoorId);
+                return steerPortal(*door);
+            }
+
+            const Portal &expected = memory.portal;
+            int hit = -1;
+            int target = -1;
+            int extra = -1;
+            hit = ActionScanPreview(gMe, &target, &extra);
+            const bool atDoor = actionTargetMatches(expected, hit, target);
+            const int expectedAngle = getangle(expected.x - observation.x, expected.y - observation.y);
+            const int expectedDistance = distance2(observation.x, observation.y, expected.x, expected.y);
+            const bool missingKey = atDoor && expected.key && !hasKey(expected.key);
+            const char *probeStatus = nullptr;
+            if (memory.interaction == DoorMemory::kWaiting
+                || memory.interaction == DoorMemory::kOpening)
+                probeStatus = "OPENING";
+            else if (memory.interaction == DoorMemory::kOpen)
+                probeStatus = "OPEN";
+            else if (missingKey)
+                probeStatus = "LOCKED_KEY_REQUIRED";
+            else if (atDoor)
+                probeStatus = "VALID_ACTION_TARGET";
+            else if (expectedDistance > kActionScanRange * kActionScanRange)
+                probeStatus = "NOT_IN_USE_RANGE";
+            else if (std::abs(angleDelta(expectedAngle, observation.angle)) >= 96)
+                probeStatus = "NOT_FACING_ACTION_TARGET";
+            else
+                probeStatus = "NO_ACTION_TARGET";
+
+            if (probeStatus == std::string("NO_ACTION_TARGET")
+                && expectedDistance <= kActionScanRange * kActionScanRange
+                && std::abs(angleDelta(expectedAngle, observation.angle)) < 96)
+            {
+                memory.availability = DoorMemory::kCurrentlyUnavailable;
+                memory.unavailableReason = 3;
+                memory.unavailableFromSector = observation.sector;
+                probeStatus = "CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE";
+                char detail[128];
+                snprintf(detail, sizeof(detail), "wall=%d reason=CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE affordance=1",
+                         expected.wall);
+                event("portal_unavailable", detail);
+            }
+            emitUseProbe(expected, memory, atDoor, hit, target, extra, probeStatus);
+
+            setGoal(missingKey ? "TRY_LOCKED_DOOR" : "REVISIT_LOCKED_DOOR", expected.wall);
             bool issueUse = false;
             if (atDoor)
             {
@@ -1527,23 +1648,23 @@ struct LLMapperBot::Impl
                     char detail[160];
                     snprintf(detail, sizeof(detail),
                              "door=%d from=%d sector=%d target_sector=%d key=%d locked=%d wall_push=%d sector_push=%d attempt=%d",
-                             door->wall, door->from, observation.sector, door->to, door->key,
-                             door->locked ? 1 : 0, door->wallPush ? 1 : 0,
-                             door->sectorPush ? 1 : 0, memory.attempts);
+                             expected.wall, expected.from, observation.sector, expected.to, expected.key,
+                             expected.locked ? 1 : 0, expected.wallPush ? 1 : 0,
+                             expected.sectorPush ? 1 : 0, memory.attempts);
                     event("interaction_started", detail);
                     event("use_pulse", detail);
                     event("interaction_waiting", detail);
                     event("door_use_attempt", detail);
                     lastDoorActionEventTick = observation.tick;
-                    pendingUse = door->wall;
+                    pendingUse = expected.wall;
                     pendingUseTick = observation.tick;
-                    lastUsedDoor = door->wall;
-                    lastUsedDoorFrom = door->from;
-                    lastUsedDoorTo = door->to;
+                    lastUsedDoor = expected.wall;
+                    lastUsedDoorFrom = expected.from;
+                    lastUsedDoorTo = expected.to;
                     lastUsedDoorTick = observation.tick;
                 }
             }
-            return steerTo(door->x, door->y, issueUse, false, door->wall, door->to);
+            return steerTo(expected.x, expected.y, issueUse, false, expected.wall, expected.to);
         }
         if (const Portal *localPortal = selectLocalPortal())
         {
@@ -1775,6 +1896,12 @@ void LLMapperBot::OnFrame()
         m_impl->event("failure", m_impl->failureReason.c_str());
         gQuitGame = true;
     }
+}
+
+void LLMapperBot::OnActionResolved(int hit, int target, int extra, bool accepted, int key)
+{
+    if (m_enabled)
+        m_impl->actionResolved(hit, target, extra, accepted, key);
 }
 
 void LLMapperBot::OnLevelExit(int exitType)
