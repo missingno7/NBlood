@@ -19,6 +19,7 @@
 
 #include "build.h"
 #include "common_game.h"
+#include "config.h"
 #include "db.h"
 #include "demo.h"
 #include "gameutil.h"
@@ -28,6 +29,17 @@
 #include "player.h"
 #include "trig.h"
 #include "triggers.h"
+
+enum TraversalCapability
+{
+    kTraversalUnknown,
+    kTraversalWalkable,
+    kTraversalJumpable,
+    kTraversalCrouchable,
+    kTraversalDropSafe,
+    kTraversalInteractionBlocked,
+    kTraversalCurrentlyUnavailable,
+};
 
 namespace
 {
@@ -41,7 +53,6 @@ constexpr int kMaxJumpAttemptsPerTarget = 3;
 constexpr int kPlayerPassageWidth = 384;
 constexpr int kPlayerStandingClearance = 5632;
 constexpr int kMaxWalkableStep = 4096;
-constexpr int kMaxJumpableStep = 12288;
 constexpr int kActionScanRange = 1024;
 constexpr int kActionApproachRange = 2048;
 constexpr int kUseStopRange = kActionApproachRange;
@@ -76,6 +87,13 @@ struct Portal
     int z = 0;
     int floorZ = 0;
     int ceilingZ = 0;
+    int fromFloorZ = 0;
+    int fromCeilingZ = 0;
+    int toFloorZ = 0;
+    int toCeilingZ = 0;
+    int crouchClearance = 0;
+    int jumpRiseLimit = 0;
+    int dropLimit = 0;
     int x1 = 0;
     int y1 = 0;
     int x2 = 0;
@@ -88,10 +106,17 @@ struct Portal
     bool sectorPush = false;
     bool directUse = false;
     bool visible = false;
+    bool localGeometry = false;
     bool walkable = false;
     bool jumpable = false;
+    bool crouchable = false;
+    bool dropSafe = false;
     bool traversable = false;
     bool locked = false;
+    bool interactionAffordance = false;
+    bool currentlyAvailable = false;
+    TraversalCapability capability = kTraversalUnknown;
+    int unavailableReason = 0;
     int wallState = -1;
     int wallBusy = 0;
     int sectorState = -1;
@@ -108,6 +133,15 @@ struct Observation
     int angle = 0;
     int health = 0;
     bool exitHere = false;
+    int localPortalCount = 0;
+    int localJumpableCount = 0;
+    int localMaxRise = 0;
+    int localMaxDrop = 0;
+    int localClearance = 0;
+    int localSectorExtra = 0;
+    int localSectorState = 0;
+    int localSectorBusy = 0;
+    int playerZVelocity = 0;
     std::vector<int> visibleSectors;
     std::vector<Portal> portals;
     std::vector<VisibleObject> objects;
@@ -156,6 +190,28 @@ static bool validXSprite(int extra)
     return extra > 0 && extra < kMaxXSprites;
 }
 
+static int playerJumpRiseLimit()
+{
+    if (!gMe)
+        return 0;
+    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+    // Blood applies normalJumpZ as the initial vertical velocity. This
+    // scale-derived bound is deliberately conservative and replaces a
+    // generic "stuck means jump" fallback.
+    return std::max(kMaxWalkableStep, std::abs(stand.normalJumpZ) >> 6);
+}
+
+static int playerCrouchClearance()
+{
+    if (!gMe)
+        return kPlayerStandingClearance * 2 / 3;
+    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+    const POSTURE &crouch = gMe->pPosture[gMe->lifeMode][kPostureCrouch];
+    if (stand.eyeAboveZ <= 0)
+        return kPlayerStandingClearance * 2 / 3;
+    return std::max(1, kPlayerStandingClearance * crouch.eyeAboveZ / stand.eyeAboveZ);
+}
+
 static const char *itemCategory(int type)
 {
     if (type >= kItemWeaponBase && type < kItemWeaponMax)
@@ -196,6 +252,15 @@ static Observation observeWorld()
     if (inRange(result.sector, 0, numsectors))
     {
         const sectortype &current = sector[result.sector];
+        result.localSectorExtra = current.extra;
+        if (current.extra > 0 && current.extra < kMaxXSectors)
+        {
+            result.localSectorState = xsector[current.extra].state;
+            result.localSectorBusy = xsector[current.extra].busy;
+        }
+        result.playerZVelocity = zvel[player->index];
+        result.localClearance = getflorzofslope(result.sector, result.x, result.y)
+            - getceilzofslope(result.sector, result.x, result.y);
         if (current.extra > 0 && current.extra < kMaxXSectors && xsector[current.extra].Exit)
             result.exitHere = true;
 
@@ -205,6 +270,7 @@ static Observation observeWorld()
             const walltype &wallRecord = wall[wallIndex];
             if (!inRange(wallRecord.nextsector, 0, numsectors))
                 continue;
+            ++result.localPortalCount;
 
             const walltype &nextWall = wall[wallRecord.point2];
             const int midX = (wallRecord.x + nextWall.x) / 2;
@@ -216,10 +282,28 @@ static Observation observeWorld()
             const int openingWidth = int(std::sqrt(double(distance2(wallRecord.x, wallRecord.y, nextWall.x, nextWall.y))));
             const int clearance = std::min(fromFloor - fromCeiling, toFloor - toCeiling);
             const int floorDelta = toFloor - fromFloor;
+            const int crouchClearance = playerCrouchClearance();
+            const int jumpRiseLimit = playerJumpRiseLimit();
+            const int dropLimit = jumpRiseLimit;
             const bool enoughWidth = openingWidth >= kPlayerPassageWidth;
-            const bool enoughClearance = clearance >= kPlayerStandingClearance;
-            const bool walkable = enoughWidth && enoughClearance && std::abs(floorDelta) <= kMaxWalkableStep;
-            const bool jumpable = enoughWidth && enoughClearance && std::abs(floorDelta) <= kMaxJumpableStep;
+            const bool standingClearance = clearance >= kPlayerStandingClearance;
+            const bool crouchingClearance = clearance >= crouchClearance;
+            const bool walkable = enoughWidth && standingClearance && std::abs(floorDelta) <= kMaxWalkableStep;
+            const bool crouchable = enoughWidth && !standingClearance && crouchingClearance
+                && std::abs(floorDelta) <= kMaxWalkableStep;
+            const bool upward = floorDelta < 0;
+            const bool downward = floorDelta > 0;
+            const bool jumpable = enoughWidth && standingClearance && upward
+                && -floorDelta <= jumpRiseLimit;
+            const bool dropSafe = enoughWidth && standingClearance && downward
+                && floorDelta <= dropLimit;
+            if (jumpable && !(wallRecord.cstat & 1))
+            {
+                ++result.localJumpableCount;
+                result.localMaxRise = std::max(result.localMaxRise, -floorDelta);
+            }
+            if (downward)
+                result.localMaxDrop = std::max(result.localMaxDrop, floorDelta);
             const int midZ = fromFloor;
             const bool visible = cansee(result.x, result.y, result.z, result.sector,
                                          midX, midY, midZ, wallRecord.nextsector);
@@ -233,6 +317,13 @@ static Observation observeWorld()
             portal.z = midZ;
             portal.floorZ = toFloor;
             portal.ceilingZ = toCeiling;
+            portal.fromFloorZ = fromFloor;
+            portal.fromCeilingZ = fromCeiling;
+            portal.toFloorZ = toFloor;
+            portal.toCeilingZ = toCeiling;
+            portal.crouchClearance = crouchClearance;
+            portal.jumpRiseLimit = jumpRiseLimit;
+            portal.dropLimit = dropLimit;
             portal.x1 = wallRecord.x;
             portal.y1 = wallRecord.y;
             portal.x2 = nextWall.x;
@@ -241,9 +332,17 @@ static Observation observeWorld()
             portal.openingWidth = openingWidth;
             portal.floorDelta = floorDelta;
             portal.clearance = clearance;
-            portal.walkable = visible && !(wallRecord.cstat & 1) && walkable;
-            portal.jumpable = visible && !(wallRecord.cstat & 1) && !walkable && jumpable;
-            portal.traversable = portal.walkable;
+            portal.localGeometry = !visible;
+            portal.walkable = !(wallRecord.cstat & 1) && walkable;
+            portal.jumpable = !(wallRecord.cstat & 1) && !walkable && jumpable;
+            portal.crouchable = !(wallRecord.cstat & 1) && crouchable;
+            portal.dropSafe = !(wallRecord.cstat & 1) && dropSafe;
+            portal.traversable = portal.walkable || portal.crouchable || portal.jumpable || portal.dropSafe;
+            portal.capability = portal.walkable ? kTraversalWalkable
+                : portal.crouchable ? kTraversalCrouchable
+                : portal.jumpable ? kTraversalJumpable
+                : portal.dropSafe ? kTraversalDropSafe
+                : kTraversalCurrentlyUnavailable;
             portal.locked = false;
             if (wallRecord.extra > 0 && wallRecord.extra < kMaxXWalls)
             {
@@ -267,15 +366,26 @@ static Observation observeWorld()
                 {
                     portal.walkable = false;
                     portal.jumpable = false;
+                    portal.crouchable = false;
+                    portal.dropSafe = false;
                     portal.traversable = false;
+                    portal.capability = kTraversalCurrentlyUnavailable;
                 }
+            }
+            portal.interactionAffordance = portal.wallPush || portal.sectorPush;
+            portal.currentlyAvailable = portal.traversable || portal.interactionAffordance;
+            if (!portal.currentlyAvailable)
+            {
+                portal.capability = kTraversalCurrentlyUnavailable;
+                portal.unavailableReason = (wallRecord.cstat & 1) ? 1 : 2;
             }
             portal.directUse = (portal.wallPush || portal.sectorPush)
                 && (!portal.traversable || std::abs(portal.floorDelta) > kMaxWalkableStep);
 
-            if (!visible)
+            if (!visible && !portal.traversable)
                 continue;
-            appendUnique(result.visibleSectors, portal.to);
+            if (visible)
+                appendUnique(result.visibleSectors, portal.to);
             result.portals.push_back(portal);
         }
     }
@@ -341,6 +451,7 @@ struct LLMapperBot::Impl
             kActionable,
             kMissingKey,
             kStructurallyBlocked,
+            kCurrentlyUnavailable,
         };
 
         enum InteractionState
@@ -357,6 +468,7 @@ struct LLMapperBot::Impl
         int attempts = 0;
         Availability availability = kActionable;
         bool opened = false;
+        int unavailableReason = 0;
         InteractionState interaction = kIdle;
         int interactionStartedTick = -1;
         int interactionDeadlineTick = -1;
@@ -389,16 +501,22 @@ struct LLMapperBot::Impl
     std::map<int, DoorMemory> doors;
     std::set<int> knownObjects;
     std::set<int> knownKeys;
+    std::set<int> unreachableObjects;
+    std::set<int> unreachableEnemies;
     std::set<int> seenEdges;
     std::set<int> visitedEdges;
     std::map<int, int> failedEdges;
     std::set<int> openedRoutes;
     std::map<int, std::vector<Portal>> knownGraph;
     Portal routePortal;
+    Portal localJumpPortal;
     int selectedDoorId = -1;
     int knowledgeRevision = 0;
     int inventoryRevision = 0;
     int lastObservedSector = -1;
+    int lastGeometryTelemetrySector = -1;
+    bool localDynamicJumpAttempted = false;
+    int localDynamicJumpUntilTick = -1;
     int lastTransitionFrom = -1;
     int lastTransitionTo = -1;
     int lastTransitionKnowledge = -1;
@@ -411,10 +529,12 @@ struct LLMapperBot::Impl
     int movementTargetSector = -1;
     int movementTargetId = -1;
     int movementTargetFrom = -1;
+    TraversalCapability movementTargetCapability = kTraversalUnknown;
     std::string movementTargetGoal;
     int targetLastX = 0;
     int targetLastY = 0;
     int targetLastZ = 0;
+    int targetLastDistance2 = 0;
     int targetLastProgressTick = 0;
     int jumpCooldownTick = 0;
     int jumpAttempts = 0;
@@ -428,6 +548,7 @@ struct LLMapperBot::Impl
     int portalWaypointX = 0;
     int portalWaypointY = 0;
     bool portalWaypointActive = false;
+    bool crouchTargetActive = false;
 
     void openFiles()
     {
@@ -464,10 +585,29 @@ struct LLMapperBot::Impl
         observation = observeWorld();
         if (observation.sector < 0)
             return;
+        if (observation.sector != lastGeometryTelemetrySector)
+        {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "sector=%d clearance=%d portals=%d jumpable=%d max_rise=%d max_drop=%d xsector=%d state=%d busy=%d zvel=%d",
+                     observation.sector, observation.localClearance, observation.localPortalCount,
+                     observation.localJumpableCount, observation.localMaxRise, observation.localMaxDrop,
+                     observation.localSectorExtra, observation.localSectorState,
+                     observation.localSectorBusy, observation.playerZVelocity);
+            event("local_geometry", detail);
+            lastGeometryTelemetrySector = observation.sector;
+        }
         const size_t oldSectors = observedSectors.size();
         observedSectors.insert(observation.visibleSectors.begin(), observation.visibleSectors.end());
         const int previousSector = lastObservedSector;
         const bool sectorChanged = observation.sector != lastObservedSector;
+        if (sectorChanged)
+        {
+            localDynamicJumpAttempted = false;
+            localDynamicJumpUntilTick = -1;
+        }
+        if (observation.localSectorBusy != 0 && observation.playerZVelocity != 0)
+            localDynamicJumpUntilTick = observation.tick + 4 * kTicsPerSec;
         if (sectorChanged && previousSector >= 0 && movementTargetFrom == previousSector
             && movementTargetSector == observation.sector && movementTargetId >= 0)
         {
@@ -569,6 +709,8 @@ struct LLMapperBot::Impl
 
         for (const Portal &portal : observation.portals)
         {
+            if (portal.localGeometry)
+                continue;
             const int edgeId = portal.wall * 65536 + portal.to;
             const bool newEdge = seenEdges.insert(edgeId).second;
             if (newEdge)
@@ -592,7 +734,7 @@ struct LLMapperBot::Impl
                 else
                     *edge = portal;
             }
-            const bool blockedInteractivePortal = portal.directUse;
+            const bool blockedInteractivePortal = portal.interactionAffordance;
             if (portal.key || portal.locked || blockedInteractivePortal
                 || (!portal.traversable && !portal.jumpable))
             {
@@ -638,12 +780,25 @@ struct LLMapperBot::Impl
                         event("door_open", "response=authoritative_traversable");
                     }
                 }
+                const DoorMemory::Availability oldAvailability = door.availability;
                 if (portal.key && !hasKey(portal.key))
                     door.availability = DoorMemory::kMissingKey;
                 else if (portal.key || portal.locked || blockedInteractivePortal || portal.traversable)
                     door.availability = DoorMemory::kActionable;
                 else
-                    door.availability = DoorMemory::kStructurallyBlocked;
+                {
+                    door.availability = DoorMemory::kCurrentlyUnavailable;
+                    door.unavailableReason = portal.unavailableReason;
+                }
+                if (door.availability == DoorMemory::kCurrentlyUnavailable
+                    && oldAvailability != DoorMemory::kCurrentlyUnavailable)
+                {
+                    char detail[96];
+                    snprintf(detail, sizeof(detail), "wall=%d reason=%d affordance=%d",
+                             portal.wall, portal.unavailableReason,
+                             portal.interactionAffordance ? 1 : 0);
+                    event("portal_unavailable", detail);
+                }
             }
         }
 
@@ -732,6 +887,8 @@ struct LLMapperBot::Impl
         {
             for (const Portal &portal : observation.portals)
             {
+                if (!portal.visible)
+                    continue;
                 const int edgeId = portal.wall * 65536 + portal.to;
                 if (portal.wall == currentGoalTarget && !edgeFailed(edgeId)
                     && (portal.traversable || portal.jumpable)
@@ -757,6 +914,8 @@ struct LLMapperBot::Impl
         bool unvisitedAvailable = false;
         for (const Portal &portal : observation.portals)
         {
+            if (!portal.visible)
+                continue;
             if ((portal.traversable || portal.jumpable)
                 && (!portal.key || hasKey(portal.key))
                 && !visitedEdges.count(portal.wall * 65536 + portal.to)
@@ -773,6 +932,8 @@ struct LLMapperBot::Impl
         int bestDistance = INT32_MAX;
         for (const Portal &portal : observation.portals)
         {
+            if (!portal.visible)
+                continue;
             if (!(portal.traversable || portal.jumpable) || (portal.key && !hasKey(portal.key)))
                 continue;
             if (avoidBacktrack && portal.to == lastTransitionFrom)
@@ -789,6 +950,30 @@ struct LLMapperBot::Impl
             {
                 best = &portal;
                 bestDistance = score;
+            }
+        }
+        return best;
+    }
+
+    const Portal *selectLocalPortal()
+    {
+        const Portal *best = nullptr;
+        int bestDistance = INT32_MAX;
+        for (const Portal &portal : observation.portals)
+        {
+            if (!portal.localGeometry || !portal.traversable)
+                continue;
+            const int edgeId = portal.wall * 65536 + portal.to;
+            if (edgeFailed(edgeId) || visitedEdges.count(edgeId)
+                || openedRoutes.count(portal.from * 65536 + portal.to)
+                || portal.to == lastTransitionFrom)
+                continue;
+            const int score = distance2(observation.x, observation.y, portal.x, portal.y);
+            if (score < bestDistance)
+            {
+                bestDistance = score;
+                localJumpPortal = portal;
+                best = &localJumpPortal;
             }
         }
         return best;
@@ -812,6 +997,120 @@ struct LLMapperBot::Impl
         return best;
     }
 
+    bool findKnownRoute(int targetSector, Portal &route) const
+    {
+        if (targetSector < 0 || targetSector == observation.sector)
+            return false;
+        std::vector<int> frontier(1, observation.sector);
+        std::set<int> reached;
+        std::map<int, Portal> parent;
+        reached.insert(observation.sector);
+        for (size_t index = 0; index < frontier.size(); ++index)
+        {
+            const int current = frontier[index];
+            auto graph = knownGraph.find(current);
+            if (graph == knownGraph.end())
+                continue;
+            for (const Portal &edge : graph->second)
+            {
+                if (edgeFailed(edge.wall * 65536 + edge.to))
+                    continue;
+                if (reached.insert(edge.to).second)
+                {
+                    parent[edge.to] = edge;
+                    frontier.push_back(edge.to);
+                }
+            }
+        }
+        if (!reached.count(targetSector))
+            return false;
+        int cursor = targetSector;
+        route = parent[cursor];
+        while (route.from != observation.sector)
+        {
+            cursor = route.from;
+            auto edge = parent.find(cursor);
+            if (edge == parent.end())
+                return false;
+            route = edge->second;
+        }
+        return true;
+    }
+
+    bool directObjectReachable(const VisibleObject &object) const
+    {
+        return object.sector == observation.sector
+            && std::abs(object.z - observation.z) <= kMaxWalkableStep;
+    }
+
+    TraversalCapability currentClearanceCapability() const
+    {
+        if (!inRange(observation.sector, 0, numsectors))
+            return kTraversalUnknown;
+        const int floorZ = getflorzofslope(observation.sector, observation.x, observation.y);
+        const int ceilingZ = getceilzofslope(observation.sector, observation.x, observation.y);
+        const int clearance = floorZ - ceilingZ;
+        if (clearance < kPlayerStandingClearance && clearance >= playerCrouchClearance())
+            return kTraversalCrouchable;
+        return kTraversalUnknown;
+    }
+
+    TraversalCapability currentRecoveryCapability() const
+    {
+        const TraversalCapability clearance = currentClearanceCapability();
+        if (clearance == kTraversalCrouchable)
+            return clearance;
+        if (!localDynamicJumpAttempted && observation.tick <= localDynamicJumpUntilTick)
+            return kTraversalJumpable;
+        return kTraversalUnknown;
+    }
+
+    bool rangedWeaponAvailable(int &weapon) const
+    {
+        static const int candidates[] = {
+            kWeaponTommy, kWeaponShotgun, kWeaponFlare, kWeaponTesla, kWeaponNapalm,
+        };
+        for (int candidate : candidates)
+        {
+            if (!gMe->hasWeapon[candidate])
+                continue;
+            const int ammo = candidate - 1;
+            if (gInfiniteAmmo || (ammo >= 0 && ammo < int(sizeof(gMe->ammoCount) / sizeof(gMe->ammoCount[0]))
+                                  && gMe->ammoCount[ammo] > 0))
+            {
+                weapon = candidate;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    GINPUT aimAndShoot(const VisibleObject &enemy, int weapon)
+    {
+        GINPUT input = {};
+        input.syncFlags.run = 1;
+        const int targetAngle = getangle(enemy.x - observation.x, enemy.y - observation.y);
+        input.q16turn = fix16_from_int(angleDelta(targetAngle, observation.angle));
+        const int horizontal = std::max(1, int(std::sqrt(double(distance2(observation.x, observation.y,
+                                                                         enemy.x, enemy.y)))));
+        const int targetZ = enemy.z;
+        const double pitch = std::atan2(double(observation.z - targetZ), double(horizontal))
+            * 1024.0 / 3.14159265358979323846;
+        const int desiredLook = std::max(-347, std::min(289, int(std::lround(pitch))));
+        const int currentLook = fix16_to_int(gMe->q16look);
+        input.q16mlook = fix16_from_int((desiredLook - currentLook) / 8);
+        if (gMe->curWeapon == weapon)
+            input.buttonFlags.shoot = 1;
+        else
+        {
+            input.newWeapon = uint8_t(weapon);
+            char detail[96];
+            snprintf(detail, sizeof(detail), "enemy=%d weapon=%d", enemy.sprite, weapon);
+            event("ranged_weapon_selected", detail);
+        }
+        return input;
+    }
+
     const Portal *selectKnownDoor()
     {
         const Portal *best = nullptr;
@@ -819,10 +1118,25 @@ struct LLMapperBot::Impl
         int bestDistance = INT32_MAX;
         const bool avoidBacktrack = repeatedBacktrackCount >= 2
             && lastTransitionTo == observation.sector;
+        int waitingDoor = -1;
+        for (const auto &entry : doors)
+        {
+            if (entry.second.interaction == DoorMemory::kWaiting
+                || entry.second.interaction == DoorMemory::kOpening)
+            {
+                waitingDoor = entry.first;
+                break;
+            }
+        }
         for (auto &entry : doors)
         {
             DoorMemory &door = entry.second;
+            if (waitingDoor >= 0 && door.id != waitingDoor)
+                continue;
+            if (!door.portal.interactionAffordance)
+                continue;
             if (door.availability == DoorMemory::kStructurallyBlocked
+                || door.availability == DoorMemory::kCurrentlyUnavailable
                 || (door.availability == DoorMemory::kMissingKey && door.attempts > 0 && !hasKey(door.portal.key)))
                 continue;
             if (door.opened && !door.portal.key && !door.portal.locked)
@@ -892,11 +1206,13 @@ struct LLMapperBot::Impl
         event("goal_changed", detail);
     }
 
-    void setMovementTarget(int x, int y, int targetSector, int targetId)
+    void setMovementTarget(int x, int y, int targetSector, int targetId,
+                           TraversalCapability capability = kTraversalUnknown)
     {
         if (movementTargetActive && movementTargetGoal == currentGoal
             && movementTargetX == x && movementTargetY == y
-            && movementTargetSector == targetSector && movementTargetId == targetId)
+            && movementTargetSector == targetSector && movementTargetId == targetId
+            && movementTargetCapability == capability)
             return;
 
         movementTargetActive = true;
@@ -905,10 +1221,12 @@ struct LLMapperBot::Impl
         movementTargetSector = targetSector;
         movementTargetId = targetId;
         movementTargetFrom = observation.sector;
+        movementTargetCapability = capability;
         movementTargetGoal = currentGoal;
         targetLastX = observation.x;
         targetLastY = observation.y;
         targetLastZ = observation.z;
+        targetLastDistance2 = distance2(observation.x, observation.y, x, y);
         targetLastProgressTick = observation.tick;
         jumpCooldownTick = observation.tick;
         jumpAttempts = 0;
@@ -919,8 +1237,9 @@ struct LLMapperBot::Impl
         if (!movementTargetActive)
             return;
 
-        const int moved = distance2(targetLastX, targetLastY, observation.x, observation.y);
-        const bool horizontalProgress = moved >= 4096;
+        const int currentDistance2 = distance2(observation.x, observation.y,
+                                               movementTargetX, movementTargetY);
+        const bool horizontalProgress = targetLastDistance2 - currentDistance2 >= 4096;
         const bool verticalProgress = std::abs(observation.z - targetLastZ) >= 256;
         const bool sectorProgress = movementTargetSector >= 0 && observation.sector != movementTargetSector;
         if (horizontalProgress || verticalProgress)
@@ -938,6 +1257,7 @@ struct LLMapperBot::Impl
             targetLastX = observation.x;
             targetLastY = observation.y;
             targetLastZ = observation.z;
+            targetLastDistance2 = currentDistance2;
             targetLastProgressTick = observation.tick;
         }
     }
@@ -945,6 +1265,7 @@ struct LLMapperBot::Impl
     bool movementNeedsJump() const
     {
         return movementTargetActive && jumpAttempts < kMaxJumpAttemptsPerTarget
+            && movementTargetCapability == kTraversalJumpable
             && observation.tick >= jumpCooldownTick
             && observation.tick - targetLastProgressTick >= kMovementStuckTicks
             && distance2(observation.x, observation.y, movementTargetX, movementTargetY) > 4096;
@@ -962,7 +1283,7 @@ struct LLMapperBot::Impl
         const int length = int(std::sqrt(double(int64_t(dx) * dx + int64_t(dy) * dy)));
         const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
         const int safeHalf = length / 2 - std::max(128, radius + 64);
-        if (safeHalf <= 256 || length <= 0)
+        if (safeHalf <= 128 || length <= 0)
             return;
 
         const double tangentX = double(dx) / length;
@@ -996,17 +1317,31 @@ struct LLMapperBot::Impl
         }
         const int targetX = portalWaypointActive ? portalWaypointX : portal.x;
         const int targetY = portalWaypointActive ? portalWaypointY : portal.y;
-        return steerTo(targetX, targetY, false, false, portal.wall, portal.to);
+        const bool crouch = portal.capability == kTraversalCrouchable;
+        if (crouch && !crouchTargetActive)
+        {
+            event("crouch_started", "reason=low_portal");
+            crouchTargetActive = true;
+        }
+        return steerTo(targetX, targetY, false, false, portal.wall, portal.to, portal.capability);
     }
 
-    GINPUT steerTo(int x, int y, bool use, bool shoot, int targetId = -1, int targetSector = -1)
+    GINPUT steerTo(int x, int y, bool use, bool shoot, int targetId = -1, int targetSector = -1,
+                   TraversalCapability capability = kTraversalUnknown)
     {
-        setMovementTarget(x, y, targetSector, targetId);
+        if (capability != kTraversalCrouchable && crouchTargetActive)
+        {
+            event("crouch_released", "reason=normal_clearance");
+            crouchTargetActive = false;
+        }
+        setMovementTarget(x, y, targetSector, targetId, capability);
         updateMovementProgress();
         GINPUT input = {};
         const int targetAngle = getangle(x - observation.x, y - observation.y);
         const int delta = angleDelta(targetAngle, observation.angle);
         input.syncFlags.run = 1;
+        if (capability == kTraversalCrouchable)
+            input.buttonFlags.crouch = 1;
         // The bot has no mouse inertia to model. Aim the player/camera at the
         // target in one correction, then let the next frame issue Use once the
         // observed heading confirms alignment.
@@ -1024,8 +1359,9 @@ struct LLMapperBot::Impl
         {
             char detail[256];
             snprintf(detail, sizeof(detail),
-                     "goal=%s target=%d sector=%d target_sector=%d distance=%d dx=%d dy=%d dz=%d forward=%d turn=%d jump_attempts=%d height=%d cant_jump=%d posture=%d",
+                     "goal=%s target=%d sector=%d target_sector=%d capability=%d distance=%d dx=%d dy=%d dz=%d forward=%d turn=%d jump_attempts=%d height=%d cant_jump=%d posture=%d",
                      currentGoal.c_str(), movementTargetId, observation.sector, movementTargetSector,
+                     int(movementTargetCapability),
                      int(std::sqrt(double(distance2(observation.x, observation.y, movementTargetX, movementTargetY)))),
                      observation.x - targetLastX, observation.y - targetLastY, observation.z - targetLastZ,
                      int(input.forward), int(input.q16turn), jumpAttempts,
@@ -1034,10 +1370,14 @@ struct LLMapperBot::Impl
             input.buttonFlags.jump = 1;
             input.forward = 2047;
             ++jumpAttempts;
+            if (currentGoal == "SEARCH_CURRENT_AREA"
+                && movementTargetCapability == kTraversalJumpable)
+                localDynamicJumpAttempted = true;
             jumpCooldownTick = observation.tick + kJumpCooldownTicks;
             event("jump_attempt", detail);
         }
-        else if (currentGoal == "EXPLORE_FRONTIER" && movementTargetActive
+        else if ((currentGoal == "EXPLORE_FRONTIER" || currentGoal == "EXPLORE_LOCAL_PORTAL")
+                 && movementTargetActive
                  && jumpAttempts >= kMaxJumpAttemptsPerTarget && movementTargetId >= 0
                  && movementTargetSector >= 0)
         {
@@ -1050,6 +1390,18 @@ struct LLMapperBot::Impl
                          movementTargetId, movementTargetFrom, movementTargetSector, jumpAttempts);
                 event("frontier_failed", detail);
             }
+            movementTargetActive = false;
+        }
+        else if (currentGoal == "EXPLORE_LOCAL_PORTAL" && movementTargetActive
+                 && movementTargetCapability != kTraversalJumpable
+                 && observation.tick - targetLastProgressTick >= kMovementStuckTicks)
+        {
+            const int edgeId = movementTargetId * 65536 + movementTargetSector;
+            failedEdges[edgeId] = knowledgeRevision;
+            char detail[96];
+            snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d reason=local_approach_blocked",
+                     movementTargetId, movementTargetFrom, movementTargetSector);
+            event("local_portal_failed", detail);
             movementTargetActive = false;
         }
         return input;
@@ -1065,23 +1417,75 @@ struct LLMapperBot::Impl
 
         if (const VisibleObject *enemy = selectObject(kObjectEnemy))
         {
-            setGoal("COMBAT_VISIBLE_ENEMY", enemy->sprite);
-            return steerTo(enemy->x, enemy->y, false, true, enemy->sprite, enemy->sector);
+            Portal route;
+            int rangedWeapon = kWeaponNone;
+            if (enemy->sector != observation.sector && findKnownRoute(enemy->sector, route))
+            {
+                setGoal("NAVIGATE_TO_VISIBLE_ENEMY", enemy->sprite);
+                return steerPortal(route);
+            }
+            if (directObjectReachable(*enemy))
+            {
+                setGoal("COMBAT_MELEE_REACHABLE_ENEMY", enemy->sprite);
+                return steerTo(enemy->x, enemy->y, false, true, enemy->sprite, enemy->sector);
+            }
+            if (rangedWeaponAvailable(rangedWeapon))
+            {
+                setGoal("COMBAT_RANGED_VISIBLE_ENEMY", enemy->sprite);
+                return aimAndShoot(*enemy, rangedWeapon);
+            }
+            if (unreachableEnemies.insert(enemy->sprite).second)
+            {
+                char detail[96];
+                snprintf(detail, sizeof(detail), "sprite=%d sector=%d dz=%d reason=no_route_or_ranged_weapon",
+                         enemy->sprite, enemy->sector, enemy->z - observation.z);
+                event("enemy_unreachable", detail);
+            }
         }
         if (const VisibleObject *key = selectObject(kObjectKey))
         {
-            setGoal("COLLECT_VISIBLE_KEY", key->sprite);
-            return steerTo(key->x, key->y, false, false, key->sprite, key->sector);
+            Portal route;
+            if (directObjectReachable(*key))
+            {
+                setGoal("COLLECT_VISIBLE_KEY", key->sprite);
+                return steerTo(key->x, key->y, false, false, key->sprite, key->sector);
+            }
+            if (findKnownRoute(key->sector, route))
+            {
+                setGoal("NAVIGATE_TO_VISIBLE_KEY", key->sprite);
+                return steerPortal(route);
+            }
+            unreachableObjects.insert(key->sprite);
         }
         if (const VisibleObject *interactive = selectObject(kObjectInteractive))
         {
-            setGoal("USE_VISIBLE_INTERACTIVE", interactive->sprite);
-            return steerTo(interactive->x, interactive->y, true, false, interactive->sprite, interactive->sector);
+            Portal route;
+            if (directObjectReachable(*interactive))
+            {
+                setGoal("USE_VISIBLE_INTERACTIVE", interactive->sprite);
+                return steerTo(interactive->x, interactive->y, true, false, interactive->sprite, interactive->sector);
+            }
+            if (findKnownRoute(interactive->sector, route))
+            {
+                setGoal("NAVIGATE_TO_VISIBLE_INTERACTIVE", interactive->sprite);
+                return steerPortal(route);
+            }
+            unreachableObjects.insert(interactive->sprite);
         }
         if (const VisibleObject *pickup = selectObject(kObjectPickup))
         {
-            setGoal("COLLECT_VISIBLE_PICKUP", pickup->sprite);
-            return steerTo(pickup->x, pickup->y, false, false, pickup->sprite, pickup->sector);
+            Portal route;
+            if (directObjectReachable(*pickup))
+            {
+                setGoal("COLLECT_VISIBLE_PICKUP", pickup->sprite);
+                return steerTo(pickup->x, pickup->y, false, false, pickup->sprite, pickup->sector);
+            }
+            if (findKnownRoute(pickup->sector, route))
+            {
+                setGoal("NAVIGATE_TO_VISIBLE_PICKUP", pickup->sprite);
+                return steerPortal(route);
+            }
+            unreachableObjects.insert(pickup->sprite);
         }
         if (observation.exitHere)
         {
@@ -1141,6 +1545,23 @@ struct LLMapperBot::Impl
             }
             return steerTo(door->x, door->y, issueUse, false, door->wall, door->to);
         }
+        if (const Portal *localPortal = selectLocalPortal())
+        {
+            const bool newLocalPortal = currentGoal != "EXPLORE_LOCAL_PORTAL"
+                || currentGoalTarget != localPortal->wall;
+            setGoal("EXPLORE_LOCAL_PORTAL", localPortal->wall);
+            if (newLocalPortal)
+            {
+                char detail[160];
+                snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d x=%d y=%d capability=%d floor_delta=%d width=%d clearance=%d",
+                         localPortal->wall, localPortal->from, localPortal->to,
+                         localPortal->x, localPortal->y,
+                         int(localPortal->capability), localPortal->floorDelta,
+                         localPortal->openingWidth, localPortal->clearance);
+                event("local_portal_target", detail);
+            }
+            return steerPortal(*localPortal);
+        }
         if (const Portal *portal = selectPortal())
         {
             const bool newFrontier = currentGoal != "EXPLORE_FRONTIER" || currentGoalTarget != portal->wall;
@@ -1163,9 +1584,17 @@ struct LLMapperBot::Impl
         idle.syncFlags.run = 1;
         if (searchAngle < 0)
             searchAngle = observation.angle;
-        if (!movementTargetActive || movementTargetGoal != currentGoal || jumpAttempts >= kMaxJumpAttemptsPerTarget)
+        const TraversalCapability searchCapability = currentRecoveryCapability();
+        const bool searchTargetStalled = movementTargetActive
+            && movementTargetGoal == currentGoal
+            && observation.tick - targetLastProgressTick >= kMovementStuckTicks;
+        const bool reorientSearch = !movementTargetActive
+            || movementTargetGoal != currentGoal
+            || jumpAttempts >= kMaxJumpAttemptsPerTarget
+            || (searchTargetStalled && searchCapability != kTraversalJumpable);
+        if (reorientSearch)
         {
-            if (movementTargetActive && jumpAttempts >= kMaxJumpAttemptsPerTarget)
+            if (movementTargetActive)
             {
                 searchAngle = wrapAngle(searchAngle + 512);
                 char detail[64];
@@ -1175,9 +1604,14 @@ struct LLMapperBot::Impl
             jumpAttempts = 0;
             const int probeX = observation.x + mulscale30(Cos(searchAngle), 8192);
             const int probeY = observation.y + mulscale30(Sin(searchAngle), 8192);
-            setMovementTarget(probeX, probeY, observation.sector, -2);
+            if (searchCapability == kTraversalCrouchable)
+                event("local_crouch_recovery", "reason=standing_clearance_unavailable");
+            else if (searchCapability == kTraversalJumpable)
+                event("local_dynamic_jump", "reason=moving_sector_with_vertical_motion");
+            setMovementTarget(probeX, probeY, observation.sector, -2, searchCapability);
         }
-        return steerTo(movementTargetX, movementTargetY, false, false, -2, observation.sector);
+        return steerTo(movementTargetX, movementTargetY, false, false, -2, observation.sector,
+                       searchCapability);
     }
 
     void detectStall()
@@ -1216,6 +1650,11 @@ struct LLMapperBot::Impl
     {
         if (!result.size())
             result = reason ? reason : "RUNTIME_ERROR";
+        fprintf(stderr,
+                "LLMAPPER BOT TERMINATION result=%s reason=%s game_time=%d goal=%s target=%d sector=%d\n",
+                result.c_str(), failureReason.c_str(), (gFrame * kTicsPerFrame) / kTicsPerSec,
+                currentGoal.c_str(), currentGoalTarget, observation.sector);
+        fflush(stderr);
         if (telemetry)
         {
             fprintf(telemetry, "{\"type\":\"summary\",\"result\":\"%s\",\"failure_reason\":\"%s\",\"game_time\":%d,\"visited_sectors\":%u,\"observed_sectors\":%u}\n",
