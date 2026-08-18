@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <string>
@@ -124,6 +125,28 @@ struct Portal
     int sectorBusy = 0;
 };
 
+enum InteractionKind
+{
+    kInteractionWall,
+    kInteractionSector,
+    kInteractionSprite,
+};
+
+struct InteractionCandidate
+{
+    InteractionKind kind = kInteractionWall;
+    int id = -1;
+    int fromSector = -1;
+    int targetSector = -1;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    int key = 0;
+    bool locked = false;
+    bool reversible = false;
+    Portal target;
+};
+
 struct Observation
 {
     int tick = 0;
@@ -145,7 +168,14 @@ struct Observation
     int playerZVelocity = 0;
     std::vector<int> visibleSectors;
     std::vector<Portal> portals;
+    std::vector<InteractionCandidate> interactions;
     std::vector<VisibleObject> objects;
+};
+
+struct LocalWaypoint
+{
+    int x = 0;
+    int y = 0;
 };
 
 static int wrapAngle(int angle)
@@ -265,15 +295,65 @@ static Observation observeWorld()
         if (current.extra > 0 && current.extra < kMaxXSectors && xsector[current.extra].Exit)
             result.exitHere = true;
 
+        // A current-sector Push is an ActionScan target in its own right.
+        // It is not represented by a portal and must be remembered even when
+        // every surrounding wall is one-sided.
+        if (current.extra > 0 && current.extra < kMaxXSectors && xsector[current.extra].Push)
+        {
+            InteractionCandidate candidate;
+            candidate.kind = kInteractionSector;
+            candidate.id = result.sector;
+            candidate.fromSector = result.sector;
+            candidate.targetSector = result.sector;
+            candidate.x = result.x;
+            candidate.y = result.y;
+            candidate.z = result.z;
+            candidate.reversible = true;
+            candidate.target.from = result.sector;
+            candidate.target.to = result.sector;
+            candidate.target.sectorPushCurrent = true;
+            result.interactions.push_back(candidate);
+        }
+
         for (int i = 0; i < current.wallnum; ++i)
         {
             const int wallIndex = current.wallptr + i;
             const walltype &wallRecord = wall[wallIndex];
+            const walltype &nextWall = wall[wallRecord.point2];
             if (!inRange(wallRecord.nextsector, 0, numsectors))
+            {
+                // XWALL triggerPush is usable without a nextsector.  It is
+                // discovered from the reachable current sector, then the
+                // real ActionScan preview remains the activation authority.
+                if (wallRecord.extra > 0 && wallRecord.extra < kMaxXWalls
+                    && xwall[wallRecord.extra].triggerPush
+                    && cansee(result.x, result.y, result.z, result.sector,
+                              (wallRecord.x + nextWall.x) / 2,
+                              (wallRecord.y + nextWall.y) / 2,
+                              result.z, result.sector))
+                {
+                    InteractionCandidate candidate;
+                    candidate.kind = kInteractionWall;
+                    candidate.id = wallIndex;
+                    candidate.fromSector = result.sector;
+                    candidate.x = (wallRecord.x + nextWall.x) / 2;
+                    candidate.y = (wallRecord.y + nextWall.y) / 2;
+                    candidate.z = result.z;
+                    candidate.key = xwall[wallRecord.extra].key;
+                    candidate.locked = xwall[wallRecord.extra].locked != 0;
+                    candidate.reversible = true;
+                    candidate.target.wall = wallIndex;
+                    candidate.target.from = result.sector;
+                    candidate.target.to = -1;
+                    candidate.target.x = candidate.x;
+                    candidate.target.y = candidate.y;
+                    candidate.target.wallPush = true;
+                    result.interactions.push_back(candidate);
+                }
                 continue;
+            }
             ++result.localPortalCount;
 
-            const walltype &nextWall = wall[wallRecord.point2];
             const int midX = (wallRecord.x + nextWall.x) / 2;
             const int midY = (wallRecord.y + nextWall.y) / 2;
             const int fromFloor = getflorzofslope(result.sector, midX, midY);
@@ -385,6 +465,23 @@ static Observation observeWorld()
             portal.directUse = (portal.wallPush || portal.sectorPush || portal.sectorPushCurrent)
                 && (!portal.traversable || std::abs(portal.floorDelta) > kMaxWalkableStep);
 
+            if (portal.interactionAffordance)
+            {
+                InteractionCandidate candidate;
+                candidate.kind = kInteractionWall;
+                candidate.id = wallIndex;
+                candidate.fromSector = result.sector;
+                candidate.targetSector = portal.to;
+                candidate.x = midX;
+                candidate.y = midY;
+                candidate.z = midZ;
+                candidate.key = portal.key;
+                candidate.locked = portal.locked;
+                candidate.reversible = true;
+                candidate.target = portal;
+                result.interactions.push_back(candidate);
+            }
+
             if (!visible && !portal.traversable)
                 continue;
             if (visible)
@@ -428,6 +525,25 @@ static Observation observeWorld()
                          : isKeyType(candidate.type) ? kObjectKey
                          : (isThing || isSwitch) ? kObjectInteractive : kObjectPickup;
         result.objects.push_back(object);
+        if (object.kind == kObjectInteractive && validXSprite(candidate.extra)
+            && xsprite[candidate.extra].Push)
+        {
+            InteractionCandidate interaction;
+            interaction.kind = kInteractionSprite;
+            interaction.id = i;
+            interaction.fromSector = candidate.sectnum;
+            interaction.targetSector = candidate.sectnum;
+            interaction.x = candidate.x;
+            interaction.y = candidate.y;
+            interaction.z = candidate.z;
+            interaction.reversible = true;
+            interaction.target.wall = -1;
+            interaction.target.from = candidate.sectnum;
+            interaction.target.to = candidate.sectnum;
+            interaction.target.x = candidate.x;
+            interaction.target.y = candidate.y;
+            result.interactions.push_back(interaction);
+        }
     }
     return result;
 }
@@ -447,6 +563,12 @@ static const char *objectName(ObjectKind kind)
 
 struct LLMapperBot::Impl
 {
+    struct EdgeFailure
+    {
+        int geometrySignature = 0;
+        int attempts = 0;
+    };
+
     struct DoorMemory
     {
         enum Availability
@@ -478,6 +600,39 @@ struct LLMapperBot::Impl
         int unavailableFromSector = -1;
     };
 
+    struct InteractionMemory
+    {
+        InteractionKind kind = kInteractionWall;
+        int id = -1;
+        int fromSector = -1;
+        int targetSector = -1;
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        int key = 0;
+        bool locked = false;
+        bool reversible = false;
+        bool observed = false;
+        bool attempted = false;
+        bool activated = false;
+        int activationCount = 0;
+        int lastActivationTick = -1;
+        int beforeState = 0;
+        int afterState = 0;
+        int unavailableFromSector = -1;
+        int state = 0;
+        bool recoveryAttempted = false;
+        Portal target;
+    };
+
+    struct PendingWork
+    {
+        int kind = 0; // 1 interaction, 2 frontier
+        int id = -1;
+        int sector = -1;
+        int edgeTarget = -1;
+    };
+
     FILE *telemetry = nullptr;
     FILE *trajectory = nullptr;
     std::string telemetryPath = "llmapper-bot.ndjson";
@@ -496,6 +651,7 @@ struct LLMapperBot::Impl
     int repeatedStateCount = 0;
     int pendingUse = -1;
     int pendingUseTick = -1;
+    int pendingInteractionKey = -1;
     std::string result;
     std::string failureReason;
     std::string currentGoal;
@@ -503,13 +659,16 @@ struct LLMapperBot::Impl
     std::set<int> observedSectors;
     std::set<int> visitedSectors;
     std::map<int, DoorMemory> doors;
+    std::map<int, InteractionMemory> interactions;
+    std::vector<PendingWork> pendingWork;
+    bool recoveryMode = false;
     std::set<int> knownObjects;
     std::set<int> knownKeys;
     std::set<int> unreachableObjects;
     std::set<int> unreachableEnemies;
     std::set<int> seenEdges;
     std::set<int> visitedEdges;
-    std::map<int, int> failedEdges;
+    std::map<int, EdgeFailure> failedEdges;
     std::set<int> openedRoutes;
     std::map<int, std::vector<Portal>> knownGraph;
     Portal routePortal;
@@ -539,6 +698,7 @@ struct LLMapperBot::Impl
     int targetLastY = 0;
     int targetLastZ = 0;
     int targetLastDistance2 = 0;
+    int targetBestDistance2 = 0;
     int targetLastProgressTick = 0;
     int jumpCooldownTick = 0;
     int jumpAttempts = 0;
@@ -555,6 +715,15 @@ struct LLMapperBot::Impl
     int portalWaypointX = 0;
     int portalWaypointY = 0;
     bool portalWaypointActive = false;
+    std::vector<LocalWaypoint> portalPlan;
+    size_t portalPlanIndex = 0;
+    int portalPlanWall = -1;
+    int portalPlanSignature = 0;
+    int portalPlanAttempts = 0;
+    bool portalCrossingActive = false;
+    int portalCrossingX = 0;
+    int portalCrossingY = 0;
+    int portalCrossingStartTick = -1;
     bool crouchTargetActive = false;
 
     void openFiles()
@@ -585,6 +754,22 @@ struct LLMapperBot::Impl
                  hit, kind, target, extra, accepted ? 1 : 0, key,
                  currentGoal.c_str(), selectedDoorId);
         event("engine_use_resolved", detail);
+        for (auto &entry : interactions)
+        {
+            InteractionMemory &memory = entry.second;
+            if (entry.first == pendingInteractionKey && memory.state == 1
+                && interactionTargetMatches(memory, hit, target))
+            {
+                char interactionDetail[128];
+                snprintf(interactionDetail, sizeof(interactionDetail),
+                         "kind=%d id=%d hit=%d target=%d extra=%d accepted=%d",
+                         int(memory.kind), memory.id, hit, target, extra, accepted ? 1 : 0);
+                event("interaction_engine_resolved", interactionDetail);
+                if (!accepted)
+                    memory.state = 3;
+            }
+        }
+        pendingInteractionKey = -1;
     }
 
     void trajectorySample()
@@ -596,6 +781,158 @@ struct LLMapperBot::Impl
                 int(gMe->pSprite->x), int(gMe->pSprite->y), int(gMe->pSprite->z), int(gMe->pSprite->sectnum),
                 int(gMe->pSprite->ang), int(gMe->pXSprite ? gMe->pXSprite->health : 0));
         fflush(trajectory);
+    }
+
+    int interactionKey(const InteractionCandidate &candidate) const
+    {
+        // Several linedefs can expose the same XSECTOR Wallpush target.
+        // Their engine identity is the sector mechanism, not each duplicate
+        // wall record, so one activation must be remembered once.
+        if (candidate.kind == kInteractionWall && candidate.target.sectorPush)
+            return int(kInteractionSector) * 1000000 + candidate.target.to + 1;
+        if (candidate.kind == kInteractionWall && candidate.target.sectorPushCurrent)
+            return int(kInteractionSector) * 1000000 + candidate.target.from + 1;
+        return int(candidate.kind) * 1000000 + candidate.id + 1;
+    }
+
+    int interactionMemoryKey(const InteractionMemory &memory) const
+    {
+        if (memory.kind == kInteractionWall && memory.target.sectorPush)
+            return int(kInteractionSector) * 1000000 + memory.target.to + 1;
+        if (memory.kind == kInteractionWall && memory.target.sectorPushCurrent)
+            return int(kInteractionSector) * 1000000 + memory.target.from + 1;
+        return int(memory.kind) * 1000000 + memory.id + 1;
+    }
+
+    int interactionStateSignature(const InteractionMemory &memory) const
+    {
+        int signature = int(memory.kind) * 131 + memory.id;
+        if (memory.kind == kInteractionWall && memory.target.sectorPush
+            && inRange(memory.target.to, 0, numsectors))
+        {
+            const sectortype &sectorRecord = sector[memory.target.to];
+            signature = signature * 31 + sectorRecord.floorz;
+            signature = signature * 31 + sectorRecord.ceilingz;
+            if (sectorRecord.extra > 0 && sectorRecord.extra < kMaxXSectors)
+            {
+                signature = signature * 31 + xsector[sectorRecord.extra].state;
+                signature = signature * 31 + xsector[sectorRecord.extra].busy;
+            }
+        }
+        else if (memory.kind == kInteractionWall && inRange(memory.target.wall, 0, numwalls))
+        {
+            const walltype &wallRecord = wall[memory.target.wall];
+            signature = signature * 31 + wallRecord.cstat;
+            signature = signature * 31 + wallRecord.nextsector;
+            signature = signature * 31 + wallRecord.x;
+            signature = signature * 31 + wallRecord.y;
+            if (wallRecord.extra > 0 && wallRecord.extra < kMaxXWalls)
+            {
+                signature = signature * 31 + xwall[wallRecord.extra].state;
+                signature = signature * 31 + xwall[wallRecord.extra].busy;
+            }
+        }
+
+        else if (memory.kind == kInteractionSector && inRange(memory.fromSector, 0, numsectors))
+        {
+            const sectortype &sectorRecord = sector[memory.fromSector];
+            signature = signature * 31 + sectorRecord.floorz;
+            signature = signature * 31 + sectorRecord.ceilingz;
+            if (sectorRecord.extra > 0 && sectorRecord.extra < kMaxXSectors)
+            {
+                signature = signature * 31 + xsector[sectorRecord.extra].state;
+                signature = signature * 31 + xsector[sectorRecord.extra].busy;
+            }
+        }
+        else if (memory.kind == kInteractionSprite && inRange(memory.id, 0, kMaxSprites))
+        {
+            const spritetype &spriteRecord = sprite[memory.id];
+            signature = signature * 31 + spriteRecord.x;
+            signature = signature * 31 + spriteRecord.y;
+            signature = signature * 31 + spriteRecord.sectnum;
+            if (validXSprite(spriteRecord.extra))
+            {
+                signature = signature * 31 + xsprite[spriteRecord.extra].state;
+                signature = signature * 31 + xsprite[spriteRecord.extra].busy;
+            }
+        }
+        return signature;
+    }
+
+    bool interactionTargetMatches(const InteractionMemory &memory, int hit, int target) const
+    {
+        if (memory.kind == kInteractionWall)
+        {
+            if (memory.target.wallPush && hit == 0 && target == memory.target.wall)
+                return true;
+            if (memory.target.sectorPush && hit == 6 && target == memory.target.to)
+                return true;
+            if (memory.target.sectorPushCurrent && hit == 6 && target == memory.target.from)
+                return true;
+        }
+        if (memory.kind == kInteractionSector)
+            return hit == 6 && target == memory.fromSector;
+        if (memory.kind == kInteractionSprite)
+            return hit == 3 && target == memory.id;
+        return false;
+    }
+
+    void rememberInteraction(const InteractionCandidate &candidate)
+    {
+        const int key = interactionKey(candidate);
+        InteractionMemory &memory = interactions[key];
+        const bool first = !memory.observed;
+        const int oldState = memory.observed ? interactionStateSignature(memory) : 0;
+        const bool canonicalSectorPush = candidate.kind == kInteractionWall
+            && (candidate.target.sectorPush || candidate.target.sectorPushCurrent);
+        memory.kind = candidate.kind;
+        memory.id = (candidate.kind == kInteractionWall && candidate.target.sectorPush)
+            ? candidate.target.to
+            : (candidate.kind == kInteractionWall && candidate.target.sectorPushCurrent)
+            ? candidate.target.from : candidate.id;
+        memory.fromSector = candidate.fromSector;
+        memory.targetSector = candidate.targetSector;
+        if (first || !canonicalSectorPush)
+        {
+            memory.x = candidate.x;
+            memory.y = candidate.y;
+            memory.z = candidate.z;
+        }
+        memory.key = candidate.key;
+        memory.locked = candidate.locked;
+        memory.reversible = candidate.reversible;
+        memory.observed = true;
+        memory.target = candidate.target;
+        const int newState = interactionStateSignature(memory);
+        if (memory.state == 1 && newState != memory.beforeState)
+        {
+            memory.state = 2;
+            memory.activated = true;
+            recoveryMode = false;
+            memory.afterState = newState;
+            char detail[128];
+            snprintf(detail, sizeof(detail), "kind=%d id=%d before=%d after=%d", int(memory.kind), memory.id,
+                     memory.beforeState, newState);
+            event("interaction_world_delta", detail);
+            lastSemanticProgressTick = observation.tick;
+        }
+        if (first)
+        {
+            recoveryMode = false;
+            pendingWork.push_back({ 1, key, candidate.fromSector, candidate.targetSector });
+            ++knowledgeRevision;
+            char detail[128];
+            snprintf(detail, sizeof(detail), "kind=%d id=%d sector=%d key=%d", int(memory.kind), memory.id,
+                     memory.fromSector, memory.key);
+            event("discovered_interaction", detail);
+            lastSemanticProgressTick = observation.tick;
+        }
+        else if (oldState != newState && memory.state != 1)
+        {
+            // State refresh is local knowledge maintenance.  It does not
+            // expose objects in sectors the bot has never observed.
+            event("interaction_state_refreshed", "source=known_world_revisit");
+        }
     }
 
     void updateKnowledge()
@@ -753,6 +1090,8 @@ struct LLMapperBot::Impl
             const bool newEdge = seenEdges.insert(edgeId).second;
             if (newEdge)
             {
+                recoveryMode = false;
+                pendingWork.push_back({ 2, portal.wall, portal.from, portal.to });
                 ++knowledgeRevision;
                 lastSemanticProgressTick = observation.tick;
                 char detail[96];
@@ -844,6 +1183,12 @@ struct LLMapperBot::Impl
             }
         }
 
+        // Refresh interaction memory from current engine state whenever the
+        // area is observed again.  This includes one-sided walls and current
+        // sector pushes, which never enter the portal graph.
+        for (const InteractionCandidate &candidate : observation.interactions)
+            rememberInteraction(candidate);
+
         for (const VisibleObject &object : observation.objects)
         {
             if (object.kind == kObjectKey && knownKeys.insert(object.type - kItemKeyBase + 1).second)
@@ -915,10 +1260,67 @@ struct LLMapperBot::Impl
         return key <= 0 || (key < 8 && gMe && gMe->hasKey[key]);
     }
 
+    int portalGeometrySignature(const Portal &portal) const
+    {
+        // A failed approach is valid only for the geometry that was actually
+        // tested.  Discovery of an unrelated pickup or sector must not make
+        // every old failure disappear, while a changed wall/sector must.
+        int signature = portal.wall * 31 + portal.from * 131 + portal.to * 977;
+        signature = signature * 31 + portal.x1;
+        signature = signature * 31 + portal.y1;
+        signature = signature * 31 + portal.x2;
+        signature = signature * 31 + portal.y2;
+        signature = signature * 31 + portal.wallState;
+        signature = signature * 31 + portal.wallBusy;
+        signature = signature * 31 + portal.sectorState;
+        signature = signature * 31 + portal.sectorBusy;
+        signature = signature * 31 + portal.floorZ;
+        signature = signature * 31 + portal.ceilingZ;
+        signature = signature * 31 + portal.floorDelta;
+        signature = signature * 31 + portal.clearance;
+        signature = signature * 31 + (portal.traversable ? 1 : 0);
+        signature = signature * 31 + (portal.crouchable ? 1 : 0);
+        return signature;
+    }
+
+    const Portal *findPortalForEdge(int edgeId) const
+    {
+        for (const Portal &portal : observation.portals)
+            if (portal.wall * 65536 + portal.to == edgeId)
+                return &portal;
+        for (const auto &entry : knownGraph)
+            for (const Portal &portal : entry.second)
+                if (portal.wall * 65536 + portal.to == edgeId)
+                    return &portal;
+        return nullptr;
+    }
+
     bool edgeFailed(int edgeId) const
     {
         auto failed = failedEdges.find(edgeId);
-        return failed != failedEdges.end() && failed->second == knowledgeRevision;
+        if (failed == failedEdges.end())
+            return false;
+        const Portal *current = findPortalForEdge(edgeId);
+        // If the edge is currently not observable, do not turn an old local
+        // trajectory failure into a permanent topological fact.
+        return current && failed->second.geometrySignature == portalGeometrySignature(*current);
+    }
+
+    void recordEdgeFailure(const Portal &portal, const char *eventName, const char *reason)
+    {
+        const int edgeId = portal.wall * 65536 + portal.to;
+        EdgeFailure &failure = failedEdges[edgeId];
+        const int signature = portalGeometrySignature(portal);
+        if (failure.geometrySignature != signature)
+        {
+            failure.geometrySignature = signature;
+            failure.attempts = 0;
+        }
+        ++failure.attempts;
+        char detail[160];
+        snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d reason=%s attempts=%d signature=%d",
+                 portal.wall, portal.from, portal.to, reason, failure.attempts, signature);
+        event(eventName, detail);
     }
 
     const Portal *selectPortal()
@@ -950,6 +1352,24 @@ struct LLMapperBot::Impl
                         && (!avoidBacktrack || portal.to != lastTransitionFrom))
                         return &portal;
                 }
+            }
+        }
+
+        // Pending work is a persistent DFS-like stack.  Prefer the most
+        // recently discovered unresolved edge in this sector before falling
+        // back to geometric nearest-neighbour scoring.
+        for (auto pending = pendingWork.rbegin(); pending != pendingWork.rend(); ++pending)
+        {
+            if (pending->kind != 2 || pending->sector != observation.sector)
+                continue;
+            for (const Portal &portal : observation.portals)
+            {
+                const int edgeId = portal.wall * 65536 + portal.to;
+                if (portal.wall == pending->id && portal.to == pending->edgeTarget
+                    && (portal.traversable || portal.jumpable)
+                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId)
+                    && (!portal.key || hasKey(portal.key)))
+                    return &portal;
             }
         }
 
@@ -985,20 +1405,62 @@ struct LLMapperBot::Impl
                 continue;
             const bool alreadyExplored = visitedEdges.count(edgeId)
                 || openedRoutes.count(portal.from * 65536 + portal.to);
-            if (unvisitedAvailable && alreadyExplored)
+            if (!unvisitedAvailable || alreadyExplored)
                 continue;
-            const int score = alreadyExplored ? 100000000 : distance2(observation.x, observation.y, portal.x, portal.y);
+            const int score = distance2(observation.x, observation.y, portal.x, portal.y);
             if (score < bestDistance)
             {
                 best = &portal;
                 bestDistance = score;
             }
         }
-        return best;
+        if (best)
+            return best;
+
+        // If this branch has no current frontier, route to the most recent
+        // pending branch already in the known graph.  This is intentional
+        // backtracking, rather than a fresh random local search.
+        for (auto pending = pendingWork.rbegin(); pending != pendingWork.rend(); ++pending)
+        {
+            if (pending->kind != 2 || pending->sector == observation.sector)
+                continue;
+            if (findKnownRoute(pending->sector, routePortal))
+                return &routePortal;
+        }
+        return nullptr;
     }
 
     const Portal *selectLocalPortal()
     {
+        if (currentGoal == "EXPLORE_LOCAL_PORTAL" && currentGoalTarget >= 0)
+        {
+            for (const Portal &portal : observation.portals)
+            {
+                const int edgeId = portal.wall * 65536 + portal.to;
+                if (portal.wall == currentGoalTarget && portal.traversable
+                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId))
+                {
+                    localJumpPortal = portal;
+                    return &localJumpPortal;
+                }
+            }
+        }
+        for (auto pending = pendingWork.rbegin(); pending != pendingWork.rend(); ++pending)
+        {
+            if (pending->kind != 2 || pending->sector != observation.sector)
+                continue;
+            for (const Portal &portal : observation.portals)
+            {
+                const int edgeId = portal.wall * 65536 + portal.to;
+                if (portal.wall == pending->id && portal.to == pending->edgeTarget
+                    && portal.localGeometry && portal.traversable
+                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId))
+                {
+                    localJumpPortal = portal;
+                    return &localJumpPortal;
+                }
+            }
+        }
         const Portal *best = nullptr;
         int bestDistance = INT32_MAX;
         for (const Portal &portal : observation.portals)
@@ -1037,6 +1499,122 @@ struct LLMapperBot::Impl
             }
         }
         return best;
+    }
+
+    InteractionMemory *selectNewInteraction(bool includeRecovery = false)
+    {
+        InteractionMemory *best = nullptr;
+        int bestDistance = INT32_MAX;
+        for (auto &entry : interactions)
+        {
+            InteractionMemory &memory = entry.second;
+            if (!memory.observed)
+                continue;
+            if (memory.attempted
+                && !(includeRecovery && recoveryMode && memory.activated
+                     && memory.reversible && !memory.recoveryAttempted))
+                continue;
+            if (memory.unavailableFromSector == observation.sector)
+                continue;
+            int distance = INT32_MAX;
+            if (memory.fromSector == observation.sector)
+                distance = distance2(observation.x, observation.y, memory.x, memory.y);
+            else
+            {
+                Portal route;
+                if (!findKnownRoute(memory.fromSector, route))
+                    continue;
+                distance = distance2(observation.x, observation.y, route.x, route.y) + 1000000;
+            }
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = &memory;
+            }
+        }
+        return best;
+    }
+
+    GINPUT steerInteraction(InteractionMemory &memory)
+    {
+        if (memory.fromSector != observation.sector)
+        {
+            Portal route;
+            if (findKnownRoute(memory.fromSector, route))
+            {
+                setGoal("NAVIGATE_TO_NEW_INTERACTION", memory.id);
+                return steerPortal(route);
+            }
+            memory.unavailableFromSector = observation.sector;
+            return GINPUT{};
+        }
+
+        int hit = -1;
+        int target = -1;
+        int extra = -1;
+        const int expectedDistance = memory.kind == kInteractionSector
+            ? 0 : distance2(observation.x, observation.y, memory.x, memory.y);
+        const int expectedAngle = memory.kind == kInteractionSector
+            ? observation.angle : getangle(memory.x - observation.x, memory.y - observation.y);
+        hit = ActionScanPreview(gMe, &target, &extra);
+        const bool valid = interactionTargetMatches(memory, hit, target);
+        const bool missingKey = memory.key && !hasKey(memory.key);
+        const char *status = missingKey ? "LOCKED_KEY_REQUIRED"
+            : valid ? "VALID_ACTION_TARGET"
+            : expectedDistance > kActionScanRange * kActionScanRange ? "NOT_IN_USE_RANGE"
+            : std::abs(angleDelta(expectedAngle, observation.angle)) >= 96 ? "NOT_FACING_ACTION_TARGET"
+            : "NO_ACTION_TARGET";
+        char detail[280];
+        snprintf(detail, sizeof(detail),
+                 "kind=%d id=%d status=%s hit=%d target=%d extra=%d distance=%d angle_delta=%d attempted=%d activations=%d",
+                 int(memory.kind), memory.id, status, hit, target, extra,
+                 int(std::sqrt(double(expectedDistance))), angleDelta(expectedAngle, observation.angle),
+                 memory.attempted ? 1 : 0, memory.activationCount);
+        event("interaction_probe", detail);
+
+        bool issueUse = false;
+        const bool recoveryActivation = recoveryMode && memory.attempted
+            && memory.activated && memory.reversible && !memory.recoveryAttempted;
+        if (valid && !missingKey && (!memory.attempted || recoveryActivation))
+        {
+            if (recoveryActivation)
+                memory.recoveryAttempted = true;
+            memory.attempted = true;
+            memory.state = 1;
+            memory.activated = false;
+            memory.lastActivationTick = observation.tick;
+            memory.beforeState = interactionStateSignature(memory);
+            ++memory.activationCount;
+            pendingInteractionKey = interactionMemoryKey(memory);
+            issueUse = true;
+            snprintf(detail, sizeof(detail), "kind=%d id=%d hit=%d target=%d attempt=%d",
+                     int(memory.kind), memory.id, hit, target, memory.activationCount);
+            event("interaction_started", detail);
+            event("use_pulse", detail);
+        }
+        if (!issueUse && memory.attempted && memory.state == 1
+            && observation.tick - memory.lastActivationTick > kInteractionTimeoutTicks)
+        {
+            memory.state = 3;
+            event("interaction_failed", "reason=INTERACTION_VALID_BUT_NO_RESPONSE");
+        }
+        if (!valid && expectedDistance <= kActionScanRange * kActionScanRange
+            && std::abs(angleDelta(expectedAngle, observation.angle)) < 96)
+        {
+            memory.unavailableFromSector = observation.sector;
+            event("interaction_unavailable", "reason=CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE");
+        }
+        setGoal(memory.kind == kInteractionSprite ? "USE_NEW_SPRITE_INTERACTION"
+                : memory.kind == kInteractionSector ? "USE_NEW_SECTOR_INTERACTION"
+                : "USE_NEW_WALL_INTERACTION", memory.id);
+        GINPUT input = steerTo(memory.x, memory.y, false, false, memory.id, memory.targetSector);
+        // Preview was taken from this exact player pose.  Do not let the
+        // candidate's display coordinate veto the pulse (sector pushes in
+        // particular have no meaningful wall-facing point).  The actual
+        // gameplay tick still resolves and reports the hit authoritatively.
+        if (issueUse)
+            input.keyFlags.action = 1;
+        return input;
     }
 
     bool findKnownRoute(int targetSector, Portal &route) const
@@ -1301,6 +1879,7 @@ struct LLMapperBot::Impl
         targetLastY = observation.y;
         targetLastZ = observation.z;
         targetLastDistance2 = distance2(observation.x, observation.y, x, y);
+        targetBestDistance2 = targetLastDistance2;
         targetLastProgressTick = observation.tick;
         jumpCooldownTick = observation.tick;
         jumpAttempts = 0;
@@ -1313,7 +1892,7 @@ struct LLMapperBot::Impl
 
         const int currentDistance2 = distance2(observation.x, observation.y,
                                                movementTargetX, movementTargetY);
-        const bool horizontalProgress = targetLastDistance2 - currentDistance2 >= 4096;
+        const bool horizontalProgress = currentDistance2 + 4096 < targetBestDistance2;
         const bool verticalProgress = std::abs(observation.z - targetLastZ) >= 256;
         const bool sectorProgress = movementTargetSector >= 0 && observation.sector != movementTargetSector;
         if (horizontalProgress || verticalProgress)
@@ -1332,6 +1911,7 @@ struct LLMapperBot::Impl
             targetLastY = observation.y;
             targetLastZ = observation.z;
             targetLastDistance2 = currentDistance2;
+            targetBestDistance2 = std::min(targetBestDistance2, currentDistance2);
             targetLastProgressTick = observation.tick;
         }
     }
@@ -1345,10 +1925,33 @@ struct LLMapperBot::Impl
             && distance2(observation.x, observation.y, movementTargetX, movementTargetY) > 4096;
     }
 
+    bool collisionProbe(int startX, int startY, int startZ, int startSector,
+                        int targetX, int targetY, int targetSector, int tolerance) const
+    {
+        if (!inRange(startSector, 0, numsectors) || !inRange(targetSector, 0, numsectors))
+            return false;
+        vec3_t position = { startX, startY, startZ };
+        int16_t sectorNumber = int16_t(startSector);
+        const int64_t dx = int64_t(targetX) - startX;
+        const int64_t dy = int64_t(targetY) - startY;
+        const int32_t xvect = int32_t(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, dx << 14)));
+        const int32_t yvect = int32_t(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, dy << 14)));
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        clipmove(&position, &sectorNumber, xvect, yvect, radius, 64 << 4, 64 << 4, CLIPMASK0);
+        const int remaining = distance2(position.x, position.y, targetX, targetY);
+        return sectorNumber == targetSector && remaining <= tolerance * tolerance;
+    }
+
     void preparePortalWaypoint(const Portal &portal)
     {
         portalWaypointWall = portal.wall;
+        portalPlanWall = portal.wall;
+        portalPlanSignature = portalGeometrySignature(portal);
+        portalPlan.clear();
+        portalPlanIndex = 0;
         portalWaypointActive = false;
+        portalCrossingActive = false;
+        portalCrossingStartTick = -1;
         portalWaypointX = portal.x;
         portalWaypointY = portal.y;
 
@@ -1356,48 +1959,214 @@ struct LLMapperBot::Impl
         const int dy = portal.y2 - portal.y1;
         const int length = int(std::sqrt(double(int64_t(dx) * dx + int64_t(dy) * dy)));
         const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
-        const int safeHalf = length / 2 - std::max(128, radius + 64);
-        if (safeHalf <= 128 || length <= 0)
+        const int margin = std::max(192, radius + 96);
+        if (length <= margin * 2)
             return;
 
+        // The crossing interval is the wall segment after removing one
+        // player radius at either end.  Test several points, not just the
+        // midpoint, because Build corners commonly block that line.
         const double tangentX = double(dx) / length;
         const double tangentY = double(dy) / length;
-        const int offset = safeHalf / 2;
-        const int candidates[2] = { offset, -offset };
-        for (int side : candidates)
+        const int safeHalf = length / 2 - margin;
+        std::vector<LocalWaypoint> crossings;
+        const int offsets[] = { -safeHalf, -safeHalf / 2, 0, safeHalf / 2, safeHalf };
+        for (int offset : offsets)
         {
-            const int candidateX = portal.x + int(std::lround(tangentX * side));
-            const int candidateY = portal.y + int(std::lround(tangentY * side));
-            if (!cansee(observation.x, observation.y, observation.z, observation.sector,
-                        candidateX, candidateY, observation.z, observation.sector))
-                continue;
-            portalWaypointX = candidateX;
-            portalWaypointY = candidateY;
-            portalWaypointActive = true;
+            LocalWaypoint candidate;
+            candidate.x = portal.x + int(std::lround(tangentX * offset));
+            candidate.y = portal.y + int(std::lround(tangentY * offset));
+            crossings.push_back(candidate);
+        }
+
+        const int startTolerance = std::max(192, radius + 128);
+        for (const LocalWaypoint &crossing : crossings)
+        {
+            if (collisionProbe(observation.x, observation.y, observation.z, observation.sector,
+                               crossing.x, crossing.y, portal.from, startTolerance))
+            {
+                portalPlan.push_back(crossing);
+                portalWaypointActive = true;
+                event("local_plan_created", "mode=direct collision_probe=clipmove nodes=1");
+                return;
+            }
+        }
+
+        // Construct a deliberately small local visibility graph.  Candidate
+        // nodes are player-sized offsets around nearby wall corners.  Every
+        // edge is validated by copied-state clipmove; cansee() is never used
+        // as a body-clearance proof.
+        std::vector<LocalWaypoint> nodes;
+        nodes.push_back({ observation.x, observation.y });
+        for (int i = 0; i < sector[observation.sector].wallnum; ++i)
+        {
+            const walltype &wallRecord = wall[sector[observation.sector].wallptr + i];
+            const walltype &nextWall = wall[wallRecord.point2];
+            const int corners[2][2] = {{ wallRecord.x, wallRecord.y }, { nextWall.x, nextWall.y }};
+            for (const auto &corner : corners)
+            {
+                const int dirs[][2] = {{ 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+                                        { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 }};
+                for (const auto &dir : dirs)
+                {
+                    const int norm = (dir[0] && dir[1]) ? 181 : 256;
+                    LocalWaypoint node;
+                    node.x = corner[0] + dir[0] * margin * 256 / norm;
+                    node.y = corner[1] + dir[1] * margin * 256 / norm;
+                    if (collisionProbe(observation.x, observation.y, observation.z, observation.sector,
+                                       node.x, node.y, observation.sector, startTolerance))
+                        nodes.push_back(node);
+                    if (nodes.size() >= 25)
+                        break;
+                }
+                if (nodes.size() >= 25)
+                    break;
+            }
+            if (nodes.size() >= 25)
+                break;
+        }
+
+        struct SearchNode { LocalWaypoint point; int parent = -1; };
+        std::vector<SearchNode> search;
+        search.push_back({ nodes.front(), -1 });
+        std::deque<int> queue;
+        queue.push_back(0);
+        std::vector<bool> used(nodes.size(), false);
+        used[0] = true;
+        int goal = -1;
+        while (!queue.empty() && goal < 0)
+        {
+            const int current = queue.front();
+            queue.pop_front();
+            const LocalWaypoint &from = search[current].point;
+            for (size_t i = 1; i < nodes.size(); ++i)
+            {
+                if (used[i])
+                    continue;
+                if (!collisionProbe(from.x, from.y, observation.z, observation.sector,
+                                     nodes[i].x, nodes[i].y, observation.sector, startTolerance))
+                    continue;
+                used[i] = true;
+                search.push_back({ nodes[i], current });
+                queue.push_back(int(search.size() - 1));
+                for (const LocalWaypoint &crossing : crossings)
+                    if (collisionProbe(nodes[i].x, nodes[i].y, observation.z, observation.sector,
+                                       crossing.x, crossing.y, portal.from, startTolerance))
+                    {
+                        search.push_back({ crossing, int(search.size() - 1) });
+                        goal = int(search.size() - 1);
+                        break;
+                    }
+                if (goal >= 0)
+                    break;
+            }
+        }
+        if (goal < 0)
+        {
+            event("local_plan_failed", "reason=no_collision_safe_path alternatives=5 corner_nodes=24");
             return;
         }
+        std::vector<LocalWaypoint> reverse;
+        for (int cursor = goal; cursor >= 0; cursor = search[cursor].parent)
+            reverse.push_back(search[cursor].point);
+        for (auto it = reverse.rbegin(); it != reverse.rend(); ++it)
+            if (portalPlan.empty() || it->x != portalPlan.back().x || it->y != portalPlan.back().y)
+                portalPlan.push_back(*it);
+        if (!portalPlan.empty())
+        {
+            // The first node is the copied current pose, not a movement goal.
+            portalPlanIndex = portalPlan.size() > 1 ? 1 : 0;
+            portalWaypointActive = true;
+        }
+        char detail[128];
+        snprintf(detail, sizeof(detail), "mode=corner_graph collision_probe=clipmove nodes=%u waypoints=%u",
+                 unsigned(nodes.size()), unsigned(portalPlan.size()));
+        event("local_plan_created", detail);
     }
 
     GINPUT steerPortal(const Portal &portal)
     {
-        if (portalWaypointWall != portal.wall)
-            preparePortalWaypoint(portal);
-        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
-        if (portalWaypointActive
-            && distance2(observation.x, observation.y, portalWaypointX, portalWaypointY)
-                <= std::max(512, radius * 2) * std::max(512, radius * 2))
+        const int signature = portalGeometrySignature(portal);
+        if (portalPlanWall != portal.wall || portalPlanSignature != signature)
         {
-            portalWaypointActive = false;
+            portalPlanAttempts = 0;
+            preparePortalWaypoint(portal);
         }
-        const int targetX = portalWaypointActive ? portalWaypointX : portal.x;
-        const int targetY = portalWaypointActive ? portalWaypointY : portal.y;
+
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        const int waypointTolerance = std::max(512, radius * 2);
+        if (portalWaypointActive && portalPlanIndex < portalPlan.size()
+            && distance2(observation.x, observation.y, portalPlan[portalPlanIndex].x,
+                         portalPlan[portalPlanIndex].y) <= waypointTolerance * waypointTolerance)
+        {
+            ++portalPlanIndex;
+            if (portalPlanIndex >= portalPlan.size())
+                portalWaypointActive = false;
+        }
+        int targetX = portalWaypointActive ? portalPlan[portalPlanIndex].x : portal.x;
+        int targetY = portalWaypointActive ? portalPlan[portalPlanIndex].y : portal.y;
+        const bool intermediate = portalWaypointActive && portalPlanIndex + 1 < portalPlan.size();
         const bool crouch = portal.capability == kTraversalCrouchable;
         if (crouch && !crouchTargetActive)
         {
             event("crouch_started", "reason=low_portal");
             crouchTargetActive = true;
         }
-        return steerTo(targetX, targetY, false, false, portal.wall, portal.to, portal.capability);
+
+        // A bad local plan gets bounded alternatives before the edge is
+        // recorded as failed.  The edge itself remains eligible if its
+        // geometry signature changes later.
+        const bool crossingStuck = portalCrossingActive && portalCrossingStartTick >= 0
+            && observation.tick - portalCrossingStartTick >= kMovementStuckTicks;
+        if ((movementTargetActive && movementTargetGoal == currentGoal
+             && movementTargetId == portal.wall
+             && observation.tick - targetLastProgressTick >= kMovementStuckTicks)
+            || crossingStuck)
+        {
+            if (portalPlanAttempts < 3)
+            {
+                ++portalPlanAttempts;
+                char detail[96];
+                snprintf(detail, sizeof(detail), "wall=%d attempt=%d reason=waypoint_stuck", portal.wall, portalPlanAttempts);
+                event("local_plan_retry", detail);
+                portalPlanWall = -1;
+                movementTargetActive = false;
+                preparePortalWaypoint(portal);
+            }
+            else
+            {
+                recordEdgeFailure(portal, "local_portal_failed", "bounded_collision_safe_approaches_exhausted");
+                movementTargetActive = false;
+            }
+        }
+        const int targetSector = intermediate ? observation.sector : portal.to;
+        if (!intermediate && !portalWaypointActive
+            && distance2(observation.x, observation.y, portal.x, portal.y)
+                <= (radius + 1024) * (radius + 1024))
+        {
+            // Once the player-sized probe has reached the safe crossing
+            // interval, aim through the portal rather than at the wall line.
+            // This keeps forward motion normal to the actual crossing and
+            // avoids oscillating on a corner when the midpoint is exactly on
+            // the collision plane.
+            if (!portalCrossingActive)
+            {
+                const int dxToPortal = portal.x - observation.x;
+                const int dyToPortal = portal.y - observation.y;
+                const int distance = std::max(1, int(std::sqrt(double(distance2(observation.x, observation.y,
+                                                                                portal.x, portal.y)))));
+                portalCrossingX = portal.x + dxToPortal * 4096 / distance;
+                portalCrossingY = portal.y + dyToPortal * 4096 / distance;
+                portalCrossingActive = true;
+                portalCrossingStartTick = observation.tick;
+                char detail[96];
+                snprintf(detail, sizeof(detail), "wall=%d x=%d y=%d", portal.wall, portalCrossingX, portalCrossingY);
+                event("portal_crossing_push", detail);
+            }
+            targetX = portalCrossingX;
+            targetY = portalCrossingY;
+        }
+        return steerTo(targetX, targetY, false, false, portal.wall, targetSector, portal.capability);
     }
 
     GINPUT steerTo(int x, int y, bool use, bool shoot, int targetId = -1, int targetSector = -1,
@@ -1455,27 +2224,9 @@ struct LLMapperBot::Impl
                  && jumpAttempts >= kMaxJumpAttemptsPerTarget && movementTargetId >= 0
                  && movementTargetSector >= 0)
         {
-            const int edgeId = movementTargetId * 65536 + movementTargetSector;
-            if (!edgeFailed(edgeId))
-            {
-                failedEdges[edgeId] = knowledgeRevision;
-                char detail[96];
-                snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d attempts=%d",
-                         movementTargetId, movementTargetFrom, movementTargetSector, jumpAttempts);
-                event("frontier_failed", detail);
-            }
-            movementTargetActive = false;
-        }
-        else if (currentGoal == "EXPLORE_LOCAL_PORTAL" && movementTargetActive
-                 && movementTargetCapability != kTraversalJumpable
-                 && observation.tick - targetLastProgressTick >= kMovementStuckTicks)
-        {
-            const int edgeId = movementTargetId * 65536 + movementTargetSector;
-            failedEdges[edgeId] = knowledgeRevision;
-            char detail[96];
-            snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d reason=local_approach_blocked",
-                     movementTargetId, movementTargetFrom, movementTargetSector);
-            event("local_portal_failed", detail);
+            const Portal *portal = findPortalForEdge(movementTargetId * 65536 + movementTargetSector);
+            if (portal)
+                recordEdgeFailure(*portal, "frontier_failed", "jump_alternatives_exhausted");
             movementTargetActive = false;
         }
         return input;
@@ -1531,21 +2282,6 @@ struct LLMapperBot::Impl
             }
             unreachableObjects.insert(key->sprite);
         }
-        if (const VisibleObject *interactive = selectObject(kObjectInteractive))
-        {
-            Portal route;
-            if (directObjectReachable(*interactive))
-            {
-                setGoal("USE_VISIBLE_INTERACTIVE", interactive->sprite);
-                return steerTo(interactive->x, interactive->y, true, false, interactive->sprite, interactive->sector);
-            }
-            if (findKnownRoute(interactive->sector, route))
-            {
-                setGoal("NAVIGATE_TO_VISIBLE_INTERACTIVE", interactive->sprite);
-                return steerPortal(route);
-            }
-            unreachableObjects.insert(interactive->sprite);
-        }
         if (const VisibleObject *pickup = selectObject(kObjectPickup))
         {
             Portal route;
@@ -1568,6 +2304,8 @@ struct LLMapperBot::Impl
             input.keyFlags.action = 1;
             return input;
         }
+        if (InteractionMemory *interaction = selectNewInteraction(false))
+            return steerInteraction(*interaction);
         if (const Portal *door = selectKnownDoor())
         {
             const int actualDoorId = selectedDoorId;
@@ -1697,6 +2435,17 @@ struct LLMapperBot::Impl
             }
             return steerPortal(*portal);
         }
+
+        // Exhausting current frontiers is a recovery transition, not a
+        // terminal condition.  Reconsider one previously activated,
+        // reversible interaction at a time before the bounded area search.
+        if (!recoveryMode)
+        {
+            recoveryMode = true;
+            event("exploration_recovery", "reason=no_frontier");
+        }
+        if (InteractionMemory *interaction = selectNewInteraction(true))
+            return steerInteraction(*interaction);
 
         // A short deterministic turn-and-walk probe resolves frontiers that
         // were not visible from the previous sample without consulting the
