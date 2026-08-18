@@ -35,6 +35,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "levels.h"
 #include "map2d.h"
 #include "view.h"
+#include "llmapper/bot/bot.h"
 
 
 int32_t ctrlCheckAllInput(void)
@@ -150,6 +151,12 @@ int gCrouchToggleState = 0;
 
 void ctrlGetInput(void)
 {
+    if (gLLMapperBot.Enabled() && gGameStarted && gInputMode == INPUT_MODE_0)
+    {
+        gInput = gLLMapperBot.GetInput();
+        return;
+    }
+
     ControlInfo info;
 
     if (!gGameStarted || gInputMode != INPUT_MODE_0)

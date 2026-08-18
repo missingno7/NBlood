@@ -49,6 +49,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gui.h"
 #include "levels.h"
 #include "loadsave.h"
+#include "llmapper/bot/bot.h"
 #include "menu.h"
 #include "mirrors.h"
 #include "music.h"
@@ -1170,6 +1171,7 @@ void ProcessFrame(void)
     gLevelTime++;
     gFrame++;
     gFrameClock += kTicsPerFrame;
+    gLLMapperBot.OnFrame();
     if ((gGameOptions.uGameFlags&kGameFlagContinuing) && !gStartNewGame)
     {
         ready2send = 0;
@@ -1258,6 +1260,13 @@ SWITCH switches[] = {
     { "conf", 43, 1 },
     { "noconsole", 43, 0 },
     { "s", 44, 1 },
+    { "bot", 45, 0 },
+    { "bot_timeout", 46, 1 },
+    { "bot_stall", 47, 1 },
+    { "bot_telemetry", 48, 1 },
+    { "bot_trajectory", 49, 1 },
+    { "bot_demo", 50, 1 },
+    { "bot_realtime", 51, 0 },
     { NULL, 0, 0 }
 };
 
@@ -1287,6 +1296,13 @@ void PrintHelp(void)
         "-record\t\tRecord demo\n"
         "-rff\t\tSpecify an RFF file for Blood game resources\n"
         "-s\t\tStart game on difficulty level; Range:0..4; Default:2;\n\n"
+        "-bot\t\tRun the in-process autonomous playtest bot\n"
+        "-bot_timeout [seconds]\tSimulated game-time limit\n"
+        "-bot_stall [seconds]\tProgress watchdog limit\n"
+        "-bot_telemetry [file]\tNDJSON event output\n"
+        "-bot_trajectory [file]\tNDJSON player trajectory output\n"
+        "-bot_demo [file.dem]\tNormal NBlood demo output\n"
+        "-bot_realtime\tDisable accelerated bot timing\n\n"
         "-server [players]\tStart a multiplayer server\n"
 #ifdef STARTUP_SETUP_WINDOW
         "-setup/nosetup\tEnable or disable startup window\n"
@@ -1577,6 +1593,40 @@ void ParseOptions(void)
             gGameOptions.nDifficultyQuantity = gSkill;
             gGameOptions.nDifficultyHealth = gSkill;
             break;
+        case 45:
+            gLLMapperBot.Enable(nullptr, nullptr, nullptr);
+            gNoSetup = 1;
+            bQuickStart = 1;
+            bNoDemo = 1;
+            break;
+        case 46:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gLLMapperBot.ConfigureTimeout(atoi(OptArgv[0]));
+            break;
+        case 47:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gLLMapperBot.ConfigureStallTimeout(atoi(OptArgv[0]));
+            break;
+        case 48:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gLLMapperBot.Enable(OptArgv[0], nullptr, nullptr);
+            break;
+        case 49:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gLLMapperBot.Enable(nullptr, OptArgv[0], nullptr);
+            break;
+        case 50:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gLLMapperBot.Enable(nullptr, nullptr, OptArgv[0]);
+            break;
+        case 51:
+            gLLMapperBot.SetFast(false);
+            break;
         }
     }
 #if 0
@@ -1660,6 +1710,12 @@ int app_main(int argc, char const * const * argv)
 
     memcpy(&gGameOptions, &gSingleGameOptions, sizeof(GAMEOPTIONS));
     ParseOptions();
+    if (gLLMapperBot.Enabled())
+    {
+        gNoSetup = 1;
+        bQuickStart = 1;
+        bNoDemo = 1;
+    }
     G_ExtInit();
 
     if (!g_useCwd)
@@ -1701,7 +1757,7 @@ int app_main(int argc, char const * const * argv)
     ScanINIFiles();
 
 #ifdef STARTUP_SETUP_WINDOW
-    if (readSetup < 0 || (!gNoSetup && (configversion != BYTEVERSION || gSetup.forcesetup)) || gCommandSetup)
+    if (!gLLMapperBot.Enabled() && (readSetup < 0 || (!gNoSetup && (configversion != BYTEVERSION || gSetup.forcesetup)) || gCommandSetup))
     {
         if (quitevent || !startwin_run())
         {
@@ -1848,6 +1904,19 @@ int app_main(int argc, char const * const * argv)
         levelAddUserMap(gUserMapFilename);
         gStartNewGame = 1;
     }
+    if (gLLMapperBot.Enabled())
+    {
+        // The default bot target is the real campaign's first map. A supplied
+        // user map remains the selected target and is not rewritten here.
+        if (!bAddUserMap)
+            levelSetupOptions(0, 0);
+        gGameOptions.nGameType = kGameTypeSinglePlayer;
+        gGameOptions.nDifficulty = 2;
+        gGameOptions.nDifficultyQuantity = 2;
+        gGameOptions.nDifficultyHealth = 2;
+        gStartNewGame = 1;
+        gLLMapperBot.PrepareLaunch();
+    }
     SetupMenus();
     videoSetViewableArea(0, 0, xdim - 1, ydim - 1);
 
@@ -1891,7 +1960,7 @@ RESTART:
         gDemo.Playback();
     if (gDemo.nDemosFound > 0)
         gGameMenuMgr.Deactivate();
-    if (!bAddUserMap && !gGameStarted)
+    if (!gLLMapperBot.Enabled() && !bAddUserMap && !gGameStarted)
     {
         gGameMenuMgr.Push(&menuMain, -1);
         if (gGameOptions.nGameType != kGameTypeSinglePlayer)
@@ -1904,6 +1973,8 @@ RESTART:
         bool bDraw;
         if (gGameStarted)
         {
+            if (gLLMapperBot.Enabled() && gLLMapperBot.Fast())
+                totalclock = gNetFifoClock;
             char gameUpdate = false;
             double const gameUpdateStartTime = timerGetFractionalTicks();
             while (gPredictTail < gNetFifoHead[myconnectindex] && !gPaused)
@@ -1917,7 +1988,7 @@ RESTART:
             {
                 do
                 {
-                    if (!frameJustDrawn)
+                    if (!gLLMapperBot.Enabled() && !frameJustDrawn)
                         break;
                     frameJustDrawn = false;
                     gNetInput = gInput;
@@ -1948,7 +2019,7 @@ RESTART:
                     g_gameUpdateAvgTime = g_gameUpdateTime;
                 g_gameUpdateAvgTime = ((GAMEUPDATEAVGTIMENUMSAMPLES-1.f)*g_gameUpdateAvgTime+g_gameUpdateTime)/((float) GAMEUPDATEAVGTIMENUMSAMPLES);
             }
-            bDraw = engineFPSLimit() != 0;
+            bDraw = gLLMapperBot.Enabled() ? false : engineFPSLimit() != 0;
             if (gQuitRequest && gQuitGame)
                 videoClearScreen(0);
             else
@@ -2064,6 +2135,7 @@ RESTART:
     ready2send = 0;
     if (gDemo.at0)
         gDemo.Close();
+    gLLMapperBot.Finish(gQuitGame ? nullptr : "RUNTIME_ERROR");
     if (gRestartGame)
     {
         UpdateDacs(0, true);
