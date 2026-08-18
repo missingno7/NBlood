@@ -523,7 +523,10 @@ void CDemo::NextDemo(void)
     SetupPlayback(NULL);
 }
 
-const int nInputSize = 17;
+// The current input payload includes the lastWeapon bit added after the
+// original 17-byte layout.  With the reserved alignment bit this is 137 bits,
+// so each packed input occupies 18 bytes.
+const int nInputSize = 18;
 const int nInputSizeLegacy = 22;
 
 void CDemo::FlushInput(int nCount)
