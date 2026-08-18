@@ -184,6 +184,16 @@ struct LocalWaypoint
     int y = 0;
 };
 
+struct MovementProbe
+{
+    bool reachable = false;
+    int wall = -1;
+    int hit = 0;
+    int x = 0;
+    int y = 0;
+    int sector = -1;
+};
+
 static int wrapAngle(int angle)
 {
     angle &= 2047;
@@ -579,8 +589,10 @@ static Observation observeWorld()
                         continue;
                     const int adjacentX = (adjacentWall.x + adjacentNext.x) / 2;
                     const int adjacentY = (adjacentWall.y + adjacentNext.y) / 2;
-                    if (!cansee(result.x, result.y, result.z, result.sector,
-                                adjacentX, adjacentY, result.z, portal.to))
+                    const bool visibleFromPlayer = cansee(
+                        result.x, result.y, result.z, result.sector,
+                        adjacentX, adjacentY, result.z, portal.to);
+                    if (!visibleFromPlayer)
                         continue;
                     InteractionCandidate candidate;
                     candidate.kind = kInteractionWall;
@@ -692,6 +704,30 @@ static const char *objectName(ObjectKind kind)
 
 struct LLMapperBot::Impl
 {
+    enum ObjectiveType
+    {
+        kObjectiveNone,
+        kObjectivePickup,
+        kObjectiveKey,
+        kObjectiveInteraction,
+        kObjectiveFrontier,
+        kObjectiveCombat,
+    };
+
+    struct Objective
+    {
+        ObjectiveType type = kObjectiveNone;
+        bool active = false;
+        int id = -1;
+        int sector = -1;
+        int targetSector = -1;
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        int interactionKey = -1;
+        int wall = -1;
+    };
+
     struct EdgeFailure
     {
         int geometrySignature = 0;
@@ -795,6 +831,9 @@ struct LLMapperBot::Impl
     std::string result;
     std::string failureReason;
     std::string currentGoal;
+    Objective currentObjective;
+    Objective suspendedObjective;
+    bool suspendedObjectiveActive = false;
     Observation observation;
     std::set<int> observedSectors;
     std::set<int> visitedSectors;
@@ -809,6 +848,7 @@ struct LLMapperBot::Impl
     std::set<int> seenEdges;
     std::set<int> visitedEdges;
     std::map<int, EdgeFailure> failedEdges;
+    std::map<int, int> localFailureSignatures;
     std::set<int> jumpFallbackEdges;
     std::set<int> openedRoutes;
     std::map<int, std::vector<Portal>> knownGraph;
@@ -868,12 +908,31 @@ struct LLMapperBot::Impl
     int portalCrossingDestinationY = 0;
     bool portalCrossingDestinationValid = false;
     int portalCrossingStartTick = -1;
+    bool navigationActive = false;
+    int navigationOriginalX = 0;
+    int navigationOriginalY = 0;
+    int navigationOriginalZ = 0;
+    int navigationOriginalSector = -1;
+    int navigationOriginalId = -1;
+    int navigationOriginalSignature = 0;
+    int navigationDetourWall = -1;
+    int navigationDetourDepth = 0;
+    int navigationWaypointX = 0;
+    int navigationWaypointY = 0;
+    bool navigationWaypointActive = false;
+    bool navigationUsingDetour = false;
+    int navigationActionableBlocker = -1;
+    std::set<int> navigationRecentWalls;
     bool crouchTargetActive = false;
     int followThroughKey = -1;
     int followThroughStartTick = -1;
     int followThroughFrom = -1;
     Portal followThroughPortal;
     bool cryptExitProven = false;
+    int lastObservedHealth = -1;
+    int lastDamageTick = -1;
+    int lastInteractionWaitKey = -1;
+    int navigationInteractionPrerequisiteKey = -1;
 
     void openFiles()
     {
@@ -1429,6 +1488,9 @@ struct LLMapperBot::Impl
         observation = observeWorld();
         if (observation.sector < 0)
             return;
+        if (lastObservedHealth >= 0 && observation.health < lastObservedHealth)
+            lastDamageTick = observation.tick;
+        lastObservedHealth = observation.health;
         if (observation.sector != lastGeometryTelemetrySector)
         {
             char detail[160];
@@ -1612,6 +1674,10 @@ struct LLMapperBot::Impl
         for (const Portal &portal : observation.portals)
         {
             const int edgeId = portal.wall * 65536 + portal.to;
+            auto localFailure = localFailureSignatures.find(edgeId);
+            if (localFailure != localFailureSignatures.end()
+                && localFailure->second != portalGeometrySignature(portal))
+                localFailureSignatures.erase(localFailure);
             const bool knownEdge = std::any_of(knownGraph[portal.from].begin(),
                                                knownGraph[portal.from].end(),
                                                [&portal](const Portal &known)
@@ -1862,6 +1928,14 @@ struct LLMapperBot::Impl
         return current && failed->second.geometrySignature == portalGeometrySignature(*current);
     }
 
+    bool localEdgeFailed(int edgeId) const
+    {
+        if (localFailureSignatures.count(edgeId) != 0)
+            return true;
+        auto failure = failedEdges.find(edgeId);
+        return failure != failedEdges.end() && failure->second.attempts > 0;
+    }
+
     void recordEdgeFailure(const Portal &portal, const char *eventName, const char *reason)
     {
         const int edgeId = portal.wall * 65536 + portal.to;
@@ -1873,6 +1947,8 @@ struct LLMapperBot::Impl
             failure.attempts = 0;
         }
         ++failure.attempts;
+        if (strcmp(eventName, "local_portal_failed") == 0)
+            localFailureSignatures[edgeId] = signature;
         char detail[160];
         snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d reason=%s attempts=%d signature=%d",
                  portal.wall, portal.from, portal.to, reason, failure.attempts, signature);
@@ -1996,7 +2072,8 @@ struct LLMapperBot::Impl
             {
                 const int edgeId = portal.wall * 65536 + portal.to;
                 if (portal.wall == currentGoalTarget && portal.traversable
-                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId))
+                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId)
+                    && !localEdgeFailed(edgeId))
                 {
                     localJumpPortal = portal;
                     if (jumpFallbackEdges.count(edgeId))
@@ -2015,7 +2092,8 @@ struct LLMapperBot::Impl
                 const int edgeId = portal.wall * 65536 + portal.to;
                 if (portal.wall == pending->id && portal.to == pending->edgeTarget
                     && portal.localGeometry && portal.traversable
-                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId))
+                    && !visitedEdges.count(edgeId) && !edgeFailed(edgeId)
+                    && !localEdgeFailed(edgeId))
                 {
                     localJumpPortal = portal;
                     if (jumpFallbackEdges.count(edgeId))
@@ -2030,7 +2108,7 @@ struct LLMapperBot::Impl
             if (!portal.localGeometry || portal.capability != kTraversalWalkable)
                 continue;
             const int edgeId = portal.wall * 65536 + portal.to;
-            if (edgeFailed(edgeId) || visitedEdges.count(edgeId)
+            if (edgeFailed(edgeId) || localEdgeFailed(edgeId) || visitedEdges.count(edgeId)
                 || openedRoutes.count(portal.from * 65536 + portal.to)
                 || portal.to == lastTransitionFrom)
                 continue;
@@ -2047,7 +2125,7 @@ struct LLMapperBot::Impl
             if (walkableAvailable && portal.capability != kTraversalWalkable)
                 continue;
             const int edgeId = portal.wall * 65536 + portal.to;
-            if (edgeFailed(edgeId) || visitedEdges.count(edgeId)
+            if (edgeFailed(edgeId) || localEdgeFailed(edgeId) || visitedEdges.count(edgeId)
                 || openedRoutes.count(portal.from * 65536 + portal.to)
                 || portal.to == lastTransitionFrom)
                 continue;
@@ -2117,6 +2195,19 @@ struct LLMapperBot::Impl
                     continue;
                 distance = distance2(observation.x, observation.y, route.x, route.y) + 1000000;
             }
+            // When several visible mechanisms share a compact room, prefer
+            // the one the real ActionScan already resolves from this pose.
+            // This keeps a moving slide-door sequence ordered by the engine's
+            // current target instead of by map-record iteration order.
+            int hit = -1;
+            int target = -1;
+            int extra = -1;
+            hit = memory.fromSector == observation.sector
+                ? ActionScanPreview(gMe, &target, &extra) : -1;
+            const bool actionValid = memory.fromSector == observation.sector
+                && interactionTargetMatches(memory, hit, target);
+            if (!actionValid)
+                distance += 100000000;
             if (distance < bestDistance)
             {
                 bestDistance = distance;
@@ -2270,8 +2361,44 @@ struct LLMapperBot::Impl
             input.keyFlags.action = 1;
         else
         {
-            input = steerTo(memory.x, memory.y, false, false,
-                            memory.id, memory.targetSector, interactionCapability);
+            const int navigationSector = memory.targetSector >= 0
+                ? memory.targetSector : observation.sector;
+            const MovementProbe interactionPath = probeMovement(
+                observation.x, observation.y, observation.z, observation.sector,
+                memory.x, memory.y, navigationSector, std::max(256, kActionApproachRange / 2));
+            // A body probe can quite correctly report the intended push wall
+            // as the blocker.  That is the interaction pose, not a detour
+            // opportunity: let the real player collision settle against the
+            // surface while ActionScan remains authoritative.
+            if (memory.target.wall >= 0 && interactionPath.wall == memory.target.wall)
+            {
+                resetNavigation();
+                input = steerTo(memory.x, memory.y, false, false,
+                                memory.id, navigationSector, interactionCapability);
+            }
+            else
+                input = navigateTo(memory.x, memory.y, memory.z, navigationSector,
+                                   memory.id, interactionCapability);
+            if (navigationActionableBlocker >= 0
+                && navigationActionableBlocker != memory.target.wall)
+            {
+                const int blockerKey = int(kInteractionWall) * 1000000
+                    + navigationActionableBlocker + 1;
+                auto blocker = interactions.find(blockerKey);
+                if (blocker != interactions.end() && blocker->second.observed)
+                {
+                    navigationInteractionPrerequisiteKey = blockerKey;
+                    char blockerDetail[96];
+                    snprintf(blockerDetail, sizeof(blockerDetail),
+                             "wall=%d original=%d", navigationActionableBlocker,
+                             memory.target.wall);
+                    event("navigation_interaction_prerequisite", blockerDetail);
+                }
+                navigationActionableBlocker = -1;
+                return GINPUT{};
+            }
+            if (navigationUsingDetour)
+                return input;
             // steerTo aims movement at the approach point.  Keep the camera
             // aimed at the real wall normal so the authoritative ActionScan
             // sees the same target on the next tick.
@@ -2340,8 +2467,12 @@ struct LLMapperBot::Impl
 
     bool directObjectReachable(const VisibleObject &object) const
     {
-        return object.sector == observation.sector
-            && std::abs(object.z - observation.z) <= kMaxWalkableStep;
+        if (object.sector != observation.sector
+            || std::abs(object.z - observation.z) > kMaxWalkableStep)
+            return false;
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        return probeMovement(observation.x, observation.y, observation.z, observation.sector,
+                             object.x, object.y, object.sector, std::max(512, radius * 2)).reachable;
     }
 
     TraversalCapability currentClearanceCapability() const
@@ -2555,6 +2686,228 @@ struct LLMapperBot::Impl
         event("goal_changed", detail);
     }
 
+    void selectObjective(const Objective &objective, const char *goal)
+    {
+        currentObjective = objective;
+        currentObjective.active = true;
+        setGoal(goal, objective.id);
+        char detail[192];
+        snprintf(detail, sizeof(detail), "type=%d id=%d sector=%d target_sector=%d wall=%d",
+                 int(objective.type), objective.id, objective.sector,
+                 objective.targetSector, objective.wall);
+        event("objective_selected", detail);
+    }
+
+    void completeObjective(const char *reason)
+    {
+        if (!currentObjective.active)
+            return;
+        char detail[128];
+        snprintf(detail, sizeof(detail), "type=%d id=%d reason=%s",
+                 int(currentObjective.type), currentObjective.id, reason);
+        event("objective_completed", detail);
+        currentObjective = Objective{};
+        movementTargetActive = false;
+        resetNavigation();
+    }
+
+    void invalidateObjective(const char *reason)
+    {
+        if (!currentObjective.active)
+            return;
+        char detail[128];
+        snprintf(detail, sizeof(detail), "type=%d id=%d reason=%s",
+                 int(currentObjective.type), currentObjective.id, reason);
+        event("objective_invalidated", detail);
+        currentObjective = Objective{};
+        movementTargetActive = false;
+        resetNavigation();
+        currentGoal.clear();
+        currentGoalTarget = -1;
+    }
+
+    bool urgentThreat()
+    {
+        if (lastDamageTick >= 0 && observation.tick - lastDamageTick <= 2 * kTicsPerSec)
+            return true;
+        const VisibleObject *enemy = selectObject(kObjectEnemy);
+        return enemy && enemy->sector == observation.sector
+            && distance2(enemy->x, enemy->y, observation.x, observation.y) <= 4096 * 4096;
+    }
+
+    bool interactionStillBusy(const InteractionMemory &memory) const
+    {
+        if (memory.target.wall >= 0 && inRange(memory.target.wall, 0, numwalls))
+        {
+            const int extra = wall[memory.target.wall].extra;
+            if (extra > 0 && extra < kMaxXWalls && xwall[extra].busy != 0)
+                return true;
+        }
+        const int sectorId = memory.target.sectorPush ? memory.target.to
+            : memory.target.sectorPushCurrent ? memory.target.from : -1;
+        if (inRange(sectorId, 0, numsectors))
+        {
+            const int extra = sector[sectorId].extra;
+            if (extra > 0 && extra < kMaxXSectors && xsector[extra].busy != 0)
+                return true;
+        }
+        return false;
+    }
+
+    GINPUT executeObjective()
+    {
+        if (!currentObjective.active)
+            return GINPUT{};
+        if (currentObjective.type == kObjectiveInteraction)
+        {
+            if (navigationInteractionPrerequisiteKey >= 0
+                && navigationInteractionPrerequisiteKey != currentObjective.interactionKey)
+            {
+                auto prerequisite = interactions.find(navigationInteractionPrerequisiteKey);
+                if (prerequisite == interactions.end() || !prerequisite->second.observed)
+                {
+                    navigationInteractionPrerequisiteKey = -1;
+                }
+                else
+                {
+                    InteractionMemory &blocker = prerequisite->second;
+                    const bool settled = blocker.engineAccepted && blocker.state == 2
+                        && (!interactionStillBusy(blocker)
+                            || observation.tick - blocker.lastActivationTick >= 2 * kTicsPerSec);
+                    if (settled)
+                    {
+                        navigationInteractionPrerequisiteKey = -1;
+                        event("navigation_interaction_prerequisite_done");
+                    }
+                    else if (blocker.state != 3)
+                        return steerInteraction(blocker);
+                    else
+                        navigationInteractionPrerequisiteKey = -1;
+                }
+            }
+            auto memory = interactions.find(currentObjective.interactionKey);
+            if (memory == interactions.end() || !memory->second.observed)
+            {
+                invalidateObjective("interaction_not_known");
+                return GINPUT{};
+            }
+            InteractionMemory &interaction = memory->second;
+            if (interaction.engineAccepted && interaction.state == 2
+                && interactionStillBusy(interaction)
+                && observation.tick - interaction.lastActivationTick < 2 * kTicsPerSec)
+            {
+                const int key = interactionMemoryKey(interaction);
+                if (lastInteractionWaitKey != key)
+                {
+                    lastInteractionWaitKey = key;
+                    event("interaction_waiting_for_settle", "engine_accepted=1 source_busy=1");
+                }
+                return GINPUT{};
+            }
+            if (interaction.engineAccepted && interaction.state == 2)
+            {
+                lastInteractionWaitKey = -1;
+                completeObjective("engine_accepted_and_settled");
+                return GINPUT{};
+            }
+            if (interaction.state == 3)
+            {
+                invalidateObjective("interaction_rejected");
+                return GINPUT{};
+            }
+            return steerInteraction(interaction);
+        }
+        if (currentObjective.type == kObjectiveFrontier)
+        {
+            if (observation.sector == currentObjective.targetSector)
+            {
+                completeObjective("sector_transition");
+                return GINPUT{};
+            }
+            if (portalPlanWall == currentObjective.wall && portalPlanAttempts >= 3)
+            {
+                const int edgeId = currentObjective.wall * 65536 + currentObjective.targetSector;
+                for (const Portal &portal : observation.portals)
+                    if (portal.wall == currentObjective.wall
+                        && portal.to == currentObjective.targetSector)
+                        localFailureSignatures[edgeId] = portalGeometrySignature(portal);
+                retirePendingFrontier(currentObjective.wall, currentObjective.sector,
+                                      currentObjective.targetSector);
+                invalidateObjective("local_navigation_exhausted");
+                return GINPUT{};
+            }
+            if (observation.sector == currentObjective.sector)
+            {
+                for (const Portal &portal : observation.portals)
+                    if (portal.wall == currentObjective.wall
+                        && portal.to == currentObjective.targetSector)
+                        return steerPortal(portal);
+            }
+            Portal route;
+            if (!findKnownRoute(currentObjective.targetSector, route))
+            {
+                invalidateObjective("frontier_no_current_route");
+                return GINPUT{};
+            }
+            return steerPortal(route);
+        }
+        if (currentObjective.type == kObjectivePickup
+            || currentObjective.type == kObjectiveKey)
+        {
+            const ObjectKind kind = currentObjective.type == kObjectiveKey
+                ? kObjectKey : kObjectPickup;
+            const VisibleObject *object = nullptr;
+            for (const VisibleObject &candidate : observation.objects)
+            {
+                if (candidate.sprite == currentObjective.id && candidate.kind == kind)
+                {
+                    object = &candidate;
+                    break;
+                }
+            }
+            if (!object)
+            {
+                completeObjective("object_collected_or_no_longer_visible");
+                return GINPUT{};
+            }
+            if (object->sector != observation.sector)
+            {
+                Portal route;
+                if (!findKnownRoute(object->sector, route))
+                {
+                    invalidateObjective("object_no_current_route");
+                    return GINPUT{};
+                }
+                return steerPortal(route);
+            }
+            return navigateTo(object->x, object->y, object->z, object->sector,
+                              object->sprite, kTraversalUnknown);
+        }
+        if (currentObjective.type == kObjectiveCombat)
+        {
+            const VisibleObject *enemy = nullptr;
+            for (const VisibleObject &candidate : observation.objects)
+                if (candidate.sprite == currentObjective.id && candidate.kind == kObjectEnemy)
+                {
+                    enemy = &candidate;
+                    break;
+                }
+            if (!enemy)
+            {
+                completeObjective("threat_gone");
+                return GINPUT{};
+            }
+            if (directObjectReachable(*enemy))
+                return navigateTo(enemy->x, enemy->y, enemy->z, enemy->sector,
+                                  enemy->sprite, kTraversalUnknown, true);
+            int rangedWeapon = kWeaponNone;
+            if (rangedWeaponAvailable(rangedWeapon))
+                return aimAndShoot(*enemy, rangedWeapon);
+            invalidateObjective("threat_not_reachable");
+        }
+        return GINPUT{};
+    }
+
     void setMovementTarget(int x, int y, int targetSector, int targetId,
                            TraversalCapability capability = kTraversalUnknown)
     {
@@ -2622,11 +2975,15 @@ struct LLMapperBot::Impl
             && distance2(observation.x, observation.y, movementTargetX, movementTargetY) > 4096;
     }
 
-    bool collisionProbe(int startX, int startY, int startZ, int startSector,
-                        int targetX, int targetY, int targetSector, int tolerance) const
+    MovementProbe probeMovement(int startX, int startY, int startZ, int startSector,
+                                int targetX, int targetY, int targetSector, int tolerance) const
     {
+        MovementProbe result;
+        result.x = startX;
+        result.y = startY;
+        result.sector = startSector;
         if (!inRange(startSector, 0, numsectors) || !inRange(targetSector, 0, numsectors))
-            return false;
+            return result;
         vec3_t position = { startX, startY, startZ };
         int16_t sectorNumber = int16_t(startSector);
         const int64_t dx = int64_t(targetX) - startX;
@@ -2637,10 +2994,235 @@ struct LLMapperBot::Impl
         int ceilingDistance = 0;
         int floorDistance = 0;
         playerCollisionDistances(ceilingDistance, floorDistance);
-        clipmove(&position, &sectorNumber, xvect, yvect, radius,
-                 ceilingDistance, floorDistance, CLIPMASK0);
+        result.hit = clipmove(&position, &sectorNumber, xvect, yvect, radius,
+                              ceilingDistance, floorDistance, CLIPMASK0);
+        result.x = position.x;
+        result.y = position.y;
+        result.sector = sectorNumber;
+        if ((result.hit & 0xc000) == 0x8000)
+            result.wall = result.hit & 0x3fff;
         const int remaining = distance2(position.x, position.y, targetX, targetY);
-        return sectorNumber == targetSector && remaining <= tolerance * tolerance;
+        result.reachable = sectorNumber == targetSector && remaining <= tolerance * tolerance;
+        return result;
+    }
+
+    bool collisionProbe(int startX, int startY, int startZ, int startSector,
+                        int targetX, int targetY, int targetSector, int tolerance) const
+    {
+        return probeMovement(startX, startY, startZ, startSector,
+                             targetX, targetY, targetSector, tolerance).reachable;
+    }
+
+    int navigationSignature(int x, int y, int z, int sector, int id) const
+    {
+        int signature = x * 31 + y;
+        signature = signature * 31 + z;
+        signature = signature * 31 + sector;
+        signature = signature * 31 + id;
+        return signature;
+    }
+
+    void resetNavigation()
+    {
+        navigationActive = false;
+        navigationWaypointActive = false;
+        navigationUsingDetour = false;
+        navigationDetourWall = -1;
+        navigationDetourDepth = 0;
+        navigationRecentWalls.clear();
+    }
+
+    bool chooseNavigationDetour(const MovementProbe &blocked)
+    {
+        if (blocked.wall < 0 || !inRange(blocked.wall, 0, numwalls)
+            || navigationDetourDepth >= 4
+            || navigationRecentWalls.count(blocked.wall))
+            return false;
+
+        const walltype &obstacle = wall[blocked.wall];
+        if (!inRange(obstacle.point2, 0, numwalls))
+            return false;
+        const walltype &obstacleEnd = wall[obstacle.point2];
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        const int margin = std::max(512, radius + 256);
+        const int dirs[][2] = {{ 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+                               { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 }};
+        const int corners[][2] = {{ obstacle.x, obstacle.y },
+                                  { obstacleEnd.x, obstacleEnd.y }};
+        struct Candidate { int x; int y; bool finalReachable; int distance; };
+        std::vector<Candidate> candidates;
+        for (const auto &corner : corners)
+        {
+            for (const auto &dir : dirs)
+            {
+                const int norm = (dir[0] && dir[1]) ? 181 : 256;
+                Candidate candidate;
+                candidate.x = corner[0] + dir[0] * margin * 256 / norm;
+                candidate.y = corner[1] + dir[1] * margin * 256 / norm;
+                const MovementProbe fromPlayer = probeMovement(
+                    observation.x, observation.y, observation.z, observation.sector,
+                    candidate.x, candidate.y, observation.sector, std::max(256, radius));
+                if (!fromPlayer.reachable)
+                    continue;
+                const MovementProbe toOriginal = probeMovement(
+                    candidate.x, candidate.y, observation.z, observation.sector,
+                    navigationOriginalX, navigationOriginalY, navigationOriginalSector,
+                    std::max(256, radius));
+                candidate.finalReachable = toOriginal.reachable;
+                candidate.distance = distance2(candidate.x, candidate.y,
+                                               navigationOriginalX, navigationOriginalY);
+                candidates.push_back(candidate);
+            }
+        }
+        if (candidates.empty())
+            return false;
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const Candidate &left, const Candidate &right)
+                         {
+                             if (left.finalReachable != right.finalReachable)
+                                 return left.finalReachable > right.finalReachable;
+                             return left.distance < right.distance;
+                         });
+        const Candidate &selected = candidates.front();
+        navigationDetourWall = blocked.wall;
+        navigationRecentWalls.insert(blocked.wall);
+        navigationWaypointX = selected.x;
+        navigationWaypointY = selected.y;
+        navigationWaypointActive = true;
+        navigationUsingDetour = true;
+        ++navigationDetourDepth;
+        char detail[192];
+        snprintf(detail, sizeof(detail), "wall=%d waypoint=(%d,%d) depth=%d final_direct=%d",
+                 blocked.wall, selected.x, selected.y, navigationDetourDepth,
+                 selected.finalReachable ? 1 : 0);
+        event("navigation_detour", detail);
+        return true;
+    }
+
+    bool rememberCollisionInteraction(int wallIndex)
+    {
+        if (!inRange(wallIndex, 0, numwalls)
+            || !inRange(observation.sector, 0, numsectors))
+            return false;
+
+        const walltype &wallRecord = wall[wallIndex];
+        if (!inRange(wallRecord.point2, 0, numwalls))
+            return false;
+        if (!inRange(wallRecord.extra, 1, kMaxXWalls)
+            || !xwall[wallRecord.extra].triggerPush)
+            return false;
+
+        const walltype &nextWall = wall[wallRecord.point2];
+        InteractionCandidate candidate;
+        candidate.kind = kInteractionWall;
+        candidate.id = wallIndex;
+        candidate.fromSector = observation.sector;
+        candidate.targetSector = -1;
+        candidate.x = (wallRecord.x + nextWall.x) / 2;
+        candidate.y = (wallRecord.y + nextWall.y) / 2;
+        candidate.z = observation.z;
+        candidate.key = xwall[wallRecord.extra].key;
+        candidate.locked = xwall[wallRecord.extra].locked != 0;
+        candidate.reversible = true;
+        candidate.target.wall = wallIndex;
+        candidate.target.from = observation.sector;
+        candidate.target.to = -1;
+        candidate.target.x = candidate.x;
+        candidate.target.y = candidate.y;
+        candidate.target.wallPush = true;
+        candidate.target.x1 = wallRecord.x;
+        candidate.target.y1 = wallRecord.y;
+        candidate.target.x2 = nextWall.x;
+        candidate.target.y2 = nextWall.y;
+        setInteractionGeometry(candidate.target);
+        candidate.z = candidate.target.z;
+        rememberInteraction(candidate);
+        return true;
+    }
+
+    GINPUT navigateTo(int x, int y, int z, int targetSector, int targetId = -1,
+                      TraversalCapability capability = kTraversalUnknown, bool shoot = false)
+    {
+        navigationActionableBlocker = -1;
+        const int signature = navigationSignature(x, y, z, targetSector, targetId);
+        if (!navigationActive || navigationOriginalSignature != signature)
+        {
+            resetNavigation();
+            navigationActive = true;
+            navigationOriginalX = x;
+            navigationOriginalY = y;
+            navigationOriginalZ = z;
+            navigationOriginalSector = targetSector;
+            navigationOriginalId = targetId;
+            navigationOriginalSignature = signature;
+        }
+
+        const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+        const int tolerance = std::max(256, radius);
+        MovementProbe direct = probeMovement(observation.x, observation.y, observation.z,
+                                             observation.sector, x, y, targetSector, tolerance);
+        if (direct.reachable)
+        {
+            if (navigationUsingDetour)
+                event("navigation_retarget_original");
+            navigationWaypointActive = false;
+            navigationUsingDetour = false;
+            navigationDetourDepth = 0;
+            navigationRecentWalls.clear();
+            return steerTo(x, y, false, shoot, targetId, targetSector, capability);
+        }
+
+        if (navigationWaypointActive)
+        {
+            if (distance2(observation.x, observation.y, navigationWaypointX,
+                          navigationWaypointY) <= tolerance * tolerance)
+            {
+                navigationWaypointActive = false;
+                event("navigation_retarget_original");
+                return steerTo(x, y, false, shoot, targetId, targetSector, capability);
+            }
+            const MovementProbe waypoint = probeMovement(
+                observation.x, observation.y, observation.z, observation.sector,
+                navigationWaypointX, navigationWaypointY, observation.sector, tolerance);
+            if (!waypoint.reachable && waypoint.wall >= 0
+                && waypoint.wall != navigationDetourWall)
+            {
+                navigationWaypointActive = false;
+                navigationUsingDetour = false;
+            }
+            else
+            {
+                return steerTo(navigationWaypointX, navigationWaypointY, false, false,
+                               targetId, observation.sector, capability);
+            }
+        }
+
+        if (direct.wall >= 0)
+        {
+            bool actionable = false;
+            for (const InteractionCandidate &candidate : observation.interactions)
+            {
+                if (candidate.kind == kInteractionWall && candidate.id == direct.wall)
+                {
+                    actionable = true;
+                    break;
+                }
+            }
+            char detail[160];
+            snprintf(detail, sizeof(detail), "wall=%d target=%d actionable=%d stop=(%d,%d)",
+                     direct.wall, targetId, actionable ? 1 : 0, direct.x, direct.y);
+            event("navigation_blocked", detail);
+            if (rememberCollisionInteraction(direct.wall))
+            {
+                navigationActionableBlocker = direct.wall;
+                event("navigation_interaction_blocker", "source=clipmove_collision_hit");
+            }
+            if (chooseNavigationDetour(direct))
+                return steerTo(navigationWaypointX, navigationWaypointY, false, false,
+                               targetId, observation.sector, capability);
+        }
+        event("navigation_failed", "reason=no_bounded_collision_safe_detour");
+        return steerTo(x, y, false, false, targetId, targetSector, capability);
     }
 
     void preparePortalWaypoint(const Portal &portal)
@@ -2961,7 +3543,15 @@ struct LLMapperBot::Impl
             targetX = portalCrossingX;
             targetY = portalCrossingY;
         }
-        return steerTo(targetX, targetY, false, false, portal.wall, targetSector, portal.capability);
+        // The final push through a portal is a specialization of the generic
+        // navigator.  Once the safe crossing point has been selected, retain
+        // the proven shallow Build movement semantics: a moving-door portal
+        // can still report its own slide-wall as a clipmove obstacle while
+        // the real player tick is already able to consume the opening.
+        if (portalCrossingActive)
+            return steerTo(targetX, targetY, false, false, portal.wall, targetSector,
+                           portal.capability);
+        return navigateTo(targetX, targetY, portal.z, targetSector, portal.wall, portal.capability);
     }
 
     GINPUT steerTo(int x, int y, bool use, bool shoot, int targetId = -1, int targetSector = -1,
@@ -3035,6 +3625,27 @@ struct LLMapperBot::Impl
         if (result.size())
             return idle;
 
+        if (currentObjective.active)
+        {
+            if (urgentThreat() && currentObjective.type != kObjectiveCombat)
+            {
+                suspendedObjective = currentObjective;
+                suspendedObjectiveActive = true;
+                currentObjective = Objective{};
+                event("objective_suspended", "reason=urgent_threat");
+            }
+            else
+                return executeObjective();
+        }
+        if (suspendedObjectiveActive && !urgentThreat())
+        {
+            currentObjective = suspendedObjective;
+            suspendedObjective = Objective{};
+            suspendedObjectiveActive = false;
+            event("objective_resumed");
+            return executeObjective();
+        }
+
         // A real accepted interaction that changed a nearby passage remains
         // the active progression objective until the player consumes it.
         // Combat is allowed afterwards, but it must not erase this one
@@ -3059,45 +3670,42 @@ struct LLMapperBot::Impl
             followThroughPortal = Portal{};
         }
 
-        if (const VisibleObject *enemy = selectObject(kObjectEnemy))
+        if (urgentThreat())
         {
-            Portal route;
-            int rangedWeapon = kWeaponNone;
-            if (enemy->sector != observation.sector && findKnownRoute(enemy->sector, route))
+            if (const VisibleObject *enemy = selectObject(kObjectEnemy))
             {
-                setGoal("NAVIGATE_TO_VISIBLE_ENEMY", enemy->sprite);
-                return steerPortal(route);
-            }
-            if (directObjectReachable(*enemy))
-            {
-                setGoal("COMBAT_MELEE_REACHABLE_ENEMY", enemy->sprite);
-                return steerTo(enemy->x, enemy->y, false, true, enemy->sprite, enemy->sector);
-            }
-            if (rangedWeaponAvailable(rangedWeapon))
-            {
-                setGoal("COMBAT_RANGED_VISIBLE_ENEMY", enemy->sprite);
-                return aimAndShoot(*enemy, rangedWeapon);
-            }
-            if (unreachableEnemies.insert(enemy->sprite).second)
-            {
-                char detail[96];
-                snprintf(detail, sizeof(detail), "sprite=%d sector=%d dz=%d reason=no_route_or_ranged_weapon",
-                         enemy->sprite, enemy->sector, enemy->z - observation.z);
-                event("enemy_unreachable", detail);
+                Objective objective;
+                objective.type = kObjectiveCombat;
+                objective.id = enemy->sprite;
+                objective.sector = enemy->sector;
+                objective.targetSector = enemy->sector;
+                selectObjective(objective, "COMBAT_THREAT");
+                return executeObjective();
             }
         }
+
         if (const VisibleObject *key = selectObject(kObjectKey))
         {
             Portal route;
             if (directObjectReachable(*key))
             {
-                setGoal("COLLECT_VISIBLE_KEY", key->sprite);
-                return steerTo(key->x, key->y, false, false, key->sprite, key->sector);
+                Objective objective;
+                objective.type = kObjectiveKey;
+                objective.id = key->sprite;
+                objective.sector = key->sector;
+                objective.targetSector = key->sector;
+                selectObjective(objective, "COLLECT_VISIBLE_KEY");
+                return executeObjective();
             }
             if (findKnownRoute(key->sector, route))
             {
-                setGoal("NAVIGATE_TO_VISIBLE_KEY", key->sprite);
-                return steerPortal(route);
+                Objective objective;
+                objective.type = kObjectiveKey;
+                objective.id = key->sprite;
+                objective.sector = key->sector;
+                objective.targetSector = key->sector;
+                selectObjective(objective, "NAVIGATE_TO_VISIBLE_KEY");
+                return executeObjective();
             }
             unreachableObjects.insert(key->sprite);
         }
@@ -3106,13 +3714,23 @@ struct LLMapperBot::Impl
             Portal route;
             if (directObjectReachable(*pickup))
             {
-                setGoal("COLLECT_VISIBLE_PICKUP", pickup->sprite);
-                return steerTo(pickup->x, pickup->y, false, false, pickup->sprite, pickup->sector);
+                Objective objective;
+                objective.type = kObjectivePickup;
+                objective.id = pickup->sprite;
+                objective.sector = pickup->sector;
+                objective.targetSector = pickup->sector;
+                selectObjective(objective, "COLLECT_VISIBLE_PICKUP");
+                return executeObjective();
             }
             if (findKnownRoute(pickup->sector, route))
             {
-                setGoal("NAVIGATE_TO_VISIBLE_PICKUP", pickup->sprite);
-                return steerPortal(route);
+                Objective objective;
+                objective.type = kObjectivePickup;
+                objective.id = pickup->sprite;
+                objective.sector = pickup->sector;
+                objective.targetSector = pickup->sector;
+                selectObjective(objective, "NAVIGATE_TO_VISIBLE_PICKUP");
+                return executeObjective();
             }
             unreachableObjects.insert(pickup->sprite);
         }
@@ -3124,7 +3742,22 @@ struct LLMapperBot::Impl
             return input;
         }
         if (InteractionMemory *interaction = selectNewInteraction(false))
-            return steerInteraction(*interaction);
+        {
+            Objective objective;
+            objective.type = kObjectiveInteraction;
+            objective.id = interaction->id;
+            objective.sector = interaction->fromSector;
+            objective.targetSector = interaction->targetSector;
+            objective.x = interaction->x;
+            objective.y = interaction->y;
+            objective.z = interaction->z;
+            objective.interactionKey = interactionMemoryKey(*interaction);
+            selectObjective(objective, interaction->kind == kInteractionSprite
+                ? "USE_NEW_SPRITE_INTERACTION"
+                : interaction->kind == kInteractionSector
+                ? "USE_NEW_SECTOR_INTERACTION" : "USE_NEW_WALL_INTERACTION");
+            return executeObjective();
+        }
         // Portal-backed USE targets are handled by InteractionMemory above.
         // Keeping a second DoorMemory goal selector here lets the same
         // ActionScan target compete with the authoritative generic lifecycle.
@@ -3248,7 +3881,14 @@ struct LLMapperBot::Impl
                          localPortal->openingWidth, localPortal->clearance);
                 event("local_portal_target", detail);
             }
-            return steerPortal(*localPortal);
+            Objective objective;
+            objective.type = kObjectiveFrontier;
+            objective.id = localPortal->wall;
+            objective.sector = localPortal->from;
+            objective.targetSector = localPortal->to;
+            objective.wall = localPortal->wall;
+            selectObjective(objective, "EXPLORE_LOCAL_PORTAL");
+            return executeObjective();
         }
         if (const Portal *portal = selectPortal())
         {
@@ -3262,7 +3902,14 @@ struct LLMapperBot::Impl
                          portal->jumpable ? 1 : 0, portal->openingWidth, portal->floorDelta, portal->clearance);
                 event("frontier_target", detail);
             }
-            return steerPortal(*portal);
+            Objective objective;
+            objective.type = kObjectiveFrontier;
+            objective.id = portal->wall;
+            objective.sector = portal->from;
+            objective.targetSector = portal->to;
+            objective.wall = portal->wall;
+            selectObjective(objective, "EXPLORE_FRONTIER");
+            return executeObjective();
         }
 
         // Exhausting current frontiers is a recovery transition, not a
