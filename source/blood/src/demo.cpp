@@ -90,6 +90,7 @@ CDemo::CDemo()
     pFirstDemo = NULL;
     pCurrentDemo = NULL;
     nDemosFound = 0;
+    m_playbackSpeed = 1;
     at2 = 0;
     memset(&atf, 0, sizeof(atf));
     m_bLegacy = false;
@@ -307,6 +308,15 @@ bool CDemo::SetupPlayback(const char *pzFile)
     return 1;
 }
 
+void CDemo::SetPlaybackSpeed(int speed)
+{
+    if (speed < 1)
+        speed = 1;
+    if (speed > 8)
+        speed = 8;
+    m_playbackSpeed = speed;
+}
+
 void CDemo::ProcessKeys(void)
 {
     switch (gInputMode)
@@ -369,6 +379,7 @@ void CDemo::Playback(void)
     CONTROL_BindsEnabled = false;
     ready2send = 0;
     int v4 = 0;
+    int playbackBurst = 0;
     if (!CGameMenuMgr::m_bActive)
     {
         gGameMenuMgr.Push(&menuMain, -1);
@@ -379,7 +390,7 @@ void CDemo::Playback(void)
 _DEMOPLAYBACK:
     while (at1 && !gQuitGame)
     {
-        while (totalclock >= gNetFifoClock && !gQuitGame)
+        while ((totalclock >= gNetFifoClock || playbackBurst > 0) && !gQuitGame)
         {
             if (!v4)
             {
@@ -433,6 +444,7 @@ _DEMOPLAYBACK:
                         Close();
                         NextDemo();
                         gNetFifoClock = totalclock;
+                        playbackBurst = 0;
                         goto _DEMOPLAYBACK;
                     }
                     else
@@ -446,6 +458,10 @@ _DEMOPLAYBACK:
             gNetFifoClock += kTicsPerFrame;
             if (!gQuitGame)
                 ProcessFrame();
+            if (playbackBurst > 0)
+                --playbackBurst;
+            else if (m_playbackSpeed > 1)
+                playbackBurst = m_playbackSpeed - 1;
             ready2send = 0;
         }
         if (engineFPSLimit())

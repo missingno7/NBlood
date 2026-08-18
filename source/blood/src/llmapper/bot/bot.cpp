@@ -1038,7 +1038,7 @@ struct LLMapperBot::Impl
 };
 
 LLMapperBot::LLMapperBot()
-    : m_impl(new Impl), m_enabled(false), m_fast(true)
+    : m_impl(new Impl), m_enabled(false), m_fast(true), m_visible(false)
 {
 }
 
@@ -1074,6 +1074,13 @@ void LLMapperBot::ConfigureStallTimeout(int seconds)
 void LLMapperBot::SetFast(bool fast)
 {
     m_fast = fast;
+}
+
+void LLMapperBot::SetVisible(bool visible)
+{
+    m_visible = visible;
+    if (visible)
+        m_fast = false;
 }
 
 void LLMapperBot::PrepareLaunch()

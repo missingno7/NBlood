@@ -18,9 +18,11 @@ public:
     void ConfigureTimeout(int seconds);
     void ConfigureStallTimeout(int seconds);
     void SetFast(bool fast);
+    void SetVisible(bool visible);
 
     bool Enabled() const { return m_enabled; }
     bool Fast() const { return m_fast; }
+    bool Visible() const { return m_visible; }
 
     // Called once after resources and the demo subsystem are initialized.
     void PrepareLaunch();
@@ -42,6 +44,7 @@ private:
     Impl *m_impl;
     bool m_enabled;
     bool m_fast;
+    bool m_visible;
 };
 
 extern LLMapperBot gLLMapperBot;

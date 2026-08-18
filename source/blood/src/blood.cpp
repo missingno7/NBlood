@@ -1267,6 +1267,8 @@ SWITCH switches[] = {
     { "bot_trajectory", 49, 1 },
     { "bot_demo", 50, 1 },
     { "bot_realtime", 51, 0 },
+    { "bot_visible", 52, 0 },
+    { "playback_speed", 53, 1 },
     { NULL, 0, 0 }
 };
 
@@ -1302,7 +1304,9 @@ void PrintHelp(void)
         "-bot_telemetry [file]\tNDJSON event output\n"
         "-bot_trajectory [file]\tNDJSON player trajectory output\n"
         "-bot_demo [file.dem]\tNormal NBlood demo output\n"
-        "-bot_realtime\tDisable accelerated bot timing\n\n"
+        "-bot_realtime\tDisable accelerated bot timing\n"
+        "-bot_visible\tShow the bot in the normal game window\n"
+        "-playback_speed [1..8]\tDemo playback speed multiplier\n\n"
         "-server [players]\tStart a multiplayer server\n"
 #ifdef STARTUP_SETUP_WINDOW
         "-setup/nosetup\tEnable or disable startup window\n"
@@ -1626,6 +1630,14 @@ void ParseOptions(void)
             break;
         case 51:
             gLLMapperBot.SetFast(false);
+            break;
+        case 52:
+            gLLMapperBot.SetVisible(true);
+            break;
+        case 53:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gDemo.SetPlaybackSpeed(atoi(OptArgv[0]));
             break;
         }
     }
@@ -2019,7 +2031,9 @@ RESTART:
                     g_gameUpdateAvgTime = g_gameUpdateTime;
                 g_gameUpdateAvgTime = ((GAMEUPDATEAVGTIMENUMSAMPLES-1.f)*g_gameUpdateAvgTime+g_gameUpdateTime)/((float) GAMEUPDATEAVGTIMENUMSAMPLES);
             }
-            bDraw = gLLMapperBot.Enabled() ? false : engineFPSLimit() != 0;
+            bDraw = gLLMapperBot.Enabled()
+                ? (gLLMapperBot.Visible() && engineFPSLimit() != 0)
+                : engineFPSLimit() != 0;
             if (gQuitRequest && gQuitGame)
                 videoClearScreen(0);
             else
