@@ -593,6 +593,7 @@ struct LLMapperBot::Impl
         int attempts = 0;
         Availability availability = kActionable;
         bool opened = false;
+        bool engineAccepted = false;
         int unavailableReason = 0;
         InteractionState interaction = kIdle;
         int interactionStartedTick = -1;
@@ -620,8 +621,15 @@ struct LLMapperBot::Impl
         int beforeState = 0;
         int afterState = 0;
         int unavailableFromSector = -1;
+        int unavailableState = 0;
+        int unavailableAttempts = 0;
+        int unavailablePose = 0;
         int state = 0;
+        bool engineAccepted = false;
+        bool observedLocalEffect = false;
+        bool observedKnownWorldDelta = false;
         bool recoveryAttempted = false;
+        std::vector<Portal> beforePortals;
         Portal target;
     };
 
@@ -631,6 +639,7 @@ struct LLMapperBot::Impl
         int id = -1;
         int sector = -1;
         int edgeTarget = -1;
+        bool resolved = false;
     };
 
     FILE *telemetry = nullptr;
@@ -725,6 +734,11 @@ struct LLMapperBot::Impl
     int portalCrossingY = 0;
     int portalCrossingStartTick = -1;
     bool crouchTargetActive = false;
+    int followThroughKey = -1;
+    int followThroughStartTick = -1;
+    int followThroughFrom = -1;
+    Portal followThroughPortal;
+    bool cryptExitProven = false;
 
     void openFiles()
     {
@@ -745,6 +759,145 @@ struct LLMapperBot::Impl
         fflush(telemetry);
     }
 
+    void retirePendingInteraction(int key)
+    {
+        for (PendingWork &pending : pendingWork)
+        {
+            if (pending.kind == 1 && pending.id == key)
+                pending.resolved = true;
+        }
+    }
+
+    void retirePendingFrontier(int wall, int from, int to)
+    {
+        for (PendingWork &pending : pendingWork)
+        {
+            if (pending.kind == 2 && pending.id == wall
+                && pending.sector == from && pending.edgeTarget == to)
+                pending.resolved = true;
+        }
+    }
+
+    bool pendingFrontierLive(const PendingWork &pending) const
+    {
+        if (pending.resolved || pending.kind != 2)
+            return false;
+        const int edgeId = pending.id * 65536 + pending.edgeTarget;
+        if (visitedEdges.count(edgeId) || edgeFailed(edgeId))
+            return false;
+        if (pending.sector == observation.sector)
+        {
+            for (const Portal &portal : observation.portals)
+            {
+                if (portal.wall == pending.id && portal.to == pending.edgeTarget)
+                    return portal.traversable || portal.jumpable;
+            }
+            return false;
+        }
+        auto graph = knownGraph.find(pending.sector);
+        if (graph == knownGraph.end())
+            return false;
+        return std::any_of(graph->second.begin(), graph->second.end(), [&pending](const Portal &portal)
+        {
+            return portal.wall == pending.id && portal.to == pending.edgeTarget
+                && (portal.traversable || portal.jumpable);
+        });
+    }
+
+    bool pendingWorkLive(const PendingWork &pending) const
+    {
+        if (pending.resolved)
+            return false;
+        if (pending.kind == 2)
+            return pendingFrontierLive(pending);
+        if (pending.kind != 1)
+            return false;
+        auto memory = interactions.find(pending.id);
+        return memory != interactions.end() && memory->second.observed
+            && !memory->second.attempted;
+    }
+
+    int interactionSourceSignature(const InteractionMemory &memory) const
+    {
+        return interactionStateSignature(memory);
+    }
+
+    void emitInteractionPortalState(const InteractionMemory &memory, const char *phase)
+    {
+        if (memory.target.wall < 0 || !inRange(memory.target.from, 0, numsectors)
+            || !inRange(memory.target.wall, 0, numwalls))
+            return;
+        const walltype &wallRecord = wall[memory.target.wall];
+        if (!inRange(wallRecord.nextsector, 0, numsectors))
+            return;
+        const walltype &nextWall = wall[wallRecord.point2];
+        const int midX = (wallRecord.x + nextWall.x) / 2;
+        const int midY = (wallRecord.y + nextWall.y) / 2;
+        const int fromFloor = getflorzofslope(memory.target.from, midX, midY);
+        const int fromCeiling = getceilzofslope(memory.target.from, midX, midY);
+        const int toFloor = getflorzofslope(wallRecord.nextsector, midX, midY);
+        const int toCeiling = getceilzofslope(wallRecord.nextsector, midX, midY);
+        const int toSector = wallRecord.nextsector;
+        const int cstat = wallRecord.cstat;
+        const int width = int(std::sqrt(double(distance2(wallRecord.x, wallRecord.y,
+                                                      nextWall.x, nextWall.y))));
+        const int clearance = std::min(fromFloor - fromCeiling, toFloor - toCeiling);
+        char detail[256];
+        snprintf(detail, sizeof(detail),
+                 "phase=%s wall=%d from=%d to=%d cstat=%d floor_delta=%d clearance=%d width=%d observed_portal=%d",
+                 phase, memory.target.wall, memory.target.from, toSector,
+                 cstat, toFloor - fromFloor, clearance, width,
+                 std::any_of(observation.portals.begin(), observation.portals.end(),
+                             [&wallRecord](const Portal &portal)
+                             {
+                                 return portal.wall == (&wallRecord - wall)
+                                     && portal.to == wallRecord.nextsector;
+                             }) ? 1 : 0);
+        event("interaction_portal_state", detail);
+    }
+
+    void updateFollowThrough(InteractionMemory &memory)
+    {
+        if (!memory.engineAccepted || memory.beforePortals.empty())
+            return;
+        for (const Portal &portal : observation.portals)
+        {
+            if (portal.from != memory.fromSector || portal.to == portal.from)
+                continue;
+            if (memory.target.wall >= 0 && portal.wall != memory.target.wall
+                && memory.target.to != portal.to)
+                continue;
+            if (memory.target.to >= 0 && memory.target.to != portal.to)
+                continue;
+            if (!portal.traversable && !portal.jumpable)
+                continue;
+            bool wasTraversable = false;
+            for (const Portal &before : memory.beforePortals)
+            {
+                if (before.wall == portal.wall && before.to == portal.to)
+                {
+                    wasTraversable = before.traversable || before.jumpable;
+                    break;
+                }
+            }
+            if (wasTraversable)
+                continue;
+
+            followThroughKey = interactionMemoryKey(memory);
+            followThroughStartTick = observation.tick;
+            followThroughFrom = portal.from;
+            followThroughPortal = portal;
+            char detail[192];
+            snprintf(detail, sizeof(detail),
+                     "kind=%d id=%d wall=%d from=%d to=%d before_traversable=0 after_traversable=%d floor_delta=%d clearance=%d",
+                     int(memory.kind), memory.id, portal.wall, portal.from, portal.to,
+                     portal.traversable || portal.jumpable ? 1 : 0,
+                     portal.floorDelta, portal.clearance);
+            event("interaction_follow_through_ready", detail);
+            return;
+        }
+    }
+
     void actionResolved(int hit, int target, int extra, bool accepted, int key)
     {
         const char *kind = hit == 0 ? "wall" : hit == 3 ? "sprite" : hit == 6 ? "sector" : "none";
@@ -760,13 +913,76 @@ struct LLMapperBot::Impl
             if (entry.first == pendingInteractionKey && memory.state == 1
                 && interactionTargetMatches(memory, hit, target))
             {
-                char interactionDetail[128];
-                snprintf(interactionDetail, sizeof(interactionDetail),
-                         "kind=%d id=%d hit=%d target=%d extra=%d accepted=%d",
-                         int(memory.kind), memory.id, hit, target, extra, accepted ? 1 : 0);
-                event("interaction_engine_resolved", interactionDetail);
-                if (!accepted)
+                int sourceExtra = -1;
+                int sourceState = -1;
+                int sourceBusy = 0;
+                if (hit == 6 && inRange(target, 0, numsectors))
+                {
+                    sourceExtra = sector[target].extra;
+                    if (sourceExtra > 0 && sourceExtra < kMaxXSectors)
+                    {
+                        sourceState = xsector[sourceExtra].state;
+                        sourceBusy = xsector[sourceExtra].busy;
+                    }
+                }
+                else if (hit == 0 && inRange(target, 0, numwalls))
+                {
+                    sourceExtra = wall[target].extra;
+                    if (sourceExtra > 0 && sourceExtra < kMaxXWalls)
+                    {
+                        sourceState = xwall[sourceExtra].state;
+                        sourceBusy = xwall[sourceExtra].busy;
+                    }
+                }
+                else if (hit == 3 && inRange(target, 0, kMaxSprites))
+                {
+                    sourceExtra = sprite[target].extra;
+                    if (sourceExtra > 0 && sourceExtra < kMaxXSprites)
+                    {
+                        sourceState = xsprite[sourceExtra].state;
+                        sourceBusy = xsprite[sourceExtra].busy;
+                    }
+                }
+                char interactionDetail[320];
+                memory.engineAccepted = accepted;
+                if (accepted)
+                {
+                    memory.activated = true;
+                    memory.observedKnownWorldDelta = false;
+                    retirePendingInteraction(entry.first);
+                }
+                else
                     memory.state = 3;
+                snprintf(interactionDetail, sizeof(interactionDetail),
+                         "kind=%d id=%d from_sector=%d player_sector=%d hit=%d target=%d extra=%d accepted=%d source_extra=%d source_state=%d source_busy=%d source_signature_before=%d source_signature_after=%d",
+                         int(memory.kind), memory.id, memory.fromSector, observation.sector,
+                         hit, target, extra, accepted ? 1 : 0, sourceExtra, sourceState,
+                         sourceBusy, memory.beforeState, interactionSourceSignature(memory));
+                event("interaction_engine_resolved", interactionDetail);
+                emitInteractionPortalState(memory, "after_process_input");
+
+                if (memory.target.wall >= 0)
+                {
+                    auto door = doors.find(memory.target.wall);
+                    if (door != doors.end())
+                    {
+                        door->second.unavailableFromSector = -1;
+                        door->second.interaction = accepted
+                            ? DoorMemory::kWaiting : DoorMemory::kFailed;
+                        door->second.interactionDeadlineTick = accepted
+                            ? observation.tick + kInteractionTimeoutTicks : -1;
+                    }
+                }
+            }
+        }
+        if (lastUsedDoor >= 0)
+        {
+            auto door = doors.find(lastUsedDoor);
+            if (door != doors.end())
+            {
+                door->second.engineAccepted = accepted;
+                if (accepted)
+                    door->second.interaction = DoorMemory::kWaiting;
             }
         }
         pendingInteractionKey = -1;
@@ -811,6 +1027,18 @@ struct LLMapperBot::Impl
             && inRange(memory.target.to, 0, numsectors))
         {
             const sectortype &sectorRecord = sector[memory.target.to];
+            signature = signature * 31 + sectorRecord.floorz;
+            signature = signature * 31 + sectorRecord.ceilingz;
+            if (sectorRecord.extra > 0 && sectorRecord.extra < kMaxXSectors)
+            {
+                signature = signature * 31 + xsector[sectorRecord.extra].state;
+                signature = signature * 31 + xsector[sectorRecord.extra].busy;
+            }
+        }
+        else if (memory.kind == kInteractionWall && memory.target.sectorPushCurrent
+                 && inRange(memory.target.from, 0, numsectors))
+        {
+            const sectortype &sectorRecord = sector[memory.target.from];
             signature = signature * 31 + sectorRecord.floorz;
             signature = signature * 31 + sectorRecord.ceilingz;
             if (sectorRecord.extra > 0 && sectorRecord.extra < kMaxXSectors)
@@ -904,10 +1132,18 @@ struct LLMapperBot::Impl
         memory.observed = true;
         memory.target = candidate.target;
         const int newState = interactionStateSignature(memory);
+        if (memory.unavailableFromSector >= 0 && memory.unavailableState != newState)
+        {
+            memory.unavailableFromSector = -1;
+            memory.unavailableAttempts = 0;
+            memory.unavailablePose = 0;
+        }
         if (memory.state == 1 && newState != memory.beforeState)
         {
             memory.state = 2;
             memory.activated = true;
+            memory.observedLocalEffect = true;
+            memory.observedKnownWorldDelta = true;
             recoveryMode = false;
             memory.afterState = newState;
             char detail[128];
@@ -916,6 +1152,7 @@ struct LLMapperBot::Impl
             event("interaction_world_delta", detail);
             lastSemanticProgressTick = observation.tick;
         }
+        updateFollowThrough(memory);
         if (first)
         {
             recoveryMode = false;
@@ -969,10 +1206,34 @@ struct LLMapperBot::Impl
             const int edgeId = movementTargetId * 65536 + observation.sector;
             visitedEdges.insert(edgeId);
             failedEdges.erase(edgeId);
+            retirePendingFrontier(movementTargetId, previousSector, observation.sector);
             char detail[128];
             snprintf(detail, sizeof(detail), "from=%d to=%d wall=%d", previousSector,
                      observation.sector, movementTargetId);
             event("portal_traversed", detail);
+            lastSemanticProgressTick = observation.tick;
+        }
+        if (sectorChanged && previousSector >= 0 && followThroughKey >= 0
+            && previousSector == followThroughFrom
+            && observation.sector == followThroughPortal.to)
+        {
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                     "before_sector=%d after_sector=%d interaction_key=%d portal_wall=%d portal_from=%d portal_to=%d engine_accepted=1 game_time=%d",
+                     previousSector, observation.sector, followThroughKey,
+                     followThroughPortal.wall, followThroughPortal.from,
+                     followThroughPortal.to, (gFrame * kTicsPerFrame) / kTicsPerSec);
+            event("interaction_follow_through_crossed", detail);
+            if (!cryptExitProven)
+            {
+                event("CRYPT_EXIT_CROSSED", detail);
+                cryptExitProven = true;
+            }
+            retirePendingInteraction(followThroughKey);
+            followThroughKey = -1;
+            followThroughStartTick = -1;
+            followThroughFrom = -1;
+            followThroughPortal = Portal{};
             lastSemanticProgressTick = observation.tick;
         }
         if (sectorChanged && previousSector >= 0 && movementTargetId >= 0)
@@ -1084,10 +1345,14 @@ struct LLMapperBot::Impl
 
         for (const Portal &portal : observation.portals)
         {
-            if (portal.localGeometry)
-                continue;
             const int edgeId = portal.wall * 65536 + portal.to;
-            const bool newEdge = seenEdges.insert(edgeId).second;
+            const bool knownEdge = std::any_of(knownGraph[portal.from].begin(),
+                                               knownGraph[portal.from].end(),
+                                               [&portal](const Portal &known)
+            {
+                return known.wall == portal.wall && known.to == portal.to;
+            });
+            const bool newEdge = !portal.localGeometry && seenEdges.insert(edgeId).second;
             if (newEdge)
             {
                 recoveryMode = false;
@@ -1099,18 +1364,24 @@ struct LLMapperBot::Impl
                          portal.from, portal.to);
                 event("discovered_frontier", detail);
             }
+            auto &edges = knownGraph[portal.from];
+            auto edge = std::find_if(edges.begin(), edges.end(), [&portal](const Portal &known)
+            {
+                return known.wall == portal.wall && known.to == portal.to;
+            });
             if (portal.traversable || portal.jumpable)
             {
-                auto &edges = knownGraph[portal.from];
-                auto edge = std::find_if(edges.begin(), edges.end(), [&portal](const Portal &known)
-                {
-                    return known.wall == portal.wall && known.to == portal.to;
-                });
-                if (edge == edges.end())
+                // A local-geometry observation may refresh an edge already
+                // known, but must not create a route from an unseen corner.
+                if (edge == edges.end() && !portal.localGeometry)
                     edges.push_back(portal);
-                else
+                else if (edge != edges.end())
                     *edge = portal;
             }
+            else if (edge != edges.end())
+                edges.erase(edge);
+            if (portal.localGeometry && !knownEdge)
+                continue;
             const bool blockedInteractivePortal = portal.interactionAffordance;
             if (portal.key || portal.locked || blockedInteractivePortal
                 || (!portal.traversable && !portal.jumpable))
@@ -1223,11 +1494,20 @@ struct LLMapperBot::Impl
             if ((door.interaction == DoorMemory::kWaiting || door.interaction == DoorMemory::kOpening)
                 && door.interactionDeadlineTick >= 0 && observation.tick > door.interactionDeadlineTick)
             {
-                door.interaction = DoorMemory::kFailed;
-                char detail[144];
-                snprintf(detail, sizeof(detail), "door=%d waited_ticks=%d reason=INTERACTION_VALID_BUT_NO_RESPONSE", door.id,
-                         observation.tick - door.interactionStartedTick);
-                event("interaction_failed", detail);
+                if (door.engineAccepted)
+                {
+                    door.interaction = DoorMemory::kOpening;
+                    event("interaction_settled", "door_engine_accepted=1 observed_local_effect=0");
+                }
+                else
+                {
+                    door.interaction = DoorMemory::kFailed;
+                    char detail[144];
+                    snprintf(detail, sizeof(detail), "door=%d waited_ticks=%d reason=INTERACTION_VALID_BUT_NO_RESPONSE", door.id,
+                             observation.tick - door.interactionStartedTick);
+                    event("interaction_failed", detail);
+                }
+                door.interactionDeadlineTick = -1;
             }
             if (door.portal.key && hasKey(door.portal.key) && door.availability == DoorMemory::kMissingKey)
             {
@@ -1360,7 +1640,8 @@ struct LLMapperBot::Impl
         // back to geometric nearest-neighbour scoring.
         for (auto pending = pendingWork.rbegin(); pending != pendingWork.rend(); ++pending)
         {
-            if (pending->kind != 2 || pending->sector != observation.sector)
+            if (!pendingWorkLive(*pending) || pending->kind != 2
+                || pending->sector != observation.sector)
                 continue;
             for (const Portal &portal : observation.portals)
             {
@@ -1422,7 +1703,8 @@ struct LLMapperBot::Impl
         // backtracking, rather than a fresh random local search.
         for (auto pending = pendingWork.rbegin(); pending != pendingWork.rend(); ++pending)
         {
-            if (pending->kind != 2 || pending->sector == observation.sector)
+            if (!pendingWorkLive(*pending) || pending->kind != 2
+                || pending->sector == observation.sector)
                 continue;
             if (findKnownRoute(pending->sector, routePortal))
                 return &routePortal;
@@ -1447,7 +1729,8 @@ struct LLMapperBot::Impl
         }
         for (auto pending = pendingWork.rbegin(); pending != pendingWork.rend(); ++pending)
         {
-            if (pending->kind != 2 || pending->sector != observation.sector)
+            if (!pendingWorkLive(*pending) || pending->kind != 2
+                || pending->sector != observation.sector)
                 continue;
             for (const Portal &portal : observation.portals)
             {
@@ -1584,6 +1867,11 @@ struct LLMapperBot::Impl
             memory.activated = false;
             memory.lastActivationTick = observation.tick;
             memory.beforeState = interactionStateSignature(memory);
+            memory.beforePortals = observation.portals;
+            memory.engineAccepted = false;
+            memory.observedLocalEffect = false;
+            memory.observedKnownWorldDelta = false;
+            emitInteractionPortalState(memory, "before_use_pulse");
             ++memory.activationCount;
             pendingInteractionKey = interactionMemoryKey(memory);
             issueUse = true;
@@ -1595,14 +1883,38 @@ struct LLMapperBot::Impl
         if (!issueUse && memory.attempted && memory.state == 1
             && observation.tick - memory.lastActivationTick > kInteractionTimeoutTicks)
         {
-            memory.state = 3;
-            event("interaction_failed", "reason=INTERACTION_VALID_BUT_NO_RESPONSE");
+            if (memory.engineAccepted)
+            {
+                memory.state = 2;
+                memory.activated = true;
+                memory.afterState = interactionStateSignature(memory);
+                event("interaction_settled", "engine_accepted=1 observed_local_effect=0 observed_known_world_delta=0");
+            }
+            else
+            {
+                memory.state = 3;
+                event("interaction_failed", "reason=INTERACTION_VALID_BUT_NO_RESPONSE");
+            }
         }
-        if (!valid && expectedDistance <= kActionScanRange * kActionScanRange
+        if (!valid && !missingKey && memory.state != 1 && memory.state != 2
+            && expectedDistance <= kActionScanRange * kActionScanRange
             && std::abs(angleDelta(expectedAngle, observation.angle)) < 96)
         {
-            memory.unavailableFromSector = observation.sector;
-            event("interaction_unavailable", "reason=CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE");
+            const int pose = (observation.x >> 9) ^ ((observation.y >> 9) << 11)
+                ^ (wrapAngle(observation.angle) >> 7);
+            if (pose != memory.unavailablePose)
+            {
+                memory.unavailablePose = pose;
+                ++memory.unavailableAttempts;
+            }
+            memory.unavailableState = interactionStateSignature(memory);
+            if (memory.unavailableAttempts >= 3)
+            {
+                memory.unavailableFromSector = observation.sector;
+                event("interaction_unavailable", "reason=CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE attempts=3");
+            }
+            else
+                event("interaction_alternative_pose", "reason=NO_ACTION_TARGET");
         }
         setGoal(memory.kind == kInteractionSprite ? "USE_NEW_SPRITE_INTERACTION"
                 : memory.kind == kInteractionSector ? "USE_NEW_SECTOR_INTERACTION"
@@ -2240,6 +2552,30 @@ struct LLMapperBot::Impl
         if (result.size())
             return idle;
 
+        // A real accepted interaction that changed a nearby passage remains
+        // the active progression objective until the player consumes it.
+        // Combat is allowed afterwards, but it must not erase this one
+        // transition between the USE pulse and the physical crossing.
+        if (followThroughKey >= 0)
+        {
+            Portal route;
+            if (observation.sector == followThroughFrom)
+            {
+                setGoal("FOLLOW_INTERACTION_PASSAGE", followThroughPortal.wall);
+                return steerPortal(followThroughPortal);
+            }
+            if (findKnownRoute(followThroughFrom, route))
+            {
+                setGoal("FOLLOW_INTERACTION_PASSAGE", followThroughPortal.wall);
+                return steerPortal(route);
+            }
+            event("interaction_follow_through_lost", "reason=no_route_to_source_sector");
+            followThroughKey = -1;
+            followThroughStartTick = -1;
+            followThroughFrom = -1;
+            followThroughPortal = Portal{};
+        }
+
         if (const VisibleObject *enemy = selectObject(kObjectEnemy))
         {
             Portal route;
@@ -2379,6 +2715,7 @@ struct LLMapperBot::Impl
                 if (!waiting && retryAllowed && !(missingKey && memory.attempts > 0))
                 {
                     memory.interaction = DoorMemory::kWaiting;
+                    memory.engineAccepted = false;
                     memory.interactionStartedTick = observation.tick;
                     memory.interactionDeadlineTick = observation.tick + kInteractionTimeoutTicks;
                     ++memory.attempts;
