@@ -1283,6 +1283,9 @@ struct LLMapperBot::Impl
     std::map<int, int> boundaryClearance;
     int lastCrossingWall = -1;
     int lastFrontierChoice = 0;
+    int directCrossingWall = -1;
+    int directCrossingBlockedTicks = 0;
+    int directCrossingBlockedUntil = -1;
     int lastSuppressedJumpTarget = -1;
     int lastAcceptedUseTick = -1;
     int clearingSector = -1;
@@ -5994,6 +5997,10 @@ struct LLMapperBot::Impl
     // its walls?  Only asked when the 256-unit grid produced nothing, so the
     // area being swept is small; a sector big enough to make the sweep
     // expensive is by definition not the narrow case.
+    //
+    // Width only.  How much headroom a sector has right now is world state
+    // -- a shut door has none and opens later -- and folding it in here
+    // would turn "closed" into "does not exist".
     bool sectorAdmitsPlayer(int sectorId, int minX, int maxX, int minY, int maxY) const
     {
         const int radius = playerClipRadius();
@@ -7469,9 +7476,42 @@ struct LLMapperBot::Impl
                                       std::max(256, bodyRadius)).reachable)
                 adjacent = committed;
         }
+        // Driving straight is only worth anything while the bot is actually
+        // getting somewhere.  Scraping along some other surface -- a pillar,
+        // a rotating door sweeping the floor between here and the gap --
+        // means the line is a fiction, and repeating it until the objective
+        // budget runs out wastes the whole opening.  Hand those to the
+        // corner planner below, which is the dynamic-geometry fallback.
+        if (directCrossingWall != portal.wall)
+        {
+            directCrossingWall = portal.wall;
+            directCrossingBlockedTicks = 0;
+            directCrossingBlockedUntil = -1;
+        }
+        const int grindingOn = currentMoveWallHit();
+        if (grindingOn >= 0 && grindingOn != portal.wall
+            && !wallsShareVertex(grindingOn, portal.wall))
+            ++directCrossingBlockedTicks;
+        else if (directCrossingBlockedTicks > 0)
+            --directCrossingBlockedTicks;
+        if (directCrossingBlockedTicks >= kTicsPerSec)
+        {
+            // Hand the crossing to the planner for a few seconds rather than
+            // one tick: alternating between the two every frame is its own
+            // way of standing still.
+            directCrossingBlockedTicks = 0;
+            directCrossingBlockedUntil = observation.tick + 3 * kTicsPerSec;
+            char detail[160];
+            snprintf(detail, sizeof(detail), "wall=%d grinding_on=%d reason=straight_line_obstructed",
+                     portal.wall, grindingOn);
+            event("portal_crossing_deferred", detail);
+        }
+        const bool lineObstructed = observation.tick < directCrossingBlockedUntil;
+
         int throughX = 0;
         int throughY = 0;
         if (portal.from == observation.sector
+            && !lineObstructed
             && distance2(observation.x, observation.y, portal.x, portal.y)
                 <= adjacent * adjacent
             && portalCrossingPoint(portal, throughX, throughY))
