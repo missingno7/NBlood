@@ -1172,6 +1172,15 @@ void ProcessFrame(void)
     gFrame++;
     gFrameClock += kTicsPerFrame;
     gLLMapperBot.OnFrame();
+    if (gLLMapperBot.Enabled() && gQuitGame)
+    {
+        // The bot run is over.  Do not enter the end-of-level summary or the
+        // episode outro/credits: those wait for a human keypress, which an
+        // automated run cannot supply, and gRestartGame would loop the game.
+        if (gDemo.at0)
+            gDemo.Close();
+        return;
+    }
     if ((gGameOptions.uGameFlags&kGameFlagContinuing) && !gStartNewGame)
     {
         ready2send = 0;

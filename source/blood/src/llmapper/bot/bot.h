@@ -6,7 +6,8 @@
 #include <cstdint>
 
 #include "fix16.h"
-#include "controls.h"
+// bot.h is included both from blood/src and its own nested directory.
+#include "../../controls.h"
 
 class LLMapperBot
 {
@@ -34,6 +35,8 @@ public:
     // Called by ProcessInput after the real engine action scan and trigger
     // dispatch have resolved a gameplay USE pulse.
     void OnActionResolved(int hit, int target, int extra, bool accepted, int key);
+    // Called from the authoritative player damage path with the engine source.
+    void OnBotDamaged(int source, int damageType, int amount);
     // Called by the normal level-exit event path.
     void OnLevelExit(int exitType);
     // Called during shutdown/restart to flush telemetry and the demo.
