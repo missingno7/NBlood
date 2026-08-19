@@ -1143,6 +1143,10 @@ struct LLMapperBot::Impl
     int jumpTargetSector = -1;
     int jumpSourceSector = -1;
     int searchAngle = -1;
+    bool searchProbeActive = false;
+    int searchProbeX = 0;
+    int searchProbeY = 0;
+    int searchProbeStartTick = 0;
     int lastDoorActionEventTick = -1;
     int lastUseProbeDoor = -1;
     int lastUseProbeTick = -1;
@@ -1244,6 +1248,7 @@ struct LLMapperBot::Impl
     std::set<int> countedKills;
     int lastLedgerDumpTick = -1;
     int lastFailedOpportunity = -1;
+    std::map<int, int> suppressionEvidence;
     int lastFailedOpportunityTick = -1;
     int stationaryX = INT32_MIN;
     int stationaryY = INT32_MIN;
@@ -2037,6 +2042,7 @@ struct LLMapperBot::Impl
             localDynamicJumpAttempted = false;
             localDynamicJumpUntilTick = -1;
             localJumpProbeCount = 0;
+            searchProbeActive = false;
         }
         if (observation.localSectorBusy != 0 && observation.playerZVelocity != 0)
             localDynamicJumpUntilTick = observation.tick + 4 * kTicsPerSec;
@@ -3088,6 +3094,14 @@ struct LLMapperBot::Impl
         }
     }
 
+    // Everything the bot has learned that could change a past verdict.  Any
+    // movement in this number is grounds for reconsidering suppressed work.
+    int worldEvidenceRevision() const
+    {
+        return knowledgeRevision * 8191 + inventoryRevision * 131
+            + navTopologyRevision;
+    }
+
     int opportunityDormantUntil(int key) const
     {
         auto entry = suppressedUntil.find(key);
@@ -3680,6 +3694,17 @@ struct LLMapperBot::Impl
             if (opportunity.id == lastFailedOpportunity
                 && observation.tick - lastFailedOpportunityTick < kTicsPerSec * 8)
                 continue;
+            // Dormant means dormant.  It ends when its cooldown ends, or when
+            // something the bot has since learned invalidates the reason it
+            // was suppressed -- a key collected, a mechanism moved, geometry
+            // changed.  Running out of other ideas is not new evidence.
+            if (opportunity.dormantUntil > observation.tick)
+            {
+                auto known = suppressionEvidence.find(opportunity.id);
+                if (known != suppressionEvidence.end()
+                    && known->second == worldEvidenceRevision())
+                    continue;
+            }
             if (!best || opportunity.dormantUntil < best->dormantUntil)
                 best = &opportunity;
         }
@@ -4872,6 +4897,11 @@ struct LLMapperBot::Impl
         const int shift = count > 3 ? 3 : count - 1;
         const int cooldown = kSuppressionBaseTicks << shift;
         suppressedUntil[key] = observation.tick + cooldown;
+        // What the bot knew when it gave up.  Waking this work again before
+        // the cooldown needs a reason, and "nothing else to do" is not one:
+        // retrying the same failure on the same knowledge is the thrash the
+        // backoff exists to prevent.
+        suppressionEvidence[key] = worldEvidenceRevision();
         char detail[160];
         snprintf(detail, sizeof(detail), "key=%d attempts=%d cooldown_s=%d reason=%s",
                  key, count, cooldown / kTicsPerSec, reason);
@@ -7887,6 +7917,7 @@ struct LLMapperBot::Impl
                     {
                         ++localJumpProbeCount;
                         localDynamicJumpAttempted = false;
+                        searchProbeActive = false;
                         searchAngle = wrapAngle(searchAngle + 512);
                         char detail[96];
                         snprintf(detail, sizeof(detail),
@@ -8312,7 +8343,14 @@ struct LLMapperBot::Impl
         }
 
         const DoorTiming standingIn = doorTiming(observation.sector);
-        if (standingIn.closing)
+        // Leave a door that is shutting, and leave one that will shut on a
+        // timer if there is no longer any reason to be standing in it.  With
+        // nothing to execute the bot otherwise waits out the mechanism, or
+        // starts a search probe, in the one place on the level where staying
+        // put is fatal.
+        const bool loiteringInMechanism = standingIn.autoCloses
+            && !currentObjective.active;
+        if (standingIn.closing || loiteringInMechanism)
         {
             if (clearingSector != observation.sector)
             {
@@ -8322,11 +8360,12 @@ struct LLMapperBot::Impl
                 {
                     char detail[208];
                     snprintf(detail, sizeof(detail),
-                             "sector=%d via_wall=%d moving=%d auto_closes=%d remaining_s=%d hold_s=%d",
+                             "sector=%d via_wall=%d moving=%d auto_closes=%d remaining_s=%d hold_s=%d reason=%s",
                              observation.sector, clearingWall, standingIn.moving ? 1 : 0,
                              standingIn.autoCloses ? 1 : 0,
                              standingIn.remainingTicks / kTicsPerSec,
-                             standingIn.holdTicks / kTicsPerSec);
+                             standingIn.holdTicks / kTicsPerSec,
+                             standingIn.closing ? "closing_on_the_player" : "no_reason_to_stay");
                     event("clear_moving_sector", detail);
                 }
             }
@@ -8511,16 +8550,45 @@ struct LLMapperBot::Impl
             setGoal("SEARCH_CURRENT_AREA", -2);
             if (searchAngle < 0)
                 searchAngle = observation.angle;
-            const int probeX = observation.x + mulscale30(Cos(searchAngle), 8192);
-            const int probeY = observation.y + mulscale30(Sin(searchAngle), 8192);
-            if (!movementTargetActive || movementTargetGoal != currentGoal
-                || movementTargetId != -2)
+            // Fix the endpoint when the probe starts.  Recomputing it from
+            // where the player is standing turns a bounded probe into an
+            // infinite ray that retreats exactly as fast as he walks, so it
+            // never ends and never rotates to the next heading; the bot just
+            // shuttles between rooms it has already seen.
+            if (!searchProbeActive || !movementTargetActive
+                || movementTargetGoal != currentGoal || movementTargetId != -2)
             {
-                event("local_jump_probe", "reason=bounded_unexplained_blocked_frontier");
-                setMovementTarget(probeX, probeY, observation.sector, -2,
+                searchProbeActive = true;
+                searchProbeX = observation.x + mulscale30(Cos(searchAngle), 8192);
+                searchProbeY = observation.y + mulscale30(Sin(searchAngle), 8192);
+                searchProbeStartTick = observation.tick;
+                char detail[160];
+                snprintf(detail, sizeof(detail),
+                         "heading=%d to=(%d,%d) probe=%d reason=bounded_unexplained_blocked_frontier",
+                         searchAngle, searchProbeX, searchProbeY, localJumpProbeCount + 1);
+                event("local_jump_probe", detail);
+                setMovementTarget(searchProbeX, searchProbeY, observation.sector, -2,
                                   kTraversalJumpable);
             }
-            return composeInput(intentFromInput(steerTo(probeX, probeY, false, false, -2,
+            // A probe that has run its time, or arrived, is finished: turn to
+            // the next heading rather than pushing at the same one.
+            const int arrive = std::max(512, playerClipRadius() * 4);
+            if (observation.tick - searchProbeStartTick > 6 * kTicsPerSec
+                || distance2(observation.x, observation.y, searchProbeX, searchProbeY)
+                    <= arrive * arrive)
+            {
+                searchProbeActive = false;
+                movementTargetActive = false;
+                ++localJumpProbeCount;
+                searchAngle = wrapAngle(searchAngle + 512);
+                char detail[128];
+                snprintf(detail, sizeof(detail), "next_heading=%d probe=%d reason=probe_finished",
+                         searchAngle, localJumpProbeCount + 1);
+                event("local_jump_probe_reoriented", detail);
+                return composeInput(move, combat, use);
+            }
+            return composeInput(intentFromInput(steerTo(searchProbeX, searchProbeY,
+                                                        false, false, -2,
                                                         observation.sector,
                                                         kTraversalJumpable)), combat, use);
         }
