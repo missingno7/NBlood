@@ -257,6 +257,7 @@ struct Portal
     bool traversable = false;
     bool locked = false;
     bool interactionAffordance = false;
+    bool blockedBySprite = false;
     bool currentlyAvailable = false;
     TraversalCapability capability = kTraversalUnknown;
     int unavailableReason = 0;
@@ -440,6 +441,88 @@ static int lookAngleForTarget(int eyeZ, int targetZ, int horizontal)
     const double angle = std::atan2(double(eyeZ - targetZ), double(std::max(1, horizontal)))
         * 1024.0 / 3.14159265358979323846;
     return std::max(kLookDownLimit, std::min(kLookUpLimit, int(std::lround(angle))));
+}
+
+static int64_t segmentDistance2(int x, int y, int x1, int y1, int x2, int y2)
+{
+    const int64_t dx = x2 - x1;
+    const int64_t dy = y2 - y1;
+    const int64_t length2 = dx * dx + dy * dy;
+    if (length2 <= 0)
+        return int64_t(x - x1) * (x - x1) + int64_t(y - y1) * (y - y1);
+    int64_t t = ((int64_t(x - x1) * dx) + (int64_t(y - y1) * dy)) * 1024 / length2;
+    if (t < 0)
+        t = 0;
+    if (t > 1024)
+        t = 1024;
+    const int px = int(x1 + dx * t / 1024);
+    const int py = int(y1 + dy * t / 1024);
+    return int64_t(x - px) * (x - px) + int64_t(y - py) * (y - py);
+}
+
+// The two ends of a wall-aligned sprite, as the engine computes them when it
+// clips against one.  A wall sprite is a line, not a post: a panel across a
+// doorway is several hundred units wide, and treating it as a clipdist-sized
+// circle at its centre misses everything but the middle.
+static void wallSpriteSpan(const spritetype &record, int &x1, int &y1,
+                           int &x2, int &y2)
+{
+    const int span = tilesiz[record.picnum].x;
+    const int offset = (record.cstat & CSTAT_SPRITE_XFLIP)
+        ? -(picanm[record.picnum].xofs + record.xoffset)
+        : (picanm[record.picnum].xofs + record.xoffset);
+    const int dax = sintable[record.ang & 2047] * record.xrepeat;
+    const int day = sintable[(record.ang + 1536) & 2047] * record.xrepeat;
+    const int anchor = (span >> 1) + offset;
+    x1 = record.x - mulscale16(dax, anchor);
+    y1 = record.y - mulscale16(day, anchor);
+    x2 = x1 + mulscale16(dax, span);
+    y2 = y1 + mulscale16(day, span);
+}
+
+// A sprite standing at this point that the player's body cannot pass.
+// Returns its index, or -1.
+//
+// Only horizontal obstruction is asked about.  A floor-aligned sprite is a
+// surface, not a barrier -- it is what a sprite bridge is made of -- and
+// clipping against one walls off the very route it provides.
+static int solidSpriteAt(int sectorId, int x, int y, int radius)
+{
+    if (!inRange(sectorId, 0, numsectors))
+        return -1;
+    const int floorZ = getflorzofslope(sectorId, x, y);
+    const int headroom = playerCrouchClearance();
+    for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
+         nSprite = nextspritesect[nSprite])
+    {
+        const spritetype &record = sprite[nSprite];
+        if (!(record.cstat & CSTAT_SPRITE_BLOCK))
+            continue;
+        if (gMe && gMe->pSprite && nSprite == gMe->pSprite->index)
+            continue;
+        const int alignment = record.cstat & CSTAT_SPRITE_ALIGNMENT_MASK;
+        if (alignment == CSTAT_SPRITE_ALIGNMENT_FLOOR
+            || alignment == CSTAT_SPRITE_ALIGNMENT_SLOPE)
+            continue;
+        // Something hanging clear above head height is not in the way.
+        int top = 0;
+        int bottom = 0;
+        GetSpriteExtents(&record, &top, &bottom);
+        if (bottom < floorZ - headroom || top > floorZ)
+            continue;
+        if (alignment == CSTAT_SPRITE_ALIGNMENT_WALL)
+        {
+            int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            wallSpriteSpan(record, x1, y1, x2, y2);
+            if (segmentDistance2(x, y, x1, y1, x2, y2) < int64_t(radius) * radius)
+                return nSprite;
+            continue;
+        }
+        const int64_t margin = int64_t(radius) + (record.clipdist << 2);
+        if (distance2(x, y, record.x, record.y) < margin * margin)
+            return nSprite;
+    }
+    return -1;
 }
 
 static void setInteractionGeometry(Portal &portal)
@@ -708,6 +791,35 @@ static Observation observeWorld()
                     portal.capability = kTraversalCurrentlyUnavailable;
                 }
             }
+            // A solid sprite standing in a doorway shuts it as surely as a
+            // closed door does, and the wall geometry says nothing about it.
+            // Without this a barricaded opening read as walkable, and the bot
+            // shouldered it until the objective budget ran out instead of
+            // treating it as an obstacle with something to be done about it.
+            if (portal.traversable)
+            {
+                const int radius = gMe && gMe->pSprite
+                    ? (gMe->pSprite->clipdist << 2) : 128;
+                int obstruction = solidSpriteAt(portal.from, portal.x, portal.y, radius);
+                if (obstruction < 0)
+                    obstruction = solidSpriteAt(portal.to, portal.x, portal.y, radius);
+                if (obstruction >= 0)
+                {
+                    portal.walkable = false;
+                    portal.jumpable = false;
+                    portal.crouchable = false;
+                    portal.dropSafe = false;
+                    portal.traversable = false;
+                    portal.capability = kTraversalCurrentlyUnavailable;
+                    portal.blockedBySprite = true;
+                    // Blocked, but not necessarily hopeless: a barricade the
+                    // player can operate is progression work, not a wall.
+                    const spritetype &blocker = sprite[obstruction];
+                    if (validXSprite(blocker.extra)
+                        && (xsprite[blocker.extra].Push || xsprite[blocker.extra].Vector))
+                        portal.interactionAffordance = true;
+                }
+            }
             if (sector[portal.from].extra > 0 && sector[portal.from].extra < kMaxXSectors)
                 portal.sectorPushCurrent = xsector[sector[portal.from].extra].Push != 0;
             portal.interactionAffordance = portal.wallPush || portal.sectorPush
@@ -829,16 +941,23 @@ static Observation observeWorld()
         const bool isItem = candidate.statnum == kStatItem;
         const bool isThing = candidate.statnum == kStatThing;
         const bool isSwitch = candidate.type >= kSwitchBase && candidate.type < kSwitchMax;
-        if (!isEnemy && !isItem && !isThing && !isSwitch)
+        // Whether the player can operate a sprite is a fact Blood records on
+        // the sprite, not something to be inferred from its status list or
+        // its type number.  A mapper is free to wire a plain decoration to a
+        // channel, and one that answers to Use is a switch whatever tile it
+        // wears; keying off the type whitelist alone left the bot walking
+        // past hand-built mechanisms as though they were scenery.
+        const bool operable = !isEnemy && validXSprite(candidate.extra)
+            && (xsprite[candidate.extra].Push || xsprite[candidate.extra].Vector);
+        if (!isEnemy && !isItem && !isThing && !isSwitch && !operable)
             continue;
         if (candidate.index == player->index || candidate.sectnum < 0)
             continue;
         if (isEnemy && (!isEnemyType(candidate.type) || !validXSprite(candidate.extra) || xsprite[candidate.extra].health == 0))
             continue;
-        if (isItem && itemCategory(candidate.type) == nullptr)
+        if (isItem && !operable && itemCategory(candidate.type) == nullptr)
             continue;
-        if ((isThing || isSwitch) && (!validXSprite(candidate.extra)
-                        || (!xsprite[candidate.extra].Push && !xsprite[candidate.extra].Vector)))
+        if ((isThing || isSwitch) && !operable)
             continue;
         if (!cansee(result.x, result.y, result.z, result.sector,
                     candidate.x, candidate.y, candidate.z, candidate.sectnum))
@@ -852,8 +971,9 @@ static Observation observeWorld()
         object.y = candidate.y;
         object.z = candidate.z;
         object.kind = isEnemy ? kObjectEnemy
-                         : isKeyType(candidate.type) ? kObjectKey
-                         : (isThing || isSwitch) ? kObjectInteractive : kObjectPickup;
+                         : (isItem && isKeyType(candidate.type)) ? kObjectKey
+                         : (isThing || isSwitch || operable) ? kObjectInteractive
+                         : kObjectPickup;
         result.objects.push_back(object);
         if (object.kind == kObjectInteractive && validXSprite(candidate.extra)
             && xsprite[candidate.extra].Push)
@@ -861,7 +981,13 @@ static Observation observeWorld()
             InteractionCandidate interaction;
             interaction.kind = kInteractionSprite;
             interaction.id = i;
-            interaction.fromSector = candidate.sectnum;
+            // Where the bot can operate it from, which is where it is
+            // standing when it sees it -- the same rule wall mechanisms use.
+            // Filing it under the sprite's own sector meant a mechanism
+            // standing in the doorway of a room the bot had not entered was
+            // unreachable by construction, so the bot could see the thing
+            // blocking its way and never form the intention to push it.
+            interaction.fromSector = result.sector;
             interaction.targetSector = candidate.sectnum;
             interaction.x = candidate.x;
             interaction.y = candidate.y;
@@ -5360,19 +5486,7 @@ struct LLMapperBot::Impl
 
     int64_t dist2ToSegment(int x, int y, int x1, int y1, int x2, int y2) const
     {
-        const int64_t dx = x2 - x1;
-        const int64_t dy = y2 - y1;
-        const int64_t length2 = dx * dx + dy * dy;
-        if (length2 <= 0)
-            return int64_t(x - x1) * (x - x1) + int64_t(y - y1) * (y - y1);
-        int64_t t = ((int64_t(x - x1) * dx) + (int64_t(y - y1) * dy)) * 1024 / length2;
-        if (t < 0)
-            t = 0;
-        if (t > 1024)
-            t = 1024;
-        const int px = int(x1 + dx * t / 1024);
-        const int py = int(y1 + dy * t / 1024);
-        return int64_t(x - px) * (x - px) + int64_t(y - py) * (y - py);
+        return segmentDistance2(x, y, x1, y1, x2, y2);
     }
 
     bool sourceInspectionPose(const Portal &portal, int &outX, int &outY, int &outZ)
@@ -6454,22 +6568,7 @@ struct LLMapperBot::Impl
     // blocking bit (cstat 1) is the same thing clipmove honours.
     bool blockedBySolidSprite(int sectorId, int x, int y) const
     {
-        if (!inRange(sectorId, 0, numsectors))
-            return false;
-        const int reach = playerClipRadius();
-        for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
-             nSprite = nextspritesect[nSprite])
-        {
-            const spritetype &record = sprite[nSprite];
-            if (!(record.cstat & CSTAT_SPRITE_BLOCK))
-                continue;
-            if (gMe && gMe->pSprite && nSprite == gMe->pSprite->index)
-                continue;
-            const int64_t margin = int64_t(reach) + (record.clipdist << 2);
-            if (distance2(x, y, record.x, record.y) < margin * margin)
-                return true;
-        }
-        return false;
+        return solidSpriteAt(sectorId, x, y, playerClipRadius()) >= 0;
     }
 
     int64_t nearestWallDistance2(int sectorId, int x, int y) const
