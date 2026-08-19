@@ -443,6 +443,52 @@ static int lookAngleForTarget(int eyeZ, int targetZ, int horizontal)
     return std::max(kLookDownLimit, std::min(kLookUpLimit, int(std::lround(angle))));
 }
 
+// Does this sector contain a floor-aligned sprite the player can stand on?
+// Asked first because the answer is almost always no, and the surface query
+// below is expensive: everywhere else the sector floor is the whole story
+// and nothing changes.
+static bool sectorHasFloorSprite(int sectorId)
+{
+    if (!inRange(sectorId, 0, numsectors))
+        return false;
+    for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
+         nSprite = nextspritesect[nSprite])
+    {
+        const spritetype &record = sprite[nSprite];
+        if (!(record.cstat & CSTAT_SPRITE_BLOCK))
+            continue;
+        const int alignment = record.cstat & CSTAT_SPRITE_ALIGNMENT_MASK;
+        if (alignment == CSTAT_SPRITE_ALIGNMENT_FLOOR
+            || alignment == CSTAT_SPRITE_ALIGNMENT_SLOPE)
+            return true;
+    }
+    return false;
+}
+
+// What the player would be standing on here, as the engine resolves it.
+//
+// A bridge made of floor sprites is a floor: reading the sector below it
+// instead sees the pit it spans, so the crossing looks like a fatal drop and
+// the route over it does not exist.  The probe is deliberately narrow -- the
+// surface under this point, not any surface within arm's reach -- so the
+// mesh does not place a cell in mid-air off the end of a plank.
+static int standingFloorZ(int sectorId, int x, int y)
+{
+    const int sectorFloor = inRange(sectorId, 0, numsectors)
+        ? getflorzofslope(sectorId, x, y) : 0;
+    if (!sectorHasFloorSprite(sectorId))
+        return sectorFloor;
+    int ceilZ = 0;
+    int ceilHit = 0;
+    int floorZ = 0;
+    int floorHit = 0;
+    GetZRangeAtXYZ(x, y, getceilzofslope(sectorId, x, y) + 1, sectorId,
+                   &ceilZ, &ceilHit, &floorZ, &floorHit, 4, CLIPMASK0);
+    if ((floorHit & 0xc000) == 0xc000 && floorZ < sectorFloor)
+        return floorZ;
+    return sectorFloor;
+}
+
 static int64_t segmentDistance2(int x, int y, int x1, int y1, int x2, int y2)
 {
     const int64_t dx = x2 - x1;
@@ -687,8 +733,10 @@ static Observation observeWorld()
 
             const int midX = (wallRecord.x + nextWall.x) / 2;
             const int midY = (wallRecord.y + nextWall.y) / 2;
-            const int fromFloor = getflorzofslope(result.sector, midX, midY);
-            const int toFloor = getflorzofslope(wallRecord.nextsector, midX, midY);
+            // The surface the player would stand on at the threshold, which
+            // is a bridge plank when one lies across the doorway.
+            const int fromFloor = standingFloorZ(result.sector, midX, midY);
+            const int toFloor = standingFloorZ(wallRecord.nextsector, midX, midY);
             const int fromCeiling = getceilzofslope(result.sector, midX, midY);
             const int toCeiling = getceilzofslope(wallRecord.nextsector, midX, midY);
             const int openingWidth = int(std::sqrt(double(distance2(wallRecord.x, wallRecord.y, nextWall.x, nextWall.y))));
@@ -781,7 +829,16 @@ static Observation observeWorld()
                 portal.sectorPush = extra.Wallpush != 0;
                 portal.sectorState = extra.state;
                 portal.sectorBusy = extra.busy;
-                if (extra.damageType != 0 || sector[portal.to].type == kSectorDamage)
+                // A damaging floor only hurts the player who touches it.
+                // Blood calls actTouchFloor for a sector hit and not for a
+                // sprite hit, so a bridge laid across the pit is a way over
+                // it -- refusing the whole sector makes such a crossing
+                // invisible.
+                const bool touchesDamagingFloor =
+                    standingFloorZ(portal.to, portal.x, portal.y)
+                        >= getflorzofslope(portal.to, portal.x, portal.y);
+                if ((extra.damageType != 0 || sector[portal.to].type == kSectorDamage)
+                    && touchesDamagingFloor)
                 {
                     portal.walkable = false;
                     portal.jumpable = false;
@@ -6482,7 +6539,7 @@ struct LLMapperBot::Impl
                             const int cy = baseY + oy * step;
                             if (inside(cx, cy, sectorId) != 1)
                                 continue;
-                            if (getflorzofslope(sectorId, cx, cy)
+                            if (standingFloorZ(sectorId, cx, cy)
                                 - getceilzofslope(sectorId, cx, cy) < required)
                                 continue;
                             if (blockedBySolidSprite(sectorId, cx, cy))
@@ -6817,8 +6874,8 @@ struct LLMapperBot::Impl
                 if (segmentCrossesSectorWall(cell.sector, cell.center.x, cell.center.y,
                                              other.center.x, other.center.y))
                     continue;
-                const int floorDelta = getflorzofslope(cell.sector, other.center.x, other.center.y)
-                    - getflorzofslope(cell.sector, cell.center.x, cell.center.y);
+                const int floorDelta = standingFloorZ(cell.sector, other.center.x, other.center.y)
+                    - standingFloorZ(cell.sector, cell.center.x, cell.center.y);
                 if (std::abs(floorDelta) > kMaxWalkableStep)
                     continue;
                 const NavEdgeMode mode = floorDelta == 0 ? kNavWalk : kNavStep;
