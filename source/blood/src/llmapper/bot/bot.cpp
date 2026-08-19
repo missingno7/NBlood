@@ -190,6 +190,9 @@ constexpr int kSurfaceRetryProbes = 8;
 // Ground that has to be covered before the bot counts as having closed on a
 // target.  Linear, in world units: a quarter of a navigation grid square.
 constexpr int kProgressStep = 24;
+// How far off the bot's heading a target may be and still be worth a shot
+// taken in passing.  256 of 2048 is 45 degrees.
+constexpr int kOpportunisticAimCone = 256;
 // Pitchfork reach, used when a breakable obstacle must be hit by hand.
 constexpr int kMeleeReach = 1024;
 constexpr int kLookUpLimit = 289;
@@ -1096,6 +1099,9 @@ struct LLMapperBot::Impl
         bool shoot = false;
         int weapon = 0;
         bool aim = false;
+        // Whether this is a threat worth taking the controls away from
+        // whatever the bot was doing.  Anything else is opportunistic.
+        bool urgent = false;
         bool valid = false;
     };
     struct UseIntent
@@ -2738,6 +2744,20 @@ struct LLMapperBot::Impl
 
     void recordEdgeFailure(const Portal &portal, const char *eventName, const char *reason)
     {
+        // Geometry in motion is not evidence about a boundary.  Failing to
+        // get through a door mid-travel says only that the bot arrived at
+        // the wrong moment, and writing that down as a property of the edge
+        // is how a route the bot later walks came to be remembered as
+        // impossible.
+        if (portal.wallBusy || portal.sectorBusy || doorTiming(portal.to).moving)
+        {
+            char pending[192];
+            snprintf(pending, sizeof(pending),
+                     "wall=%d from=%d to=%d reason=%s evidence=geometry_in_motion",
+                     portal.wall, portal.from, portal.to, reason);
+            event("edge_failure_withheld", pending);
+            return;
+        }
         const int edgeId = portal.wall * 65536 + portal.to;
         EdgeFailure &failure = failedEdges[edgeId];
         const int signature = portalGeometrySignature(portal);
@@ -6538,6 +6558,16 @@ struct LLMapperBot::Impl
             else if (navMeshInMotion)
             {
                 ++navPoseStableTicks;
+                // The second clause is deliberate and load-bearing.  While
+                // any watched sector is travelling the pose signature changes
+                // every tick, so the stable-tick count never accumulates and
+                // the mesh would stay frozen -- and unroutable -- for the
+                // whole door cycle.  The bot's own sector being idle is the
+                // statement that its immediate surroundings are usable now,
+                // which is what planning the next few steps needs; route
+                // validity against remote motion is handled by the dynamic
+                // link refresh below.  Dropping it strands the bot beside
+                // every moving door until the door closes on it.
                 if (navPoseStableTicks >= 8 || observation.localSectorBusy == 0)
                 {
                     navMeshInMotion = false;
@@ -8143,7 +8173,15 @@ struct LLMapperBot::Impl
         input.buttonFlags.jump = move.jump ? 1 : 0;
         input.buttonFlags.crouch = move.crouch ? 1 : 0;
         input.keyFlags.action = use.action ? 1 : 0;
-        if (combat.aim)
+        // Who owns the camera.  Navigation keeps it while it is actually
+        // going somewhere, unless the threat is pressing enough to be worth
+        // stopping for: movement only walks once it is facing its waypoint,
+        // so a distant enemy that took the camera left the bot standing
+        // still -- and standing still was then read as the route being
+        // impossible.  Fire from the route when the route points that way.
+        const bool opportunistic = combat.aim && !combat.urgent && move.valid
+            && std::abs(combat.turn) > kOpportunisticAimCone;
+        if (combat.aim && !opportunistic)
         {
             input.q16turn = fix16_from_int(combat.turn);
             input.q16mlook = combat.look;
@@ -8228,10 +8266,12 @@ struct LLMapperBot::Impl
         return bestCell;
     }
 
-    CombatIntent combatIntentFor(const VisibleObject &enemy, CombatTactic tactic)
+    CombatIntent combatIntentFor(const VisibleObject &enemy, CombatTactic tactic,
+                                 bool urgent = true)
     {
         CombatIntent combat;
         combat.aim = true;
+        combat.urgent = urgent;
         combat.turn = angleDelta(getangle(enemy.x - observation.x, enemy.y - observation.y),
                                  observation.angle);
         const int horizontal = std::max(1, int(std::sqrt(double(distance2(
@@ -8362,7 +8402,8 @@ struct LLMapperBot::Impl
             combatTactic = kCombatNone;
         }
         if (combatTactic == kCombatRanged && enemy)
-            combat = combatIntentFor(*enemy, kCombatRanged);
+            combat = combatIntentFor(*enemy, kCombatRanged,
+                                     situation.immediateThreat || situation.critical);
         else if (combatTactic == kCombatMelee && enemy)
         {
             combat = combatIntentFor(*enemy, kCombatMelee);
