@@ -962,7 +962,6 @@ struct LLMapperBot::Impl
         int attempts = 0;
         Availability availability = kActionable;
         bool opened = false;
-        bool engineAccepted = false;
         int unavailableReason = 0;
         InteractionState interaction = kIdle;
         int interactionStartedTick = -1;
@@ -1063,12 +1062,25 @@ struct LLMapperBot::Impl
     int lastAttackerDamageType = -1;
     bool combatRetreatUnavailableEmitted = false;
     int lastCombatTacticEvent = -1;
+    // One place converts a wanted change in the player's pitch into the
+    // q16mlook the engine expects.  Outside a vanilla demo, ProcessInput
+    // applies `q16mlook << 3`, so a raw value swings the view eight times as
+    // far as asked -- which is what made the bot flick up and down every
+    // other tick once anything asked it to level off.  Scale in fixed point
+    // rather than dividing the integer first, so a one-unit correction still
+    // moves the view instead of truncating to nothing and never settling.
+    static fix16_t encodeLook(int wantedDelta)
+    {
+        const fix16_t requested = fix16_from_int(wantedDelta);
+        return gDemo.VanillaDemo() ? requested : requested / 8;
+    }
+
     struct MovementIntent
     {
         int forward = 0;
         int strafe = 0;
         int turn = 0;
-        int look = 0;
+        fix16_t look = 0;
         bool jump = false;
         bool crouch = false;
         bool run = true;
@@ -1077,7 +1089,7 @@ struct LLMapperBot::Impl
     struct CombatIntent
     {
         int turn = 0;
-        int look = 0;
+        fix16_t look = 0;
         bool shoot = false;
         int weapon = 0;
         bool aim = false;
@@ -1513,24 +1525,23 @@ struct LLMapperBot::Impl
         if (lastUsedDoor >= 0)
         {
             auto door = doors.find(lastUsedDoor);
-            if (door != doors.end())
-            {
-                door->second.engineAccepted = accepted;
-                if (accepted)
-                    door->second.interaction = DoorMemory::kWaiting;
-            }
+            if (door != doors.end() && accepted)
+                door->second.interaction = DoorMemory::kWaiting;
         }
         pendingInteractionKey = -1;
     }
 
+    // `look` is sampled because a view that will not settle is invisible in
+    // position alone: the bot stands still and flicks up and down.
     void trajectorySample()
     {
         if (!trajectory || !gMe || !gMe->pSprite)
             return;
-        fprintf(trajectory, "{\"game_time\":%d,\"x\":%d,\"y\":%d,\"z\":%d,\"sector\":%d,\"angle\":%d,\"health\":%d}\n",
+        fprintf(trajectory, "{\"game_time\":%d,\"x\":%d,\"y\":%d,\"z\":%d,\"sector\":%d,\"angle\":%d,\"look\":%d,\"health\":%d}\n",
                 (gFrame * kTicsPerFrame) / kTicsPerSec,
                 int(gMe->pSprite->x), int(gMe->pSprite->y), int(gMe->pSprite->z), int(gMe->pSprite->sectnum),
-                int(gMe->pSprite->ang), int(gMe->pXSprite ? gMe->pXSprite->health : 0));
+                int(gMe->pSprite->ang), fix16_to_int(gMe->q16look),
+                int(gMe->pXSprite ? gMe->pXSprite->health : 0));
         fflush(trajectory);
     }
 
@@ -1958,6 +1969,22 @@ struct LLMapperBot::Impl
             snprintf(detail, sizeof(detail), "mechanism_sector=%d rearmed=%d", driven, rearmed);
             event("opportunities_rearmed_by_world_change", detail);
         }
+    }
+
+    // Whether the engine accepted an activation aimed at this boundary.
+    // Asked rather than mirrored: the door record used to carry its own copy
+    // of this fact, and nothing wrote that copy on the path that actually
+    // resolves a Use, so an activation the engine had accepted was reported
+    // seconds later as having produced no response.  Execution state has one
+    // owner, and it is the interaction ledger.
+    bool activationAccepted(int wallId) const
+    {
+        if (wallId < 0)
+            return false;
+        for (const auto &entry : interactions)
+            if (entry.second.engineAccepted && entry.second.target.wall == wallId)
+                return true;
+        return false;
     }
 
     void updateKnowledge()
@@ -2519,7 +2546,7 @@ struct LLMapperBot::Impl
             if ((door.interaction == DoorMemory::kWaiting || door.interaction == DoorMemory::kOpening)
                 && door.interactionDeadlineTick >= 0 && observation.tick > door.interactionDeadlineTick)
             {
-                if (door.engineAccepted)
+                if (activationAccepted(door.id))
                 {
                     door.interaction = DoorMemory::kOpening;
                     event("interaction_settled", "door_engine_accepted=1 observed_local_effect=0");
@@ -4168,6 +4195,17 @@ struct LLMapperBot::Impl
             return false;
         if (interactionStateSignature(memory) == memory.afterState)
             return false;
+        // An activation the world visibly answered has already done its job.
+        // Asking for it again needs evidence that what it produced is gone --
+        // the mechanism back at the state it started from -- not merely that
+        // this particular boundary is still shut.  A mechanism whose effect
+        // is elsewhere (a rotating sector clearing floor space, a door on a
+        // remote TX channel) never makes its own wall passable, so that test
+        // alone had the bot pressing a switch a second time and undoing the
+        // opening it had just made for itself.
+        if (memory.observedKnownWorldDelta
+            && interactionStateSignature(memory) != memory.beforeState)
+            return false;
         return memory.target.interactionAffordance && !memory.target.traversable;
     }
 
@@ -4280,7 +4318,7 @@ struct LLMapperBot::Impl
         }
 
         input.q16turn = fix16_from_int(turn);
-        input.q16mlook = fix16_from_int(lookDelta / 4);
+        input.q16mlook = encodeLook(lookDelta);
         noteCameraOwner("BREAK_OBSTACLE", memory.id, aimAngle, desiredLook);
         if (gMe->curWeapon != weapon)
         {
@@ -4567,7 +4605,7 @@ struct LLMapperBot::Impl
             input = GINPUT{};
             input.syncFlags.run = 0;
             input.q16turn = fix16_from_int(turnToTarget);
-            input.q16mlook = fix16_from_int(lookDelta / 8);
+            input.q16mlook = encodeLook(lookDelta);
             if (interactionCrouch)
                 input.buttonFlags.crouch = 1;
             // Close the last stretch only once roughly squared up, so the
@@ -4685,7 +4723,7 @@ struct LLMapperBot::Impl
             * 1024.0 / 3.14159265358979323846;
         const int desiredLook = std::max(-347, std::min(289, int(std::lround(pitch))));
         const int currentLook = fix16_to_int(gMe->q16look);
-        input.q16mlook = fix16_from_int((desiredLook - currentLook) / 8);
+        input.q16mlook = encodeLook(desiredLook - currentLook);
         if (gMe->curWeapon == weapon)
             input.buttonFlags.shoot = 1;
         else
@@ -5303,7 +5341,7 @@ struct LLMapperBot::Impl
         const int look = lookAngleForTarget(observation.z, crossing.z,
             std::max(1, int(std::sqrt(double(distance2(observation.x, observation.y,
                                                       crossing.x, crossing.y))))));
-        input.q16mlook = fix16_from_int((look - fix16_to_int(gMe->q16look)) / 8);
+        input.q16mlook = encodeLook(look - fix16_to_int(gMe->q16look));
         if (crossing.crouchable || crossing.interactionCrouch)
             input.buttonFlags.crouch = 1;
         if (std::abs(angleDelta(targetAngle, observation.angle)) > 96
@@ -7864,7 +7902,7 @@ struct LLMapperBot::Impl
             {
                 const int correction = std::max(-kLookLevelRate,
                                                 std::min(kLookLevelRate, -currentLook));
-                input.q16mlook = fix16_from_int(correction);
+                input.q16mlook = encodeLook(correction);
                 noteCameraOwner("NAVIGATION", targetId, targetAngle, 0);
             }
         }
@@ -7951,7 +7989,7 @@ struct LLMapperBot::Impl
         if (combat.aim)
         {
             input.q16turn = fix16_from_int(combat.turn);
-            input.q16mlook = fix16_from_int(combat.look);
+            input.q16mlook = combat.look;
             if (combat.weapon && gMe->curWeapon != combat.weapon)
             {
                 input.syncFlags.weaponChange = 1;
@@ -7988,7 +8026,7 @@ struct LLMapperBot::Impl
             input.forward = int16_t(move.forward);
             input.strafe = int16_t(move.strafe);
             input.q16turn = fix16_from_int(move.turn);
-            input.q16mlook = fix16_from_int(move.look);
+            input.q16mlook = move.look;
         }
         return input;
     }
@@ -7999,7 +8037,7 @@ struct LLMapperBot::Impl
         move.forward = input.forward;
         move.strafe = input.strafe;
         move.turn = fix16_to_int(input.q16turn);
-        move.look = fix16_to_int(input.q16mlook);
+        move.look = input.q16mlook;
         move.jump = input.buttonFlags.jump;
         move.crouch = input.buttonFlags.crouch;
         move.run = input.syncFlags.run;
@@ -8043,7 +8081,7 @@ struct LLMapperBot::Impl
             observation.x, observation.y, enemy.x, enemy.y)))));
         const int currentLook = fix16_to_int(gMe->q16look);
         const int desiredLook = lookAngleForTarget(observation.z, enemy.z, horizontal);
-        combat.look = (desiredLook - currentLook) / 8;
+        combat.look = encodeLook(desiredLook - currentLook);
         int weapon = 0;
         if (tactic == kCombatRanged && rangedWeaponAvailable(weapon))
         {
