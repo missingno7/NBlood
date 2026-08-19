@@ -520,7 +520,11 @@ static Observation observeWorld()
             portal.openingWidth = openingWidth;
             portal.floorDelta = floorDelta;
             portal.clearance = clearance;
-            portal.localGeometry = !visible;
+            // The player is physically inside result.sector, so the complete
+            // static wall loop of this sector is local knowledge even when a
+            // corner hides the portal from the current view.  Visibility is
+            // still retained separately for objects and remote geometry.
+            portal.localGeometry = true;
             portal.walkable = !(wallRecord.cstat & 1) && walkable;
             portal.jumpable = !(wallRecord.cstat & 1) && !walkable && jumpable;
             portal.crouchable = !(wallRecord.cstat & 1) && crouchable;
@@ -646,8 +650,6 @@ static Observation observeWorld()
                 }
             }
 
-            if (!visible && !portal.traversable)
-                continue;
             if (visible)
                 appendUnique(result.visibleSectors, portal.to);
             result.portals.push_back(portal);
@@ -866,6 +868,10 @@ struct LLMapperBot::Impl
         int id = -1;
         int sector = -1;
         int edgeTarget = -1;
+        // Multiple linedefs can lead from the same known area into the same
+        // destination.  They are transportation alternatives, not separate
+        // exploration work items.
+        std::vector<int> candidates;
         FrontierState state = kDiscovered;
         int stateSignature = 0;
         bool resolved = false; // retained for old telemetry/state compatibility
@@ -881,6 +887,7 @@ struct LLMapperBot::Impl
     int lastObservationTick = -1;
     int lastTrajectoryTick = -1;
     int lastSemanticProgressTick = 0;
+    bool explorationSnapshotEmitted = false;
     int lastStateLocation = -1;
     std::string lastStateGoal;
     int lastStateTarget = -1;
@@ -992,9 +999,14 @@ struct LLMapperBot::Impl
     size_t navRouteIndex = 0;
     int navRouteSignature = 0;
     int navRouteTopologyRevision = 0;
+    int navRouteRejectedSignature = 0;
+    int lastNavWaypointX = INT32_MIN;
+    int lastNavWaypointY = INT32_MIN;
     std::vector<NavCell> navCells;
     int navTopologySignature = 0;
+    int navDynamicSignatureValue = 0;
     int navTopologyRevision = 0;
+    int lastNavWaypointEvent = -1;
     int navigationFailureSignature = 0;
     int navigationFailureCount = 0;
     int lastNavigationFailureTick = -1;
@@ -1002,6 +1014,11 @@ struct LLMapperBot::Impl
     int lastFrontierSource = -1;
     int lastFrontierTarget = -1;
     int frontierSelectionCount = 0;
+    int lastTransportRouteWall = -1;
+    int lastTransportRouteFrom = -1;
+    int lastTransportRouteTo = -1;
+    int lastCombatRetreatCell = -1;
+    bool combatRetreatUnavailableEmitted = false;
     bool crouchTargetActive = false;
     int followThroughKey = -1;
     int followThroughStartTick = -1;
@@ -1042,10 +1059,11 @@ struct LLMapperBot::Impl
 
     void retirePendingFrontier(int wall, int from, int to)
     {
+        (void)wall; // retirement is destination-scoped, wall is telemetry identity
         for (PendingWork &pending : pendingWork)
         {
-            if (pending.kind == 2 && pending.id == wall
-                && pending.sector == from && pending.edgeTarget == to)
+            if (pending.kind == 2 && pending.sector == from
+                && pending.edgeTarget == to)
             {
                 pending.state = PendingWork::kConsumed;
                 pending.resolved = true;
@@ -1056,8 +1074,11 @@ struct LLMapperBot::Impl
     PendingWork *findPendingFrontier(int wall, int from, int to)
     {
         for (PendingWork &pending : pendingWork)
-            if (pending.kind == 2 && pending.id == wall
-                && pending.sector == from && pending.edgeTarget == to)
+            if (pending.kind == 2 && pending.sector == from
+                && pending.edgeTarget == to
+                && (pending.id == wall
+                    || std::find(pending.candidates.begin(), pending.candidates.end(), wall)
+                        != pending.candidates.end()))
                 return &pending;
         return nullptr;
     }
@@ -1068,11 +1089,13 @@ struct LLMapperBot::Impl
             || pending.state == PendingWork::kConsumed
             || pending.state == PendingWork::kStale)
             return false;
+        if (visitedSectors.count(pending.edgeTarget))
+            return false;
         if (pending.sector == observation.sector)
         {
             for (const Portal &portal : observation.portals)
             {
-                if (portal.wall == pending.id && portal.to == pending.edgeTarget)
+                if (portal.to == pending.edgeTarget)
                     return portal.traversable || portal.jumpable;
             }
             return false;
@@ -1082,7 +1105,7 @@ struct LLMapperBot::Impl
             return false;
         return std::any_of(graph->second.begin(), graph->second.end(), [&pending](const Portal &portal)
         {
-            return portal.wall == pending.id && portal.to == pending.edgeTarget
+            return portal.to == pending.edgeTarget
                 && (portal.traversable || portal.jumpable);
         });
     }
@@ -1556,7 +1579,12 @@ struct LLMapperBot::Impl
         if (first)
         {
             recoveryMode = false;
-            pendingWork.push_back({ 1, key, candidate.fromSector, candidate.targetSector });
+            PendingWork pending;
+            pending.kind = 1;
+            pending.id = key;
+            pending.sector = candidate.fromSector;
+            pending.edgeTarget = candidate.targetSector;
+            pendingWork.push_back(pending);
             ++knowledgeRevision;
             char detail[128];
             snprintf(detail, sizeof(detail), "kind=%d id=%d sector=%d key=%d", int(memory.kind), memory.id,
@@ -1796,24 +1824,34 @@ struct LLMapperBot::Impl
             if (localFailure != localFailureSignatures.end()
                 && localFailure->second != portalGeometrySignature(portal))
                 localFailureSignatures.erase(localFailure);
-            const bool knownEdge = std::any_of(knownGraph[portal.from].begin(),
-                                               knownGraph[portal.from].end(),
-                                               [&portal](const Portal &known)
-            {
-                return known.wall == portal.wall && known.to == portal.to;
-            });
-            const bool newEdge = !portal.localGeometry && seenEdges.insert(edgeId).second;
-            if (newEdge)
+            const bool newEdge = seenEdges.insert(edgeId).second;
+            if (newEdge && !visitedSectors.count(portal.to))
             {
                 recoveryMode = false;
-                PendingWork pending;
-                pending.kind = 2;
-                pending.id = portal.wall;
-                pending.sector = portal.from;
-                pending.edgeTarget = portal.to;
-                pending.state = PendingWork::kDiscovered;
-                pending.stateSignature = portalGeometrySignature(portal);
-                pendingWork.push_back(pending);
+                PendingWork *pending = nullptr;
+                for (PendingWork &candidate : pendingWork)
+                    if (candidate.kind == 2 && candidate.sector == portal.from
+                        && candidate.edgeTarget == portal.to
+                        && !candidate.resolved)
+                    {
+                        pending = &candidate;
+                        break;
+                    }
+                if (!pending)
+                {
+                    PendingWork candidate;
+                    candidate.kind = 2;
+                    candidate.id = portal.wall;
+                    candidate.sector = portal.from;
+                    candidate.edgeTarget = portal.to;
+                    candidate.candidates.push_back(portal.wall);
+                    candidate.state = PendingWork::kDiscovered;
+                    candidate.stateSignature = portalGeometrySignature(portal);
+                    pendingWork.push_back(candidate);
+                }
+                else if (std::find(pending->candidates.begin(), pending->candidates.end(),
+                                   portal.wall) == pending->candidates.end())
+                    pending->candidates.push_back(portal.wall);
                 ++knowledgeRevision;
                 lastSemanticProgressTick = observation.tick;
                 char detail[96];
@@ -1843,14 +1881,14 @@ struct LLMapperBot::Impl
             {
                 // A local-geometry observation may refresh an edge already
                 // known, but must not create a route from an unseen corner.
-                if (edge == edges.end() && !portal.localGeometry)
+                if (edge == edges.end())
                     edges.push_back(portal);
-            else if (edge != edges.end())
+                else
                 *edge = portal;
             }
             else if (edge != edges.end())
                 edges.erase(edge);
-            if (!portal.localGeometry && (portal.traversable || portal.jumpable))
+            if (portal.traversable || portal.jumpable)
             {
                 // A visible two-sided Build opening is a known route in both
                 // directions.  Keeping only the observed wall direction made
@@ -1964,7 +2002,7 @@ struct LLMapperBot::Impl
                     *reverseEdge = reverse;
                 }
             }
-            else if (!portal.localGeometry && inRange(portal.to, 0, numsectors))
+            else if (inRange(portal.to, 0, numsectors))
             {
                 // The cached reverse route describes current topology, not
                 // historical reachability.  Remove it when this re-observed
@@ -1980,8 +2018,6 @@ struct LLMapperBot::Impl
                         ++reverseEdge;
                 }
             }
-            if (portal.localGeometry && !knownEdge)
-                continue;
             const bool blockedInteractivePortal = portal.interactionAffordance;
             if (portal.key || portal.locked || blockedInteractivePortal
                 || (!portal.traversable && !portal.jumpable))
@@ -2239,8 +2275,6 @@ struct LLMapperBot::Impl
         {
             for (const Portal &portal : observation.portals)
             {
-                if (!portal.visible)
-                    continue;
                 const int edgeId = portal.wall * 65536 + portal.to;
                 if (portal.wall == currentGoalTarget && !edgeFailed(edgeId)
                     && (portal.traversable || portal.jumpable)
@@ -2274,7 +2308,7 @@ struct LLMapperBot::Impl
             for (const Portal &portal : observation.portals)
             {
                 const int edgeId = portal.wall * 65536 + portal.to;
-                if (portal.wall == pending->id && portal.to == pending->edgeTarget
+                if (portal.to == pending->edgeTarget && !visitedSectors.count(portal.to)
                     && (portal.traversable || portal.jumpable)
                     && !visitedEdges.count(edgeId) && !edgeFailed(edgeId)
                     && (!portal.key || hasKey(portal.key)))
@@ -2285,11 +2319,9 @@ struct LLMapperBot::Impl
         bool unvisitedAvailable = false;
         for (const Portal &portal : observation.portals)
         {
-            if (!portal.visible)
-                continue;
             if ((portal.traversable || portal.jumpable)
                 && (!portal.key || hasKey(portal.key))
-                && !visitedEdges.count(portal.wall * 65536 + portal.to)
+                && !visitedSectors.count(portal.to)
                 && !edgeFailed(portal.wall * 65536 + portal.to)
                 && !openedRoutes.count(portal.from * 65536 + portal.to)
                 && (!avoidBacktrack || portal.to != lastTransitionFrom))
@@ -2303,16 +2335,16 @@ struct LLMapperBot::Impl
         int bestDistance = INT32_MAX;
         for (const Portal &portal : observation.portals)
         {
-            if (!portal.visible)
-                continue;
             if (!(portal.traversable || portal.jumpable) || (portal.key && !hasKey(portal.key)))
+                continue;
+            if (visitedSectors.count(portal.to))
                 continue;
             if (avoidBacktrack && portal.to == lastTransitionFrom)
                 continue;
             const int edgeId = portal.wall * 65536 + portal.to;
             if (edgeFailed(edgeId))
                 continue;
-            const bool alreadyExplored = visitedEdges.count(edgeId)
+            const bool alreadyExplored = visitedSectors.count(portal.to)
                 || openedRoutes.count(portal.from * 65536 + portal.to);
             if (!unvisitedAvailable || alreadyExplored)
                 continue;
@@ -2340,12 +2372,27 @@ struct LLMapperBot::Impl
             if (!pendingWorkLive(*pending) || pending->kind != 2
                 || pending->sector == observation.sector)
                 continue;
+            if (visitedSectors.count(pending->edgeTarget))
+                continue;
             Portal route;
             if (!findKnownRoute(pending->sector, route))
                 continue;
-            const int edgeId = pending->id * 65536 + pending->edgeTarget;
-            if (edgeFailed(edgeId))
+            int usableWall = -1;
+            for (const Portal &candidate : knownGraph[pending->sector])
+                if (candidate.to == pending->edgeTarget
+                    && (candidate.traversable || candidate.jumpable)
+                    && !edgeFailed(candidate.wall * 65536 + candidate.to))
+                {
+                    usableWall = candidate.wall;
+                    break;
+                }
+            if (usableWall < 0)
                 continue;
+            // The work item is destination-scoped, but the committed
+            // objective still needs one currently viable crossing candidate.
+            // Do not keep retrying the group's first wall after that route
+            // edge has failed.
+            pending->id = usableWall;
             return &*pending;
         }
         return nullptr;
@@ -2377,7 +2424,7 @@ struct LLMapperBot::Impl
             for (const Portal &portal : observation.portals)
             {
                 const int edgeId = portal.wall * 65536 + portal.to;
-                if (portal.wall == pending->id && portal.to == pending->edgeTarget
+                if (portal.to == pending->edgeTarget && !visitedSectors.count(portal.to)
                     && portal.localGeometry && portal.traversable
                     && !visitedEdges.count(edgeId) && !edgeFailed(edgeId)
                     && !localEdgeFailed(edgeId))
@@ -2394,6 +2441,8 @@ struct LLMapperBot::Impl
         {
             if (!portal.localGeometry || portal.capability != kTraversalWalkable)
                 continue;
+            if (visitedSectors.count(portal.to))
+                continue;
             const int edgeId = portal.wall * 65536 + portal.to;
             if (edgeFailed(edgeId) || localEdgeFailed(edgeId) || visitedEdges.count(edgeId)
                 || openedRoutes.count(portal.from * 65536 + portal.to)
@@ -2408,6 +2457,8 @@ struct LLMapperBot::Impl
         for (const Portal &portal : observation.portals)
         {
             if (!portal.localGeometry || !portal.traversable)
+                continue;
+            if (visitedSectors.count(portal.to))
                 continue;
             if (walkableAvailable && portal.capability != kTraversalWalkable)
                 continue;
@@ -3041,7 +3092,8 @@ struct LLMapperBot::Impl
         const VisibleObject *enemy = selectObject(kObjectEnemy);
         return enemy && !unreachableEnemies.count(enemy->sprite)
             && enemy->sector == observation.sector
-            && distance2(enemy->x, enemy->y, observation.x, observation.y) <= 4096 * 4096;
+            && distance2(enemy->x, enemy->y, observation.x, observation.y) <= 1024 * 1024
+            && directObjectReachable(*enemy);
     }
 
     GINPUT retreatFromEnemy(const VisibleObject &enemy)
@@ -3074,29 +3126,55 @@ struct LLMapperBot::Impl
         }
         if (bestCell < 0)
         {
-            // A partially observed area can have no currently usable cell
-            // center.  Keep the no-ranged policy safe anyway: move away from
-            // the attacker, never toward it, and let the next observation
-            // discover a better retreat cell.
-            const int awayAngle = wrapAngle(getangle(
-                observation.x - enemy.x, observation.y - enemy.y));
-            const int retreatX = observation.x + mulscale30(Cos(awayAngle), 4096);
-            const int retreatY = observation.y + mulscale30(Sin(awayAngle), 4096);
-            event("combat_retreat", "mode=direct_away_no_cell");
-            setGoal("COMBAT_RETREAT", enemy.sprite);
-            return steerTo(retreatX, retreatY, false, false, -1,
-                           observation.sector, kTraversalUnknown);
+            // Raw opposite-point movement can send the player through a wall.
+            // A retreat is valid only when the same validated local topology
+            // proves the destination reachable.
+            if (!combatRetreatUnavailableEmitted)
+            {
+                combatRetreatUnavailableEmitted = true;
+                event("combat_retreat_unavailable", "reason=no_validated_local_cell");
+            }
+            return GINPUT{};
         }
-        char detail[160];
-        snprintf(detail, sizeof(detail), "enemy=%d cell=%d distance=%d->%d",
-                 enemy.sprite, bestCell,
-                 int(std::sqrt(double(currentEnemyDistance))),
-                 int(std::sqrt(double(bestEnemyDistance))));
-        event("combat_retreat", detail);
+        combatRetreatUnavailableEmitted = false;
+        if (bestCell != lastCombatRetreatCell)
+        {
+            lastCombatRetreatCell = bestCell;
+            char detail[160];
+            snprintf(detail, sizeof(detail), "enemy=%d cell=%d distance=%d->%d",
+                     enemy.sprite, bestCell,
+                     int(std::sqrt(double(currentEnemyDistance))),
+                     int(std::sqrt(double(bestEnemyDistance))));
+            event("combat_retreat", detail);
+        }
         setGoal("COMBAT_RETREAT", enemy.sprite);
         const NavCell &cell = navCells[bestCell];
         return navigateTo(cell.center.x, cell.center.y, observation.z,
                           observation.sector, -1, kTraversalUnknown);
+    }
+
+    bool meleeWeaponAvailable() const
+    {
+        return gMe && gMe->hasWeapon[kWeaponPitchfork];
+    }
+
+    GINPUT meleeAttack(const VisibleObject &enemy)
+    {
+        GINPUT input = {};
+        input.syncFlags.run = 1;
+        input.q16turn = fix16_from_int(angleDelta(
+            getangle(enemy.x - observation.x, enemy.y - observation.y), observation.angle));
+        if (!meleeWeaponAvailable())
+            return input;
+        if (gMe->curWeapon != kWeaponPitchfork)
+        {
+            input.syncFlags.weaponChange = 1;
+            input.newWeapon = uint8_t(kWeaponPitchfork);
+            event("melee_weapon_selected", "weapon=pitchfork");
+            return input;
+        }
+        input.buttonFlags.shoot = 1;
+        return input;
     }
 
     bool interactionStillBusy(const InteractionMemory &memory) const
@@ -3200,7 +3278,30 @@ struct LLMapperBot::Impl
             {
                 Portal sourceRoute;
                 if (findKnownRoute(currentObjective.sector, sourceRoute))
+                {
+                    char routeDetail[192];
+                    snprintf(routeDetail, sizeof(routeDetail),
+                             "frontier_wall=%d source=%d target=%d route_wall=%d route_from=%d route_to=%d current=%d",
+                             currentObjective.wall, currentObjective.sector,
+                             currentObjective.targetSector, sourceRoute.wall,
+                             sourceRoute.from, sourceRoute.to, observation.sector);
+                    if (sourceRoute.wall != lastTransportRouteWall
+                        || sourceRoute.from != lastTransportRouteFrom
+                        || sourceRoute.to != lastTransportRouteTo)
+                    {
+                        lastTransportRouteWall = sourceRoute.wall;
+                        lastTransportRouteFrom = sourceRoute.from;
+                        lastTransportRouteTo = sourceRoute.to;
+                        event("frontier_transport_route", routeDetail);
+                    }
+                    if (sourceRoute.from != observation.sector)
+                    {
+                        event("frontier_transport_invalid", "reason=route_source_not_current_sector");
+                        invalidateObjective("frontier_invalid_transport_route");
+                        return GINPUT{};
+                    }
                     return steerPortal(sourceRoute);
+                }
                 invalidateObjective("frontier_no_current_source_route");
                 return GINPUT{};
             }
@@ -3283,11 +3384,20 @@ struct LLMapperBot::Impl
             if (distance2(enemy->x, enemy->y, observation.x, observation.y)
                     <= meleeRange * meleeRange
                 && directObjectReachable(*enemy))
-                return navigateTo(enemy->x, enemy->y, enemy->z, enemy->sector,
-                                  enemy->sprite, kTraversalUnknown, true);
+            {
+                if (!meleeWeaponAvailable())
+                {
+                    event("threat_deferred", "reason=no_melee_weapon");
+                    invalidateObjective("threat_no_melee_weapon");
+                    return GINPUT{};
+                }
+                return meleeAttack(*enemy);
+            }
             GINPUT retreat = retreatFromEnemy(*enemy);
             if (retreat.forward || retreat.strafe || retreat.q16turn || retreat.buttonFlags.shoot)
                 return retreat;
+            if (meleeWeaponAvailable())
+                return meleeAttack(*enemy);
             unreachableEnemies.insert(enemy->sprite);
             lastDamageTick = -1;
             event("threat_deferred", "reason=no_ranged_weapon_and_no_safe_retreat");
@@ -3424,8 +3534,6 @@ struct LLMapperBot::Impl
             signature = signature * 31 + sectorId;
             signature = signature * 31 + sectorRecord.wallptr;
             signature = signature * 31 + sectorRecord.wallnum;
-            signature = signature * 31 + sectorRecord.floorz;
-            signature = signature * 31 + sectorRecord.ceilingz;
             for (int i = 0; i < sectorRecord.wallnum; ++i)
             {
                 const int wallId = sectorRecord.wallptr + i;
@@ -3435,8 +3543,43 @@ struct LLMapperBot::Impl
                 signature = signature * 31 + wallRecord.x;
                 signature = signature * 31 + wallRecord.y;
                 signature = signature * 31 + wallRecord.point2;
+            }
+        }
+        return signature;
+    }
+
+    int navDynamicSignature() const
+    {
+        int signature = 23;
+        std::set<int> sectors = observedSectors;
+        if (inRange(observation.sector, 0, numsectors))
+            sectors.insert(observation.sector);
+        for (int sectorId : sectors)
+        {
+            if (!inRange(sectorId, 0, numsectors))
+                continue;
+            const sectortype &record = sector[sectorId];
+            signature = signature * 31 + sectorId;
+            signature = signature * 31 + record.floorz;
+            signature = signature * 31 + record.ceilingz;
+            if (record.extra > 0 && record.extra < kMaxXSectors)
+            {
+                signature = signature * 31 + xsector[record.extra].state;
+                signature = signature * 31 + xsector[record.extra].busy;
+            }
+            for (int i = 0; i < record.wallnum; ++i)
+            {
+                const int wallId = record.wallptr + i;
+                if (!inRange(wallId, 0, numwalls))
+                    continue;
+                const walltype &wallRecord = wall[wallId];
                 signature = signature * 31 + wallRecord.nextsector;
                 signature = signature * 31 + wallRecord.cstat;
+                if (wallRecord.extra > 0 && wallRecord.extra < kMaxXWalls)
+                {
+                    signature = signature * 31 + xwall[wallRecord.extra].state;
+                    signature = signature * 31 + xwall[wallRecord.extra].busy;
+                }
             }
         }
         return signature;
@@ -3458,6 +3601,56 @@ struct LLMapperBot::Impl
         link.gateway = gateway;
         link.hasGateway = hasGateway;
         cell.links.push_back(link);
+    }
+
+    void refreshDynamicNavLinks()
+    {
+        // Triangle connectivity is planar and remains cached.  Only links
+        // whose capability depends on current sector/wall state are rebuilt.
+        for (NavCell &cell : navCells)
+            cell.links.erase(std::remove_if(cell.links.begin(), cell.links.end(),
+                                            [](const NavLink &link)
+                                            { return link.wall >= 0; }), cell.links.end());
+        for (const auto &entry : knownGraph)
+            for (const Portal &portal : entry.second)
+            {
+                if (!(portal.traversable || portal.jumpable)
+                    || !observedSectors.count(portal.from)
+                    || !observedSectors.count(portal.to))
+                    continue;
+                const int from = nearestNavCell(portal.from, portal.x, portal.y);
+                const int to = nearestNavCell(portal.to, portal.x, portal.y);
+                if (from >= 0 && to >= 0)
+                    addNavLink(from, to, navModeForPortal(portal), portal.wall,
+                               { portal.x, portal.y }, true);
+            }
+        int nextArea = 0;
+        for (NavCell &cell : navCells)
+            cell.walkArea = -1;
+        for (NavCell &cell : navCells)
+        {
+            if (cell.walkArea >= 0)
+                continue;
+            std::deque<int> queue;
+            queue.push_back(cell.id);
+            cell.walkArea = nextArea;
+            while (!queue.empty())
+            {
+                const int current = queue.front();
+                queue.pop_front();
+                for (const NavLink &link : navCells[current].links)
+                {
+                    if (link.mode != kNavWalk && link.mode != kNavStep)
+                        continue;
+                    if (navCells[link.target].walkArea < 0)
+                    {
+                        navCells[link.target].walkArea = nextArea;
+                        queue.push_back(link.target);
+                    }
+                }
+            }
+            ++nextArea;
+        }
     }
 
     int nearestNavCell(int sectorId, int x, int y) const
@@ -3618,9 +3811,20 @@ struct LLMapperBot::Impl
     void ensureNavTopology()
     {
         const int signature = navGeometrySignature();
+        const int dynamicSignature = navDynamicSignature();
         if (signature == navTopologySignature && !navCells.empty())
+        {
+            if (dynamicSignature != navDynamicSignatureValue)
+            {
+                refreshDynamicNavLinks();
+                navDynamicSignatureValue = dynamicSignature;
+                ++navTopologyRevision;
+                event("nav_links_refreshed", "source=dynamic_world_state");
+            }
             return;
+        }
         navTopologySignature = signature;
+        navDynamicSignatureValue = dynamicSignature;
         navCells.clear();
         std::set<int> sectors = observedSectors;
         if (inRange(observation.sector, 0, numsectors))
@@ -3659,22 +3863,7 @@ struct LLMapperBot::Impl
                 }
             }
 
-        for (const auto &entry : knownGraph)
-            for (const Portal &portal : entry.second)
-            {
-                if (!(portal.traversable || portal.jumpable)
-                    || !observedSectors.count(portal.from)
-                    || !observedSectors.count(portal.to))
-                    continue;
-                const int from = nearestNavCell(portal.from, portal.x, portal.y);
-                const int to = nearestNavCell(portal.to, portal.x, portal.y);
-                if (from >= 0 && to >= 0)
-                {
-                    const NavEdgeMode mode = navModeForPortal(portal);
-                    addNavLink(from, to, mode, portal.wall,
-                               { portal.x, portal.y }, true);
-                }
-            }
+        refreshDynamicNavLinks();
 
         int nextArea = 0;
         for (NavCell &cell : navCells)
@@ -3752,7 +3941,7 @@ struct LLMapperBot::Impl
         }
         if (cells.back() != start)
             return false;
-        navRoute.clear();
+        std::vector<LocalWaypoint> rawRoute;
         const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
         for (auto it = cells.rbegin(); it != cells.rend(); ++it)
         {
@@ -3767,27 +3956,101 @@ struct LLMapperBot::Impl
                     continue;
                 if (link.hasGateway)
                 {
-                    waypoint = link.gateway;
-                    const int dx = navCells[toCell].center.x - waypoint.x;
-                    const int dy = navCells[toCell].center.y - waypoint.y;
-                    const int length = std::max(1, int(std::sqrt(double(dx * dx + dy * dy))));
-                    const int inset = std::min(radius + 256, length / 2);
-                    waypoint.x += dx * inset / length;
-                    waypoint.y += dy * inset / length;
+                    std::vector<LocalWaypoint> candidates;
+                    candidates.push_back(link.gateway);
+                    // The midpoint of a shared edge can be a poor
+                    // player-sized passage point near a corner.  Preserve a
+                    // compact bounded set of alternatives along the same
+                    // gateway, inset toward the receiving cell.
+                    for (int a = 0; a < 3; ++a)
+                        for (int b = 0; b < 3; ++b)
+                        {
+                            const LocalWaypoint &a1 = navCells[fromCell].vertex[a];
+                            const LocalWaypoint &a2 = navCells[fromCell].vertex[(a + 1) % 3];
+                            const LocalWaypoint &b1 = navCells[toCell].vertex[b];
+                            const LocalWaypoint &b2 = navCells[toCell].vertex[(b + 1) % 3];
+                            const bool same =
+                                (a1.x == b2.x && a1.y == b2.y && a2.x == b1.x && a2.y == b1.y)
+                                || (a1.x == b1.x && a1.y == b1.y && a2.x == b2.x && a2.y == b2.y);
+                            if (!same)
+                                continue;
+                            for (int numerator : { 1, 2, 3 })
+                            {
+                                LocalWaypoint candidate = {
+                                    a1.x + (a2.x - a1.x) * numerator / 4,
+                                    a1.y + (a2.y - a1.y) * numerator / 4 };
+                                const int dx = navCells[toCell].center.x - candidate.x;
+                                const int dy = navCells[toCell].center.y - candidate.y;
+                                const int length = std::max(1, int(std::sqrt(double(dx * dx + dy * dy))));
+                                const int inset = std::min(radius + 256, length / 2);
+                                candidate.x += dx * inset / length;
+                                candidate.y += dy * inset / length;
+                                candidates.push_back(candidate);
+                            }
+                        }
+                    if (rawRoute.empty())
+                    {
+                        for (const LocalWaypoint &candidate : candidates)
+                        {
+                            if (probeMovement(observation.x, observation.y, observation.z,
+                                              observation.sector, candidate.x, candidate.y,
+                                              observation.sector, std::max(256, radius)).reachable)
+                            {
+                                waypoint = candidate;
+                                break;
+                            }
+                        }
+                    }
                 }
                 break;
             }
-            if (navRoute.empty() || navRoute.back().x != waypoint.x
-                || navRoute.back().y != waypoint.y)
-                navRoute.push_back(waypoint);
+            if (rawRoute.empty() || rawRoute.back().x != waypoint.x
+                || rawRoute.back().y != waypoint.y)
+                rawRoute.push_back(waypoint);
         }
+        // The gateways carry the connectivity proof.  They are not intended
+        // to become a sequence of triangle-centre footsteps.  Add the real
+        // target and greedily keep the furthest gateway that the authoritative
+        // player-sized probe can reach from the current simplified point.
+        rawRoute.push_back({ targetX, targetY });
+        navRoute.clear();
+        size_t rawIndex = 0;
+        while (rawIndex < rawRoute.size())
+        {
+            int best = -1;
+            const int startX = navRoute.empty() ? observation.x : navRoute.back().x;
+            const int startY = navRoute.empty() ? observation.y : navRoute.back().y;
+            const int startZ = observation.z;
+            for (int candidate = int(rawRoute.size()) - 1;
+                 candidate >= int(rawIndex); --candidate)
+            {
+                const MovementProbe probe = probeMovement(
+                    startX, startY, startZ, observation.sector,
+                    rawRoute[candidate].x, rawRoute[candidate].y,
+                    observation.sector, std::max(256, radius));
+                if (probe.reachable)
+                {
+                    best = candidate;
+                    break;
+                }
+            }
+            if (best < 0)
+                best = int(rawIndex);
+            if (navRoute.empty() || navRoute.back().x != rawRoute[best].x
+                || navRoute.back().y != rawRoute[best].y)
+                navRoute.push_back(rawRoute[best]);
+            rawIndex = size_t(best + 1);
+        }
+        const bool routeChanged = navRouteSignature != signature
+            || navRouteTopologyRevision != navTopologyRevision;
         navRouteIndex = 0;
         navRouteSignature = signature;
         navRouteTopologyRevision = navTopologyRevision;
         char detail[160];
         snprintf(detail, sizeof(detail), "cells=%u target=(%d,%d) area=%d",
                  unsigned(navRoute.size()), targetX, targetY, navCells[target].walkArea);
-        event("nav_route_selected", detail);
+        if (routeChanged)
+            event("nav_route_selected", detail);
         return !navRoute.empty();
     }
 
@@ -3818,18 +4081,56 @@ struct LLMapperBot::Impl
         navRoute.clear();
         navRouteIndex = 0;
         navRouteSignature = 0;
+        navRouteRejectedSignature = 0;
         navigationFailureSignature = 0;
         navigationFailureCount = 0;
         lastNavigationFailureTick = -1;
+        lastNavWaypointX = INT32_MIN;
+        lastNavWaypointY = INT32_MIN;
+    }
+
+    int wallOwnerSector(int wallId) const
+    {
+        if (!inRange(wallId, 0, numwalls))
+            return -1;
+        for (int sectorId = 0; sectorId < numsectors; ++sectorId)
+        {
+            const sectortype &record = sector[sectorId];
+            if (wallId >= record.wallptr && wallId < record.wallptr + record.wallnum)
+                return sectorId;
+        }
+        return -1;
+    }
+
+    // clipmove reports the physical wall it touched, not necessarily the
+    // directional linedef owned by the player's current sector.  Resolve the
+    // actual side before classifying vertical traversal.
+    int directionalNavigationWall(int wallId) const
+    {
+        if (!inRange(wallId, 0, numwalls))
+            return -1;
+        const int owner = wallOwnerSector(wallId);
+        if (owner == observation.sector)
+            return wallId;
+        const walltype &record = wall[wallId];
+        if (record.nextsector == observation.sector
+            && inRange(record.nextwall, 0, numwalls))
+            return record.nextwall;
+        return -1;
     }
 
     NavEdgeMode classifyNavigationBlock(int wallId, int x, int y) const
     {
-        if (!inRange(wallId, 0, numwalls))
+        (void)x;
+        (void)y;
+        const int directionalWall = directionalNavigationWall(wallId);
+        if (!inRange(directionalWall, 0, numwalls))
             return kNavBlocked;
-        const walltype &wallRecord = wall[wallId];
+        const walltype &wallRecord = wall[directionalWall];
         if (!inRange(wallRecord.point2, 0, numwalls))
             return kNavBlocked;
+        const int sampleX = (wallRecord.x + wall[wallRecord.point2].x) / 2;
+        const int sampleY = (wallRecord.y + wall[wallRecord.point2].y) / 2;
         if (!inRange(wallRecord.nextsector, 0, numsectors))
         {
             if (inRange(wallRecord.extra, 1, kMaxXWalls)
@@ -3844,10 +4145,15 @@ struct LLMapperBot::Impl
                 return kNavInteraction;
             return kNavBlocked;
         }
-        const int fromFloor = getflorzofslope(observation.sector, x, y);
-        const int toFloor = getflorzofslope(wallRecord.nextsector, x, y);
-        const int fromCeiling = getceilzofslope(observation.sector, x, y);
-        const int toCeiling = getceilzofslope(wallRecord.nextsector, x, y);
+        const int fromSector = observation.sector;
+        // A collision can stop at different points along a sloped wall.  Use
+        // the portal midpoint for capability classification so the same
+        // directional opening does not oscillate between BLOCKED and JUMP
+        // merely because clipmove stopped at a different x/y.
+        const int fromFloor = getflorzofslope(fromSector, sampleX, sampleY);
+        const int toFloor = getflorzofslope(wallRecord.nextsector, sampleX, sampleY);
+        const int fromCeiling = getceilzofslope(fromSector, sampleX, sampleY);
+        const int toCeiling = getceilzofslope(wallRecord.nextsector, sampleX, sampleY);
         const int clearance = std::min(fromFloor - fromCeiling, toFloor - toCeiling);
         const int width = int(std::sqrt(double(distance2(
             wallRecord.x, wallRecord.y, wall[wallRecord.point2].x,
@@ -3994,7 +4300,12 @@ struct LLMapperBot::Impl
         const int signature = navigationSignature(x, y, z, targetSector, targetId);
         if (!navigationActive || navigationOriginalSignature != signature)
         {
-            resetNavigation();
+            // steerPortal may have prepared a route before entering this
+            // shared primitive.  Preserve it when it belongs to exactly this
+            // target; all other navigation state is reset normally.
+            const bool preserveRoute = navRouteSignature == signature && !navRoute.empty();
+            if (!preserveRoute)
+                resetNavigation();
             navigationActive = true;
             navigationOriginalX = x;
             navigationOriginalY = y;
@@ -4040,11 +4351,17 @@ struct LLMapperBot::Impl
                     next.x, next.y, observation.sector, tolerance);
                 if (segment.reachable)
                 {
-                    event("nav_cell_waypoint", "source=derived_triangle_cell");
+                    if (lastNavWaypointX != next.x || lastNavWaypointY != next.y)
+                    {
+                        lastNavWaypointX = next.x;
+                        lastNavWaypointY = next.y;
+                        event("nav_cell_waypoint", "source=validated_gateway");
+                    }
                     return steerTo(next.x, next.y, false, shoot, targetId,
                                    observation.sector, capability);
                 }
-                event("nav_segment_failed", "source=derived_triangle_cell");
+                event("nav_segment_failed", "source=validated_gateway");
+                navRouteRejectedSignature = signature;
                 navRoute.clear();
             }
         }
@@ -4077,12 +4394,37 @@ struct LLMapperBot::Impl
         if (direct.wall >= 0)
         {
             const NavEdgeMode blockMode = classifyNavigationBlock(direct.wall, direct.x, direct.y);
-            const int nextSector = inRange(direct.wall, 0, numwalls)
-                ? wall[direct.wall].nextsector : -1;
+            const int ownerSector = wallOwnerSector(direct.wall);
+            const int directionalWall = directionalNavigationWall(direct.wall);
+            const int nextSector = inRange(directionalWall, 0, numwalls)
+                ? wall[directionalWall].nextsector : -1;
+            const int floorDelta = inRange(directionalWall, 0, numwalls)
+                && inRange(nextSector, 0, numsectors)
+                ? getflorzofslope(nextSector,
+                                  (wall[directionalWall].x
+                                   + wall[wall[directionalWall].point2].x) / 2,
+                                  (wall[directionalWall].y
+                                   + wall[wall[directionalWall].point2].y) / 2)
+                    - getflorzofslope(observation.sector,
+                                      (wall[directionalWall].x
+                                       + wall[wall[directionalWall].point2].x) / 2,
+                                      (wall[directionalWall].y
+                                       + wall[wall[directionalWall].point2].y) / 2)
+                : 0;
+            const int nextWall = inRange(directionalWall, 0, numwalls)
+                ? wall[directionalWall].nextwall : -1;
+            const int openingWidth = inRange(directionalWall, 0, numwalls)
+                && inRange(wall[directionalWall].point2, 0, numwalls)
+                ? int(std::sqrt(double(distance2(
+                    wall[directionalWall].x, wall[directionalWall].y,
+                    wall[wall[directionalWall].point2].x,
+                    wall[wall[directionalWall].point2].y)))) : 0;
             char classification[192];
             snprintf(classification, sizeof(classification),
-                     "wall=%d mode=%s nextsector=%d stop=(%d,%d)", direct.wall,
-                     navEdgeModeName(blockMode), nextSector, direct.x, direct.y);
+                     "wall=%d directional_wall=%d owner=%d player_side=%d nextwall=%d mode=%s nextsector=%d floor_delta=%d width=%d stop=(%d,%d)",
+                     direct.wall, directionalWall, ownerSector, observation.sector,
+                     nextWall, navEdgeModeName(blockMode), nextSector, floorDelta, openingWidth,
+                     direct.x, direct.y);
             event("navigation_block_classified", classification);
             if (blockMode == kNavWalk || blockMode == kNavStep || blockMode == kNavDrop)
             {
@@ -4114,7 +4456,8 @@ struct LLMapperBot::Impl
             if (rememberCollisionInteraction(direct.wall))
                 event("navigation_interaction_opportunity", "source=clipmove_collision_hit");
             ensureNavTopology();
-            if (buildNavRoute(x, y, targetSector, signature))
+            if (navRouteRejectedSignature != signature
+                && buildNavRoute(x, y, targetSector, signature))
             {
                 const LocalWaypoint &waypoint = navRoute.front();
                 return steerTo(waypoint.x, waypoint.y, false, false, targetId,
@@ -4137,15 +4480,24 @@ struct LLMapperBot::Impl
         {
             if (currentObjective.type == kObjectiveFrontier)
             {
-                const int edgeId = currentObjective.wall * 65536
-                    + currentObjective.targetSector;
+                // A remote frontier is work; the portal used to transport
+                // the player to its source is only a route step.  A failed
+                // route step must not consume or poison the original work.
+                const bool transporting = observation.sector != currentObjective.sector;
+                const int failedWall = transporting && movementTargetActive
+                    ? movementTargetId : currentObjective.wall;
+                const int failedTarget = transporting && movementTargetActive
+                    ? movementTargetSector : currentObjective.targetSector;
+                const int edgeId = failedWall * 65536 + failedTarget;
                 const Portal *failedPortal = findPortalForEdge(edgeId);
                 if (failedPortal)
                 {
                     recordEdgeFailure(*failedPortal, "local_portal_failed",
-                                      "navigation_failed_bounded");
-                    retirePendingFrontier(currentObjective.wall, currentObjective.sector,
-                                          currentObjective.targetSector);
+                                      transporting ? "transport_edge_failed"
+                                                    : "navigation_failed_bounded");
+                    if (!transporting)
+                        retirePendingFrontier(currentObjective.wall, currentObjective.sector,
+                                              currentObjective.targetSector);
                 }
             }
             event("navigation_failed_bounded", "reason=objective_temporarily_unreachable");
@@ -4384,16 +4736,27 @@ struct LLMapperBot::Impl
                 portal.x, portal.y, observation.sector, std::max(256, bodyRadius));
             if (!sideProbe.reachable)
             {
-                const int routeSignature = navigationSignature(portal.x, portal.y,
-                                                                portal.z, observation.sector,
-                                                                portal.wall);
-                if (navRouteSignature != routeSignature
+                const int routeSignature = navigationSignature(
+                    portal.x, portal.y, portal.z, observation.sector, portal.wall);
+                if (navRouteRejectedSignature != routeSignature
+                    && (navRouteSignature != routeSignature
                     || navRouteTopologyRevision != navTopologyRevision
-                    || navRoute.empty())
+                    || navRoute.empty()))
                     buildNavRoute(portal.x, portal.y, observation.sector, routeSignature);
                 if (!navRoute.empty() && navRouteSignature == routeSignature)
-                    return navigateTo(portal.x, portal.y, portal.z, observation.sector,
-                                      portal.wall, portal.capability);
+                {
+                    GINPUT routeInput = navigateTo(portal.x, portal.y, portal.z,
+                                                   observation.sector, portal.wall,
+                                                   portal.capability);
+                    if (routeInput.forward || routeInput.strafe || routeInput.q16turn
+                        || routeInput.q16mlook || routeInput.buttonFlags.jump
+                        || routeInput.buttonFlags.crouch)
+                        return routeInput;
+                    // A validated gateway route can be rejected by the real
+                    // copied-state probe after geometry changes.  Continue
+                    // into the bounded portal corner planner rather than
+                    // returning an idle input and abandoning the crossing.
+                }
             }
         }
         const int signature = portalGeometrySignature(portal);
@@ -4728,9 +5091,22 @@ struct LLMapperBot::Impl
         if (InteractionMemory *interaction = selectNewInteraction(true))
             return steerInteraction(*interaction);
 
-        // A short deterministic turn-and-walk probe resolves frontiers that
-        // were not visible from the previous sample without consulting the
-        // loaded map's complete topology.
+        // Entered-sector geometry is complete local knowledge, so normal
+        // exploration must not roam blindly to discover a portal hidden
+        // around a corner.  Retain the old probe only when decomposition
+        // genuinely failed for the current sector.
+        ensureNavTopology();
+        if (nearestNavCell(observation.sector, observation.x, observation.y) >= 0)
+        {
+            if (currentGoal != "RECOVERY_KNOWN_AREA")
+                event("exploration_no_local_frontier", "source=complete_entered_sector_geometry");
+            setGoal("RECOVERY_KNOWN_AREA", observation.sector);
+            return idle;
+        }
+
+        // Degraded fallback for a sector whose local geometry could not be
+        // triangulated.  This path should be rare and is intentionally not a
+        // normal exploration strategy.
         setGoal("SEARCH_CURRENT_AREA", -2);
         idle.syncFlags.run = 1;
         if (searchAngle < 0)
@@ -4767,6 +5143,33 @@ struct LLMapperBot::Impl
 
     void detectStall()
     {
+        if (!explorationSnapshotEmitted
+            && (!currentObjective.active || currentObjective.type != kObjectiveCombat)
+            && observation.tick - lastSemanticProgressTick > 10 * kTicsPerSec)
+        {
+            ensureNavTopology();
+            int localFrontiers = 0;
+            int remoteFrontiers = 0;
+            for (const PendingWork &pending : pendingWork)
+            {
+                if (!pendingWorkLive(pending))
+                    continue;
+                if (pending.kind == 2 && pending.sector == observation.sector)
+                    ++localFrontiers;
+                else if (pending.kind == 2)
+                    ++remoteFrontiers;
+            }
+            char detail[224];
+            snprintf(detail, sizeof(detail),
+                     "sector=%d cells=%u area=%d objective=%d local_frontiers=%d remote_frontiers=%d interactions=%u objects=%u",
+                     observation.sector, unsigned(navCells.size()),
+                     nearestNavCell(observation.sector, observation.x, observation.y) >= 0
+                         ? navCells[nearestNavCell(observation.sector, observation.x, observation.y)].walkArea : -1,
+                     int(currentObjective.type), localFrontiers, remoteFrontiers,
+                     unsigned(interactions.size()), unsigned(objectMemory.size()));
+            event("exploration_stuck_snapshot", detail);
+            explorationSnapshotEmitted = true;
+        }
         if (observation.tick - lastSemanticProgressTick > stallSeconds * kTicsPerSec)
         {
             result = "STALLED";
