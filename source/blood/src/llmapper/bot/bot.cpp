@@ -1249,6 +1249,7 @@ struct LLMapperBot::Impl
     int stationaryY = INT32_MIN;
     int stationaryZ = INT32_MIN;
     int stationarySinceTick = 0;
+    int lastCommandedMoveTick = 0;
     std::set<int64_t> observedCells;
     int coverageTargetX = 0;
     int coverageTargetY = 0;
@@ -2039,16 +2040,26 @@ struct LLMapperBot::Impl
         }
         if (observation.localSectorBusy != 0 && observation.playerZVelocity != 0)
             localDynamicJumpUntilTick = observation.tick + 4 * kTicsPerSec;
+        // Which boundary the player physically crossed is a fact about the
+        // two sectors, not about what the route was aiming at.  A route's
+        // final destination wall is frequently several rooms further on, and
+        // recording it here wrote a connection into the world graph that
+        // does not exist -- which then excluded the real frontier from
+        // future exploration.
+        const int crossedWall = wallJoinsSectors(movementTargetId, previousSector,
+                                                 observation.sector)
+            ? movementTargetId
+            : crossingWallBetween(previousSector, observation.sector);
         if (sectorChanged && previousSector >= 0 && movementTargetActive
             && movementTargetFrom == previousSector
-            && movementTargetSector == observation.sector && movementTargetId >= 0)
+            && movementTargetSector == observation.sector && crossedWall >= 0)
         {
-            const int edgeId = movementTargetId * 65536 + observation.sector;
+            const int edgeId = crossedWall * 65536 + observation.sector;
             visitedEdges.insert(edgeId);
             failedEdges.erase(edgeId);
-            char detail[128];
-            snprintf(detail, sizeof(detail), "from=%d to=%d wall=%d", previousSector,
-                     observation.sector, movementTargetId);
+            char detail[160];
+            snprintf(detail, sizeof(detail), "from=%d to=%d wall=%d aimed_at=%d",
+                     previousSector, observation.sector, crossedWall, movementTargetId);
             event("portal_traversed", detail);
 
             const bool isActiveFrontier = currentObjective.active
@@ -3372,6 +3383,48 @@ struct LLMapperBot::Impl
             event("hazard_sector_detected", detail);
         }
         hazardSectors[observation.sector] = observation.tick + kHazardAvoidTicks;
+    }
+
+    // Does this wall actually separate these two sectors?  A route's final
+    // destination wall is not proof of which boundary the player physically
+    // crossed on the way there, and recording the wrong one writes a
+    // connection into the world graph that does not exist -- which then
+    // excludes the real frontier from future exploration.
+    static bool wallJoinsSectors(int wallId, int a, int b)
+    {
+        if (!inRange(wallId, 0, numwalls) || a < 0 || b < 0)
+            return false;
+        const int owner = sectorofwall(int16_t(wallId));
+        const int other = wall[wallId].nextsector;
+        return (owner == a && other == b) || (owner == b && other == a);
+    }
+
+    // The boundary between two sectors nearest the player -- the one he most
+    // plausibly just stepped over.
+    int crossingWallBetween(int from, int to) const
+    {
+        if (!inRange(from, 0, numsectors) || !inRange(to, 0, numsectors))
+            return -1;
+        const sectortype &record = sector[from];
+        int best = -1;
+        int64_t bestDistance = INT64_MAX;
+        for (int i = 0; i < record.wallnum; ++i)
+        {
+            const int wallId = record.wallptr + i;
+            if (!inRange(wallId, 0, numwalls) || wall[wallId].nextsector != to)
+                continue;
+            if (!inRange(wall[wallId].point2, 0, numwalls))
+                continue;
+            const int64_t distance = dist2ToSegment(
+                observation.x, observation.y, wall[wallId].x, wall[wallId].y,
+                wall[wall[wallId].point2].x, wall[wall[wallId].point2].y);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = wallId;
+            }
+        }
+        return best;
     }
 
     // Which boundary of the sector the bot is standing in leads out of it.
@@ -8114,7 +8167,20 @@ struct LLMapperBot::Impl
         return combat;
     }
 
+    // Every decision leaves a record of whether the bot actually asked to
+    // move.  The stationary watchdog needs it: standing still because some
+    // controller is deliberately holding position -- aiming at a switch,
+    // waiting out a door, lining up a shot -- is not a movement failure, and
+    // treating it as one suppressed perfectly good routes.
     GINPUT decide()
+    {
+        const GINPUT input = decideInput();
+        if (input.forward || input.strafe)
+            lastCommandedMoveTick = observation.tick;
+        return input;
+    }
+
+    GINPUT decideInput()
     {
         GINPUT idle = {};
         if (!gMe || !gMe->pSprite || !gMe->pXSprite)
@@ -8307,17 +8373,29 @@ struct LLMapperBot::Impl
                  && currentGoal != "WAIT_MOVING_MECHANISM"
                  && !committedMechanismBusy())
         {
-            char detail[176];
+            // Not moving is only a failure if the bot was asking to move.
+            const bool asked = observation.tick - lastCommandedMoveTick
+                <= kStationaryLimitTicks;
+            char detail[192];
             snprintf(detail, sizeof(detail),
-                     "seconds=%d sector=%d goal=%s objective_active=%d",
+                     "seconds=%d sector=%d goal=%s objective_active=%d camera_owner=%s",
                      (observation.tick - stationarySinceTick) / kTicsPerSec,
                      observation.sector, currentGoal.c_str(),
-                     currentObjective.active ? 1 : 0);
-            event("stationary_deadlock", detail);
+                     currentObjective.active ? 1 : 0, cameraOwner.c_str());
             stationarySinceTick = observation.tick;
-            if (currentObjective.active)
-                invalidateObjective("stationary_deadlock");
-            resetNavigation();
+            if (!asked)
+            {
+                // Someone is holding position on purpose.  Say so and leave
+                // the objective alone; the objective budget still bounds it.
+                event("stationary_hold", detail);
+            }
+            else
+            {
+                event("stationary_deadlock", detail);
+                if (currentObjective.active)
+                    invalidateObjective("stationary_deadlock");
+                resetNavigation();
+            }
         }
         if (currentObjective.active && enforceObjectiveBudget())
         {
