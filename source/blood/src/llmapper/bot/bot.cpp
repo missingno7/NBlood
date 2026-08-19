@@ -176,6 +176,9 @@ constexpr int kLookLevelRate = 24;
 constexpr int kDamageBurstWindow = kTicsPerSec;
 constexpr int kDamageBurstSevere = 200;
 constexpr int kHazardAvoidTicks = 30 * kTicsPerSec;
+// Probes at a surface the engine will not name as a target before the bot
+// goes and tries a different surface of the same mechanism.
+constexpr int kSurfaceRetryProbes = 8;
 // Slack demanded on top of the body envelope before a gap counts as
 // passable.  A gap exactly the height of the player is not one the engine
 // will move him through.
@@ -1248,6 +1251,7 @@ struct LLMapperBot::Impl
     int damageBurstCount = 0;
     int damageBurstHealth = 0;
     std::map<int, int> hazardSectors;   // sector -> tick it stops being avoided
+    std::set<int> triedSurfaces;        // mechanism/wall pairs already attempted
     std::set<int> reopenableConnections;
     int openedRouteWall = -1;
     int openedRouteFrom = -1;
@@ -4099,6 +4103,49 @@ struct LLMapperBot::Impl
         event("camera_owner", detail);
     }
 
+    // Move this mechanism's approach point to a surface that has not been
+    // tried from the bot's current side.  Returns false when they have all
+    // been tried, which is the honest answer that it cannot be used here.
+    bool advanceInteractionSurface(InteractionMemory &memory)
+    {
+        const int key = interactionMemoryKey(memory);
+        const InteractionCandidate *next = nullptr;
+        int bestDistance = INT32_MAX;
+        for (const InteractionCandidate &candidate : observation.interactions)
+        {
+            if (interactionKey(candidate) != key)
+                continue;
+            if (candidate.target.wall >= 0
+                && triedSurfaces.count(key * 8192 + candidate.target.wall))
+                continue;
+            const int distance = distance2(observation.x, observation.y,
+                                           candidate.x, candidate.y);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                next = &candidate;
+            }
+        }
+        if (!next)
+            return false;
+        if (memory.target.wall >= 0)
+            triedSurfaces.insert(key * 8192 + memory.target.wall);
+        char detail[208];
+        snprintf(detail, sizeof(detail),
+                 "mechanism=%d from_wall=%d to_wall=%d at=(%d,%d) distance=%d",
+                 memory.id, memory.target.wall, next->target.wall, next->x, next->y,
+                 int(std::sqrt(double(bestDistance))));
+        event("interaction_surface_retried", detail);
+        memory.target = next->target;
+        memory.x = next->x;
+        memory.y = next->y;
+        memory.z = next->z;
+        memory.unavailablePose = 0;
+        resetNavigation();
+        movementTargetActive = false;
+        return true;
+    }
+
     GINPUT steerInteraction(InteractionMemory &memory)
     {
         if (memory.fromSector != observation.sector)
@@ -4200,6 +4247,7 @@ struct LLMapperBot::Impl
             memory.attempted = true;
             memory.state = 1;
             memory.activated = false;
+            triedSurfaces.erase(interactionMemoryKey(memory) * 8192 + memory.target.wall);
             memory.lastActivationTick = observation.tick;
             memory.beforeState = interactionStateSignature(memory);
             memory.beforePortals = observation.portals;
@@ -4232,23 +4280,26 @@ struct LLMapperBot::Impl
                 event("interaction_failed", "reason=INTERACTION_VALID_BUT_NO_RESPONSE");
             }
         }
-        if (!valid && !missingKey && memory.state != 1 && memory.state != 2
+        if (!valid && !missingKey && memory.state != 1
             && expectedDistance <= kActionScanRange * kActionScanRange
             && std::abs(angleDelta(expectedAngle, observation.angle)) < 96
             && std::abs(lookDelta) < 64)
         {
-            const int pose = (observation.x >> 9) ^ ((observation.y >> 9) << 11)
-                ^ (wrapAngle(observation.angle) >> 7);
-            if (pose != memory.unavailablePose)
-            {
-                memory.unavailablePose = pose;
-                ++memory.unavailableAttempts;
-            }
+            ++memory.unavailableAttempts;
             memory.unavailableState = interactionStateSignature(memory);
-            if (memory.unavailableAttempts >= 3)
+            if (memory.unavailableAttempts >= kSurfaceRetryProbes)
             {
-                memory.unavailableFromSector = observation.sector;
-                event("interaction_unavailable", "reason=CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE attempts=3");
+                // Squared up, in range, and the engine still will not name
+                // this as a target.  Try a different surface of the same
+                // mechanism before concluding it cannot be used from here.
+                if (advanceInteractionSurface(memory))
+                    memory.unavailableAttempts = 0;
+                else
+                {
+                    memory.unavailableFromSector = observation.sector;
+                    event("interaction_unavailable",
+                          "reason=CURRENTLY_UNAVAILABLE_FROM_THIS_SIDE attempts=3");
+                }
             }
             else
                 event("interaction_alternative_pose", "reason=NO_ACTION_TARGET");
@@ -5803,6 +5854,34 @@ struct LLMapperBot::Impl
         grid.signature = sectorGeometrySignature(sectorId);
     }
 
+    // Does the straight line between two points cross a wall of this sector?
+    bool segmentCrossesSectorWall(int sectorId, int ax, int ay, int bx, int by) const
+    {
+        if (!inRange(sectorId, 0, numsectors))
+            return true;
+        const sectortype &record = sector[sectorId];
+        for (int i = 0; i < record.wallnum; ++i)
+        {
+            const int wallId = record.wallptr + i;
+            if (!inRange(wallId, 0, numwalls) || !inRange(wall[wallId].point2, 0, numwalls))
+                continue;
+            const walltype &start = wall[wallId];
+            const walltype &end = wall[start.point2];
+            const int64_t d1 = int64_t(bx - ax) * (start.y - ay) - int64_t(by - ay) * (start.x - ax);
+            const int64_t d2 = int64_t(bx - ax) * (end.y - ay) - int64_t(by - ay) * (end.x - ax);
+            if ((d1 > 0 && d2 > 0) || (d1 < 0 && d2 < 0))
+                continue;
+            const int64_t d3 = int64_t(end.x - start.x) * (ay - start.y)
+                - int64_t(end.y - start.y) * (ax - start.x);
+            const int64_t d4 = int64_t(end.x - start.x) * (by - start.y)
+                - int64_t(end.y - start.y) * (bx - start.x);
+            if ((d3 > 0 && d4 > 0) || (d3 < 0 && d4 < 0))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
     // Does a solid sprite stand where the player wants to be?  Build's
     // blocking bit (cstat 1) is the same thing clipmove honours.
     bool blockedBySolidSprite(int sectorId, int x, int y) const
@@ -5999,12 +6078,11 @@ struct LLMapperBot::Impl
                 // one-sided wall between them blocks the ray.
                 if (blockedBySolidSprite(cell.sector, midX, midY))
                     continue;
-                const int eyeZ = getflorzofslope(cell.sector, cell.center.x, cell.center.y)
-                    - kCoverageEyeOffset;
-                const int otherZ = getflorzofslope(cell.sector, other.center.x, other.center.y)
-                    - kCoverageEyeOffset;
-                if (!cansee(cell.center.x, cell.center.y, eyeZ, cell.sector,
-                            other.center.x, other.center.y, otherZ, other.sector))
+                // Deliberately geometry, not cansee(): that is a sight test
+                // and is blocked by sprites, so a courtyard with scenery in
+                // it was carved into separate walk areas by its own torches.
+                if (segmentCrossesSectorWall(cell.sector, cell.center.x, cell.center.y,
+                                             other.center.x, other.center.y))
                     continue;
                 const int floorDelta = getflorzofslope(cell.sector, other.center.x, other.center.y)
                     - getflorzofslope(cell.sector, cell.center.x, cell.center.y);
