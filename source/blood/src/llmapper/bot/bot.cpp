@@ -2057,7 +2057,14 @@ struct LLMapperBot::Impl
             localDynamicJumpAttempted = false;
             localDynamicJumpUntilTick = -1;
             localJumpProbeCount = 0;
-            searchProbeActive = false;
+            // Ground the bot has not stood on before is a genuinely new
+            // situation and cancels the probe.  Being shoved back and forth
+            // between two rooms it already knows is not: restarting on every
+            // such bounce recomputed the endpoint from the player's position
+            // and so let it track him after all, which is the thing fixing
+            // the endpoint was meant to stop.
+            if (!visitedSectors.count(observation.sector))
+                searchProbeActive = false;
         }
         if (observation.localSectorBusy != 0 && observation.playerZVelocity != 0)
             localDynamicJumpUntilTick = observation.tick + 4 * kTicsPerSec;
@@ -5871,9 +5878,11 @@ struct LLMapperBot::Impl
             if (jumpAttempts > 0)
             {
                 char detail[128];
-                snprintf(detail, sizeof(detail), "target=%d dx=%d dy=%d dz=%d attempts=%d",
+                snprintf(detail, sizeof(detail),
+                         "target=%d dx=%d dy=%d dz=%d attempts=%d reason=%s",
                          movementTargetId, observation.x - targetLastX, observation.y - targetLastY,
-                         observation.z - targetLastZ, jumpAttempts);
+                         observation.z - targetLastZ, jumpAttempts,
+                         horizontalProgress ? "closed_on_target" : "entered_target_sector");
                 event("jump_succeeded", detail);
                 jumpAttempts = 0;
             }
@@ -8526,9 +8535,14 @@ struct LLMapperBot::Impl
                  && currentGoal != "WAIT_MOVING_MECHANISM"
                  && !committedMechanismBusy())
         {
-            // Not moving is only a failure if the bot was asking to move.
+            // Not moving is only a failure if the bot was asking to move --
+            // and only the route's failure if the route was in charge.  A
+            // melee engagement commands translation and then stands still
+            // because an enemy body is in the way; blaming the frontier for
+            // that is how a perfectly good route came to be suppressed.
             const bool asked = observation.tick - lastCommandedMoveTick
-                <= kStationaryLimitTicks;
+                    <= kStationaryLimitTicks
+                && (cameraOwner.empty() || cameraOwner == "NAVIGATION");
             char detail[192];
             snprintf(detail, sizeof(detail),
                      "seconds=%d sector=%d goal=%s objective_active=%d camera_owner=%s",
@@ -8669,8 +8683,7 @@ struct LLMapperBot::Impl
             // infinite ray that retreats exactly as fast as he walks, so it
             // never ends and never rotates to the next heading; the bot just
             // shuttles between rooms it has already seen.
-            if (!searchProbeActive || !movementTargetActive
-                || movementTargetGoal != currentGoal || movementTargetId != -2)
+            if (!searchProbeActive)
             {
                 searchProbeActive = true;
                 searchProbeX = observation.x + mulscale30(Cos(searchAngle), 8192);
@@ -8678,12 +8691,19 @@ struct LLMapperBot::Impl
                 searchProbeStartTick = observation.tick;
                 char detail[160];
                 snprintf(detail, sizeof(detail),
-                         "heading=%d to=(%d,%d) probe=%d reason=bounded_unexplained_blocked_frontier",
+                         "heading=%d to_x=%d to_y=%d probe=%d reason=bounded_unexplained_blocked_frontier",
                          searchAngle, searchProbeX, searchProbeY, localJumpProbeCount + 1);
                 event("local_jump_probe", detail);
+            }
+            // The probe survives being interrupted -- combat, a door, a
+            // moment of the goal being something else.  Re-issuing the
+            // movement target is fine; recomputing where the probe was going
+            // is not, or an interruption every second or two silently
+            // restarts the same heading for ever.
+            if (!movementTargetActive || movementTargetGoal != currentGoal
+                || movementTargetId != -2)
                 setMovementTarget(searchProbeX, searchProbeY, observation.sector, -2,
                                   kTraversalJumpable);
-            }
             // A probe that has run its time, or arrived, is finished: turn to
             // the next heading rather than pushing at the same one.
             const int arrive = std::max(512, playerClipRadius() * 4);
