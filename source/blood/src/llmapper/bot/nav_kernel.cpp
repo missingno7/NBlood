@@ -383,6 +383,7 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
     const Opportunity *remoteFrontier = 0;
     const Opportunity *localPickup = 0;
     const Opportunity *blocker = 0;
+    const Opportunity *localBlocker = 0;
     const Opportunity *coverage = 0;
     const Opportunity *committed = 0;
 
@@ -417,7 +418,12 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
             break;
         case kOpportunityBlocked:
         case kOpportunityInteraction:
-            if (!blocker || deeperThan(candidate, *blocker))
+            if (candidate.local)
+            {
+                if (!localBlocker || deeperThan(candidate, *localBlocker))
+                    localBlocker = &candidate;
+            }
+            else if (!blocker || deeperThan(candidate, *blocker))
                 blocker = &candidate;
             break;
         case kOpportunityCoverage:
@@ -455,6 +461,16 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
     {
         mission.kind = kMissionContinue;
         mission.opportunity = localFrontier->id;
+    }
+    // An obstacle right here that the bot knows how to solve beats walking
+    // to the far side of the level for a branch it could take afterwards.
+    // Ranking a remote frontier first is what made the bot arrive at a shut
+    // door, give up within seconds, and trek away without ever trying the
+    // mechanism standing in front of it.
+    else if (localBlocker)
+    {
+        mission.kind = kMissionSolveBlocker;
+        mission.opportunity = localBlocker->id;
     }
     else if (remoteFrontier)
     {

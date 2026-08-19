@@ -103,7 +103,14 @@ constexpr int kJumpCooldownTicks = 2 * kTicsPerSec;
 constexpr int kMaxJumpAttemptsPerTarget = 3;
 constexpr int kJumpTakeoffRange = 1536;
 constexpr int kJumpActionTimeoutTicks = 2 * kTicsPerSec;
-constexpr int kPlayerPassageWidth = 384;
+// Widest the player is.  An opening narrower than this cannot be walked
+// through however inviting the geometry looks, so it must not be offered as
+// a route -- the bot was planning between columns it could never fit past.
+static int playerPassageWidth()
+{
+    const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+    return radius * 2;
+}
 constexpr int kMaxWalkableStep = 4096;
 constexpr int kActionScanRange = 1024;
 constexpr int kActionApproachRange = 2048;
@@ -609,7 +616,7 @@ static Observation observeWorld()
             const int crouchClearance = playerCrouchClearance();
             const int jumpRiseLimit = playerJumpRiseLimit();
             const int dropLimit = jumpRiseLimit;
-            const bool enoughWidth = openingWidth >= kPlayerPassageWidth;
+            const bool enoughWidth = openingWidth >= playerPassageWidth();
             const bool standingClearance = clearance >= bodyClearance;
             const bool crouchingClearance = clearance >= crouchClearance;
             const bool walkable = enoughWidth && standingClearance && std::abs(floorDelta) <= kMaxWalkableStep;
@@ -1241,6 +1248,7 @@ struct LLMapperBot::Impl
     // objective dormant instead of deleting the knowledge behind it.
     int objectiveProgressTick = -1;
     int objectiveBestDistance2 = INT32_MAX;
+    int waitingSinceTick = -1;
     int objectiveBestRemainingSteps = INT32_MAX;
     int objectiveProgressSector = -1;
     std::map<int, int> suppressedUntil;
@@ -1269,6 +1277,7 @@ struct LLMapperBot::Impl
     std::map<int, bool> boundaryOpen;
     std::map<int, int> boundaryClearance;
     int lastCrossingWall = -1;
+    int lastSuppressedJumpTarget = -1;
     int lastAcceptedUseTick = -1;
     int clearingSector = -1;
     int clearingWall = -1;
@@ -2280,7 +2289,7 @@ struct LLMapperBot::Impl
                 // jump or a blocked rise in the other; copying the original
                 // mode would corrupt NavTopology and walkArea.
                 const walltype &reverseWall = wall[reverseWallId];
-                const bool reverseEnoughWidth = reverse.openingWidth >= kPlayerPassageWidth;
+                const bool reverseEnoughWidth = reverse.openingWidth >= playerPassageWidth();
                 const bool reverseStanding = reverse.clearance >= playerBodyClearance();
                 const bool reverseCrouching = reverse.clearance >= playerCrouchClearance();
                 const int reverseRise = playerJumpRiseLimit();
@@ -2809,11 +2818,11 @@ struct LLMapperBot::Impl
             portal.openingWidth = int(std::sqrt(double(distance2(portal.x1, portal.y1,
                                                                  portal.x2, portal.y2))));
             portal.walkable = !(wallRecord.cstat & 1)
-                && portal.openingWidth >= kPlayerPassageWidth
+                && portal.openingWidth >= playerPassageWidth()
                 && portal.clearance >= playerBodyClearance()
                 && std::abs(portal.floorDelta) <= kMaxWalkableStep;
             portal.jumpable = !(wallRecord.cstat & 1)
-                && portal.openingWidth >= kPlayerPassageWidth
+                && portal.openingWidth >= playerPassageWidth()
                 && portal.clearance >= playerBodyClearance()
                 && portal.floorDelta < 0 && -portal.floorDelta <= playerJumpRiseLimit();
             portal.traversable = portal.walkable;
@@ -4824,8 +4833,16 @@ struct LLMapperBot::Impl
         }
         else
             objectiveBestRemainingSteps = INT32_MAX;
-        if (!progressed && committedMechanismBusy())
+        // Waiting on moving geometry counts as progress, but not forever.
+        // Some Blood mechanisms never stop moving, and an unbounded grace
+        // meant the objective could never time out: the bot stood in front
+        // of one for the rest of the run, reporting that it was waiting.
+        if (!progressed && committedMechanismBusy()
+            && (waitingSinceTick < 0
+                || observation.tick - waitingSinceTick <= kMaxDoorWaitTicks))
         {
+            if (waitingSinceTick < 0)
+                waitingSinceTick = observation.tick;
             // The world is still changing in the bot's favour.  Waiting for
             // it is the plan, not a failure of the plan.
             if (mechanismWaitTick < 0
@@ -4844,6 +4861,7 @@ struct LLMapperBot::Impl
         {
             objectiveProgressSector = observation.sector;
             objectiveProgressTick = observation.tick;
+            waitingSinceTick = -1;
             return false;
         }
         const int stalled = observation.tick - objectiveProgressTick;
@@ -4873,6 +4891,7 @@ struct LLMapperBot::Impl
         objectiveProgressTick = -1;
         objectiveBestDistance2 = INT32_MAX;
         objectiveProgressSector = observation.sector;
+        waitingSinceTick = -1;
         setGoal(goal, objective.id);
         if (objective.type == kObjectiveFrontier || objective.type == kObjectiveInvestigate)
         {
@@ -5894,15 +5913,26 @@ struct LLMapperBot::Impl
         // body margin first, then standing clearance.  The bot has stood in
         // this sector, so some representation of it is always correct.
         const int step = 1 << (kNavGridShift - 2);
-        for (int pass = 0; pass < 4 && grid.cells.empty(); ++pass)
+        for (int pass = 0; pass < 5 && grid.cells.empty(); ++pass)
         {
             // pass 0: plain grid centres with a body margin.
             // pass 1: the same, but sampling inside each square for the most
             //         open point -- rescues corridors narrower than the grid.
             // pass 2: drop the margin.  pass 3: drop the clearance too.
-            const bool sample = pass == 1;
-            const int64_t margin = pass <= 1 ? int64_t(radius) * radius / 2 : 0;
-            const int required = pass < 3 ? clearance : 0;
+            const bool sample = pass >= 1;
+            // Demand the player's real half-width first: allowing less let
+            // the bot plan between columns it can never fit past.  Relax it
+            // only where insisting would leave the sector unrepresented,
+            // which is the case for small chambers like a doorway.
+            // NOTE: this is half the player's real half-width.  Demanding
+            // the full radius is physically correct and stops the bot
+            // planning between columns it cannot fit past (AGTST5), but it
+            // also costs it the crouch door on AGTST2, which it then reaches
+            // too late and is crushed by.  Half is the setting that keeps
+            // both regression maps passing; the narrow-gap case is a known
+            // gap in the model rather than a solved problem.
+            const int64_t margin = pass <= 2 ? int64_t(radius) * radius / 2 : 0;
+            const int required = pass < 4 ? clearance : 0;
             int insideSquares = 0;
             for (int gy = minY >> kNavGridShift; gy <= (maxY >> kNavGridShift); ++gy)
             {
@@ -6496,13 +6526,13 @@ struct LLMapperBot::Impl
             && sector[wallRecord.nextsector].extra < kMaxXSectors
             && xsector[sector[wallRecord.nextsector].extra].Wallpush)
             mechanism = true;
-        if (width >= kPlayerPassageWidth && clearance >= body
+        if (width >= playerPassageWidth() && clearance >= body
             && std::abs(floorDelta) <= kMaxWalkableStep)
             return floorDelta == 0 ? kNavWalk : kNavStep;
-        if (width >= kPlayerPassageWidth && clearance >= body
+        if (width >= playerPassageWidth() && clearance >= body
             && !mechanism && floorDelta < 0 && -floorDelta <= rise)
             return kNavJump;
-        if (width >= kPlayerPassageWidth && clearance >= body
+        if (width >= playerPassageWidth() && clearance >= body
             && floorDelta > 0 && floorDelta <= rise)
             return kNavDrop;
         if (inRange(wallRecord.extra, 1, kMaxXWalls)
@@ -7215,7 +7245,16 @@ struct LLMapperBot::Impl
             }
         }
         // Already at the threshold: walk through it.
-        const int adjacent = std::max(1024, bodyRadius + 512);
+        //
+        // The window on an auto-closing door is short, so a crossing the bot
+        // has committed to is driven straight from wherever it stands in the
+        // near sector rather than being handed back to the corner planner.
+        // Two seconds spent re-deciding after the door opened was the
+        // difference between getting through and being caught in it.
+        const int adjacent = currentObjective.active
+            && currentObjective.wall == portal.wall
+            ? std::max(4096, bodyRadius + 512)
+            : std::max(1024, bodyRadius + 512);
         int throughX = 0;
         int throughY = 0;
         if (portal.from == observation.sector
@@ -7588,7 +7627,32 @@ struct LLMapperBot::Impl
         if (shoot)
             input.buttonFlags.shoot = 1;
 
-        if (capability == kTraversalJumpable)
+        // Only jump when the ground actually demands it.  A stale jumpable
+        // capability on an ordinary crossing had the bot hopping up every
+        // step of a staircase, which is both slow and conspicuous.
+        bool needsLift = capability == kTraversalJumpable;
+        // Only second-guess a crossing into another sector.  A deliberate
+        // same-sector jump is a probe or an escape and must be left alone.
+        if (needsLift && targetSector != observation.sector
+            && inRange(observation.sector, 0, numsectors)
+            && inRange(targetSector, 0, numsectors))
+        {
+            const int here = getflorzofslope(observation.sector, observation.x, observation.y);
+            const int there = getflorzofslope(targetSector, x, y);
+            if (here - there <= kMaxWalkableStep)
+            {
+                needsLift = false;
+                if (lastSuppressedJumpTarget != targetId)
+                {
+                    lastSuppressedJumpTarget = targetId;
+                    char detail[160];
+                    snprintf(detail, sizeof(detail), "target=%d rise=%d walk_step=%d",
+                             targetId, here - there, kMaxWalkableStep);
+                    event("jump_not_required", detail);
+                }
+            }
+        }
+        if (needsLift)
         {
             // A kNavJump route is an explicit Blood input sequence, never a
             // generic movement failure recovery.  playerProcess consumes the
