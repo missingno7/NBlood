@@ -189,13 +189,6 @@ constexpr int kHazardAvoidTicks = 30 * kTicsPerSec;
 constexpr int kSurfaceRetryProbes = 8;
 // Pitchfork reach, used when a breakable obstacle must be hit by hand.
 constexpr int kMeleeReach = 1024;
-// Slack demanded on top of the body envelope before a gap counts as
-// passable.  A gap exactly the height of the player is not one the engine
-// will move him through.
-constexpr int kFitMargin = 512;
-// Largest heading error the bot will walk through rather than pivot for.
-// 512 of 2048 is 90 degrees.
-constexpr int kMoveWhileTurning = 512;
 constexpr int kLookUpLimit = 289;
 constexpr int kLookDownLimit = -347;
 
