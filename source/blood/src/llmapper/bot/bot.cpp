@@ -1460,24 +1460,44 @@ struct LLMapperBot::Impl
         fflush(trajectory);
     }
 
+    // The extended sector a push surface operates, or -1 when the surface is
+    // a mechanism in its own right.  Several walls around one door sector
+    // all drive that sector, and to the bot they are one thing to do.
+    int mechanismSector(const Portal &target, int targetSector) const
+    {
+        if (target.sectorPush && inRange(target.to, 0, numsectors))
+            return target.to;
+        if (target.sectorPushCurrent && inRange(target.from, 0, numsectors))
+            return target.from;
+        if (target.wallPush && inRange(targetSector, 0, numsectors)
+            && sector[targetSector].extra > 0
+            && sector[targetSector].extra < kMaxXSectors)
+            return targetSector;
+        return -1;
+    }
+
     int interactionKey(const InteractionCandidate &candidate) const
     {
-        // Several linedefs can expose the same XSECTOR Wallpush target.
-        // Their engine identity is the sector mechanism, not each duplicate
-        // wall record, so one activation must be remembered once.
-        if (candidate.kind == kInteractionWall && candidate.target.sectorPush)
-            return int(kInteractionSector) * 1000000 + candidate.target.to + 1;
-        if (candidate.kind == kInteractionWall && candidate.target.sectorPushCurrent)
-            return int(kInteractionSector) * 1000000 + candidate.target.from + 1;
+        // Several linedefs can expose the same XSECTOR target.  Their engine
+        // identity is the sector mechanism, not each duplicate wall record,
+        // so one activation must be remembered once.
+        if (candidate.kind == kInteractionWall)
+        {
+            const int mechanism = mechanismSector(candidate.target, candidate.targetSector);
+            if (mechanism >= 0)
+                return int(kInteractionSector) * 1000000 + mechanism + 1;
+        }
         return int(candidate.kind) * 1000000 + candidate.id + 1;
     }
 
     int interactionMemoryKey(const InteractionMemory &memory) const
     {
-        if (memory.kind == kInteractionWall && memory.target.sectorPush)
-            return int(kInteractionSector) * 1000000 + memory.target.to + 1;
-        if (memory.kind == kInteractionWall && memory.target.sectorPushCurrent)
-            return int(kInteractionSector) * 1000000 + memory.target.from + 1;
+        if (memory.kind == kInteractionWall)
+        {
+            const int mechanism = mechanismSector(memory.target, memory.targetSector);
+            if (mechanism >= 0)
+                return int(kInteractionSector) * 1000000 + mechanism + 1;
+        }
         return int(memory.kind) * 1000000 + memory.id + 1;
     }
 
@@ -1559,6 +1579,20 @@ struct LLMapperBot::Impl
         {
             if (memory.target.wallPush && hit == 0 && target == memory.target.wall)
                 return true;
+            // A door ringed by several push walls answers on whichever of
+            // them the player is facing; they are all the same mechanism.
+            // The push surfaces usually belong to the moving sector itself
+            // and face outward, so accept a wall on either side of it.
+            if (memory.target.wallPush && hit == 0 && inRange(target, 0, numwalls))
+            {
+                const int mechanism = mechanismSector(memory.target, memory.targetSector);
+                if (mechanism >= 0
+                    && (wall[target].nextsector == mechanism
+                        || wallOwnerSector(target) == mechanism)
+                    && inRange(wall[target].extra, 1, kMaxXWalls)
+                    && xwall[wall[target].extra].triggerPush)
+                    return true;
+            }
             if (memory.target.sectorPush && hit == 6 && target == memory.target.to)
                 return true;
             if (memory.target.sectorPushCurrent && hit == 6 && target == memory.target.from)
@@ -1664,24 +1698,39 @@ struct LLMapperBot::Impl
         const bool first = !memory.observed;
         const int oldState = memory.observed ? interactionStateSignature(memory) : 0;
         const bool canonicalSectorPush = candidate.kind == kInteractionWall
-            && (candidate.target.sectorPush || candidate.target.sectorPushCurrent);
+            && mechanismSector(candidate.target, candidate.targetSector) >= 0;
         memory.kind = candidate.kind;
-        memory.id = (candidate.kind == kInteractionWall && candidate.target.sectorPush)
-            ? candidate.target.to
-            : (candidate.kind == kInteractionWall && candidate.target.sectorPushCurrent)
-            ? candidate.target.from : candidate.id;
+        const int candidateMechanism = candidate.kind == kInteractionWall
+            ? mechanismSector(candidate.target, candidate.targetSector) : -1;
+        memory.id = candidateMechanism >= 0 ? candidateMechanism : candidate.id;
         const bool sideChanged = memory.observed && memory.fromSector != candidate.fromSector;
+        // Among several surfaces driving one mechanism, the useful one is the
+        // one the player can reach and face right now.
+        const bool closerSurface = memory.observed && candidate.kind == kInteractionWall
+            && candidate.target.wallPush && memory.target.wallPush
+            && candidate.target.wall != memory.target.wall
+            && distance2(observation.x, observation.y, candidate.x, candidate.y)
+                < distance2(observation.x, observation.y, memory.x, memory.y);
         memory.fromSector = candidate.fromSector;
         memory.targetSector = candidate.targetSector;
         // A reversible mechanism is usable from more than one side, and the
         // side that matters is the one the bot is standing on now.  Keeping
         // the first-seen approach point sent the bot at a pose it could no
         // longer reach once the door it came through closed behind it.
-        if (first || !canonicalSectorPush || sideChanged)
+        if (first || !canonicalSectorPush || sideChanged || closerSurface)
         {
             memory.x = candidate.x;
             memory.y = candidate.y;
             memory.z = candidate.z;
+            if (closerSurface && !sideChanged)
+            {
+                char detail[176];
+                snprintf(detail, sizeof(detail),
+                         "mechanism=%d from_wall=%d to_wall=%d at=(%d,%d)",
+                         memory.id, memory.target.wall, candidate.target.wall,
+                         candidate.x, candidate.y);
+                event("interaction_surface_reselected", detail);
+            }
             if (sideChanged)
             {
                 char detail[160];
@@ -2879,8 +2928,16 @@ struct LLMapperBot::Impl
                                                   portal.from, portal.to,
                                                   portalIdentitySignature(portal)))
                         continue;
+                    // Keyed by where it leads, not by which of its walls the
+                    // bot happens to be looking at.
                     opportunity.kind = llmapper::kOpportunityBlocked;
-                    opportunity.id = 3000000 + portal.wall * 8 + int(kObjectiveInvestigate);
+                    opportunity.id = 4000000 + portal.to;
+                    bool alreadyOffered = false;
+                    for (const llmapper::Opportunity &known : ledger)
+                        if (known.id == opportunity.id)
+                            alreadyOffered = true;
+                    if (alreadyOffered)
+                        continue;
                 }
                 else
                 {
@@ -3342,7 +3399,6 @@ struct LLMapperBot::Impl
         // A dormant opportunity must not hide the frontiers behind it.
         // Filter suppressed work out of the candidate set, then let the
         // kernel rank what is genuinely still actionable.
-        const int suppressType = blocked ? int(kObjectiveInvestigate) : int(kObjectiveFrontier);
         std::vector<DerivedFrontier> live;
         live.reserve(derivedFrontiers.size());
         for (const DerivedFrontier &candidateFrontier : derivedFrontiers)
@@ -3355,7 +3411,9 @@ struct LLMapperBot::Impl
             for (size_t i = 0; i < candidateFrontier.candidates.size(); ++i)
             {
                 const Boundary &boundary = candidateFrontier.candidates[i];
-                if (objectiveSuppressed(3000000 + boundary.wall * 8 + suppressType))
+                if (objectiveSuppressed(blocked
+                        ? 4000000 + boundary.to
+                        : 3000000 + boundary.wall * 8 + int(kObjectiveFrontier)))
                     continue;
                 filtered.candidates.push_back(boundary);
             }
@@ -3704,7 +3762,9 @@ struct LLMapperBot::Impl
             || !memory.traversed || memory.target.wall < 0
             || memory.target.to < 0 || memory.target.from != observation.sector)
             return false;
-        // Leave alone only while finishing motion the bot itself started.
+        // Leave alone while it is finishing motion the bot asked for.
+        if (memory.activationCount > 0 && interactionStillBusy(memory))
+            return false;
         if (memory.lastActivationTick >= 0
             && observation.tick - memory.lastActivationTick < kReactivationCooldownTicks)
             return false;
@@ -3790,7 +3850,8 @@ struct LLMapperBot::Impl
         // for a minute without ever pressing Use.
         const bool selfCausedMotion = memory.lastActivationTick >= 0
             && observation.tick - memory.lastActivationTick < kReactivationCooldownTicks;
-        const bool mechanismMoving = selfCausedMotion && interactionStillBusy(memory);
+        const bool mechanismMoving = interactionStillBusy(memory)
+            && (selfCausedMotion || memory.activationCount > 0);
         bool issueUse = false;
         const bool recoveryActivation = recoveryMode && memory.attempted
             && memory.activated && memory.reversible && !memory.recoveryAttempted;
@@ -3804,10 +3865,22 @@ struct LLMapperBot::Impl
         // Press when the engine says the target is good and the mechanism is
         // not already moving, bounded by a cooldown and an attempt budget;
         // the objective budget and dormancy handle the rest.
+        const int movedSector = mechanismSector(memory.target, memory.targetSector);
+        const bool wouldMoveOwnSector = movedSector >= 0
+            && movedSector == observation.sector && !memory.target.sectorPushCurrent;
+        if (wouldMoveOwnSector && !memory.attempted)
+        {
+            char detail[176];
+            snprintf(detail, sizeof(detail),
+                     "kind=%d id=%d mechanism_sector=%d player_sector=%d reason=would_move_occupied_sector",
+                     int(memory.kind), memory.id, movedSector, observation.sector);
+            event("interaction_refused", detail);
+        }
         const bool cooldownElapsed = memory.lastActivationTick < 0
             || observation.tick - memory.lastActivationTick >= kReactivationCooldownTicks;
         const bool budgetLeft = memory.activationCount < kMaxActivationAttempts;
         if (valid && !missingKey && !mechanismMoving && cooldownElapsed
+            && !wouldMoveOwnSector
             && (!memory.attempted || recoveryActivation || reactivation || budgetLeft))
         {
             if (reactivation)
@@ -4130,8 +4203,9 @@ struct LLMapperBot::Impl
         case kObjectiveInteraction:
             return 1000000 + objective.interactionKey;
         case kObjectiveFrontier:
-        case kObjectiveInvestigate:
             return 3000000 + objective.wall * 8 + int(objective.type);
+        case kObjectiveInvestigate:
+            return 4000000 + objective.targetSector;
         case kObjectivePickup:
         case kObjectiveKey:
             return 5000000 + objective.id;
@@ -4696,7 +4770,7 @@ struct LLMapperBot::Impl
                 // Already known and already tried.  Re-investigating it is
                 // not new knowledge, so let the boundary rest rather than
                 // rediscovering the same mechanism every tick.
-                suppressObjective(3000000 + crossing.wall * 8 + int(kObjectiveInvestigate),
+                suppressObjective(4000000 + currentObjective.targetSector,
                                   "mechanism_already_known");
             }
             completeObjective("investigation_found_interaction");
@@ -4718,8 +4792,7 @@ struct LLMapperBot::Impl
         snprintf(investigated, sizeof(investigated), "wall=%d dest=%d hit=%d reason=%s",
                  crossing.wall, currentObjective.targetSector, hit, reason);
         event("blocked_frontier_investigated", investigated);
-        suppressObjective(3000000 + crossing.wall * 8 + int(kObjectiveInvestigate),
-                          "investigated_no_action");
+        suppressObjective(4000000 + currentObjective.targetSector, "investigated_no_action");
         completeObjective("investigation_no_action");
         return input;
     }
@@ -6562,6 +6635,30 @@ struct LLMapperBot::Impl
             && portalCrossingPoint(portal, throughX, throughY))
         {
             const TraversalCapability posture = portalPosture(portal);
+            if (posture == kTraversalCurrentlyUnavailable)
+            {
+                // The opening is not passable yet.  Face it and wait rather
+                // than walking into it: pushing at a door that is still
+                // moving is how the bot ended up shouldering a closing door
+                // on the way back instead of ducking under an open one.
+                GINPUT hold = {};
+                hold.q16turn = fix16_from_int(angleDelta(
+                    getangle(throughX - observation.x, throughY - observation.y),
+                    observation.angle));
+                if (lastCrossingWall != -portal.wall - 1)
+                {
+                    lastCrossingWall = -portal.wall - 1;
+                    char detail[192];
+                    snprintf(detail, sizeof(detail),
+                             "wall=%d from=%d to=%d clearance=%d crouch=%d busy=%d",
+                             portal.wall, portal.from, portal.to, portal.clearance,
+                             playerCrouchClearance(),
+                             portal.wallBusy || portal.sectorBusy ? 1 : 0);
+                    event("portal_waiting_to_open", detail);
+                }
+                noteCameraOwner("PORTAL_WAIT", portal.wall, observation.angle, 0);
+                return hold;
+            }
             if (lastCrossingWall != portal.wall)
             {
                 lastCrossingWall = portal.wall;
