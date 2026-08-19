@@ -1196,6 +1196,10 @@ struct LLMapperBot::Impl
     struct SectorGrid
     {
         int signature = 0;
+        // False when no point in the sector clears the player's own radius
+        // from its walls -- a slot narrower than Caleb.  Such a sector is
+        // not a destination and not a route, only scenery.
+        bool admitsPlayer = true;
         std::vector<GridCell> cells;
     };
     std::map<int, SectorGrid> sectorGrids;
@@ -1278,6 +1282,7 @@ struct LLMapperBot::Impl
     std::map<int, bool> boundaryOpen;
     std::map<int, int> boundaryClearance;
     int lastCrossingWall = -1;
+    int lastFrontierChoice = 0;
     int lastSuppressedJumpTarget = -1;
     int lastAcceptedUseTick = -1;
     int clearingSector = -1;
@@ -3083,7 +3088,10 @@ struct LLMapperBot::Impl
                 // destination but perfectly good as transit, and refusing it
                 // outright severed real routes.
                 if (!sectorHasStandableSpace(portal.to))
+                {
                     noteTooNarrow(portal);
+                    continue;
+                }
                 const int edgeId = portal.wall * 65536 + portal.to;
                 llmapper::Opportunity opportunity;
                 opportunity.sector = from;
@@ -3392,6 +3400,17 @@ struct LLMapperBot::Impl
         int openClearance = 0;    // floor-to-ceiling gap when fully open
     };
 
+    // Sign of the sector's live busy delta: positive travels toward the ON
+    // state, negative toward OFF.  Falls back to the caller's guess when the
+    // engine has no entry for this sector.
+    static bool busyDeltaHeadsOn(int sectorId, bool fallback)
+    {
+        for (int i = 0; i < gBusyCount; ++i)
+            if (gBusy[i].at0 == sectorId)
+                return gBusy[i].at4 > 0;
+        return fallback;
+    }
+
     // Blood drives a sector mechanism by stepping `busy` between 0 and
     // 65536 over 12*busyTime ticks, then posts the reverse command after
     // 12*waitTime ticks.  Read that rather than inferring it.
@@ -3421,8 +3440,14 @@ struct LLMapperBot::Impl
         timing.moving = busy != 0;
         if (!timing.moving)
             return timing;
-        // `busy` is the fraction travelled toward the ON state.
-        const bool headingOn = record.state != 0;
+        // Which way it is travelling comes from the engine's own busy entry.
+        // `state` is NOT that answer: SetSectorState only runs when the
+        // travel finishes, so throughout the motion `state` still describes
+        // where the sector came from.  Reading it as the heading inverted
+        // every verdict -- an opening door looked like a closing one, so the
+        // bot stood and waited out doors it could already have walked
+        // through, and a genuinely closing door looked safe to enter.
+        const bool headingOn = busyDeltaHeadsOn(sectorId, record.state == 0);
         // Walking into a gap that is still widening is fine; walking into
         // one that is narrowing is how the bot gets crushed.
         timing.closing = headingOn != openingIsOn;
@@ -5501,8 +5526,28 @@ struct LLMapperBot::Impl
             currentObjective.routeStepFrom = observation.sector;
             currentObjective.routeStepTo = crossing->from == observation.sector
                 ? crossing->to : crossing->from;
-            if (observation.sector == crossing->from
-                && (crossing->traversable || crossing->jumpable)
+            // Which of the two ways of reaching a frontier is in use, and
+            // why.  A crossing that silently falls back to the planner is
+            // how the bot came to stand still in front of an open door.
+            const bool onNearSide = observation.sector == crossing->from;
+            const bool passable = crossing->traversable || crossing->jumpable;
+            const int choice = crossing->wall * 8 + (onNearSide ? 1 : 0)
+                + (passable ? 2 : 0) + 4;
+            if (choice != lastFrontierChoice)
+            {
+                lastFrontierChoice = choice;
+                char detail[224];
+                snprintf(detail, sizeof(detail),
+                         "wall=%d want_from=%d portal_from=%d here=%d to=%d "
+                         "traversable=%d jumpable=%d clearance=%d cap=%d path=%s",
+                         crossing->wall, currentObjective.sector, crossing->from,
+                         observation.sector, crossing->to,
+                         crossing->traversable ? 1 : 0, crossing->jumpable ? 1 : 0,
+                         crossing->clearance, int(crossing->capability),
+                         (onNearSide && passable) ? "portal" : "planner");
+                event("frontier_route_choice", detail);
+            }
+            if (onNearSide && passable
                 && currentObjective.type == kObjectiveFrontier)
                 return steerPortal(*crossing);
             return navigateTo(crossing->x, crossing->y, crossing->z, crossing->from,
@@ -5909,7 +5954,8 @@ struct LLMapperBot::Impl
             buildNavSector(sectorId);
             grid = sectorGrids.find(sectorId);
         }
-        return grid != sectorGrids.end() && !grid->second.cells.empty();
+        return grid != sectorGrids.end() && grid->second.admitsPlayer
+            && !grid->second.cells.empty();
     }
 
     int nearestNavCell(int sectorId, int x, int y) const
@@ -5942,6 +5988,33 @@ struct LLMapperBot::Impl
             }
         }
         return best >= 0 ? best : fallback;
+    }
+
+    // Does any point in this sector leave the player's own radius clear of
+    // its walls?  Only asked when the 256-unit grid produced nothing, so the
+    // area being swept is small; a sector big enough to make the sweep
+    // expensive is by definition not the narrow case.
+    bool sectorAdmitsPlayer(int sectorId, int minX, int maxX, int minY, int maxY) const
+    {
+        const int radius = playerClipRadius();
+        const int step = std::max(32, radius / 2);
+        const int64_t required = int64_t(radius) * radius;
+        int samples = 0;
+        for (int y = minY; y <= maxY; y += step)
+        {
+            for (int x = minX; x <= maxX; x += step)
+            {
+                if (++samples > 8192)
+                    return true;
+                if (inside(x, y, sectorId) != 1)
+                    continue;
+                if (blockedBySolidSprite(sectorId, x, y))
+                    continue;
+                if (nearestWallDistance2(sectorId, x, y) >= required)
+                    return true;
+            }
+        }
+        return false;
     }
 
     // Regenerate one sector's standable grid.  Cached per sector and only
@@ -5978,6 +6051,11 @@ struct LLMapperBot::Impl
         // body margin first, then standing clearance.  The bot has stood in
         // this sector, so some representation of it is always correct.
         const int step = 1 << (kNavGridShift - 2);
+        // Whether the cells that survived were placed by a pass that still
+        // demanded the player's own half-width.  The later, relaxed passes
+        // exist to keep a sector represented at all, and their cells say
+        // nothing about whether a body fits there.
+        bool marginRespected = false;
         for (int pass = 0; pass < 5 && grid.cells.empty(); ++pass)
         {
             // pass 0: plain grid centres with a body margin.
@@ -5989,15 +6067,7 @@ struct LLMapperBot::Impl
             // the bot plan between columns it can never fit past.  Relax it
             // only where insisting would leave the sector unrepresented,
             // which is the case for small chambers like a doorway.
-            // NOTE: half the player's real half-width.  The full radius is
-            // physically correct and is what stops the bot planning between
-            // bars it cannot fit past (AGTST5 completes with it, and AGTST4
-            // loses its remaining repeated transitions).  It costs AGTST2,
-            // whose squeeze door does not tolerate the ~2s the bot currently
-            // loses between the door opening and the crossing starting.
-            // Half keeps AGTST1 and AGTST2 passing; see the report for the
-            // measured trade.
-            const int64_t margin = pass <= 2 ? int64_t(radius) * radius / 2 : 0;
+            const int64_t margin = pass <= 2 ? int64_t(radius) * radius : 0;
             const int required = pass < 4 ? clearance : 0;
             int insideSquares = 0;
             for (int gy = minY >> kNavGridShift; gy <= (maxY >> kNavGridShift); ++gy)
@@ -6054,13 +6124,22 @@ struct LLMapperBot::Impl
                 event("nav_sector_too_tight_for_grid", detail);
                 grid.cells.clear();
             }
+            if (!grid.cells.empty() && margin > 0)
+                marginRespected = true;
         }
         // A sector too thin to hold a standable square is still crossed --
         // a step, a ledge, a door track.  Give it a transit cell at each of
         // its doorways so routes can pass through, even though nothing will
         // choose to stand there.  Without this the strict destination lookup
         // severs every route that runs through such a place.
-        if (grid.cells.empty())
+        //
+        // But only where the player fits at all.  A 128-unit slot between
+        // two rooms is not a tight corridor, it is a wall with a seam in it,
+        // and handing it transit cells is what had the bot shouldering the
+        // masonry beside it for the rest of the run.
+        grid.admitsPlayer = marginRespected
+            || sectorAdmitsPlayer(sectorId, minX, maxX, minY, maxY);
+        if (grid.cells.empty() && grid.admitsPlayer)
         {
             for (int i = 0; i < sectorRecord.wallnum; ++i)
             {
@@ -7368,10 +7447,28 @@ struct LLMapperBot::Impl
         // near sector rather than being handed back to the corner planner.
         // Two seconds spent re-deciding after the door opened was the
         // difference between getting through and being caught in it.
-        const int adjacent = currentObjective.active
-            && currentObjective.wall == portal.wall
-            ? std::max(4096, bodyRadius + 512)
-            : std::max(1024, bodyRadius + 512);
+        //
+        // Driving straight only makes sense while the line is actually
+        // clear, though.  With a pillar or a rotating door between the bot
+        // and the gap it just walks into the obstacle and grinds along it
+        // until the objective times out, so the long reach is granted only
+        // when the body-sized probe says the run is unobstructed.
+        const int nearby = std::max(1024, bodyRadius + 512);
+        int adjacent = nearby;
+        if (currentObjective.active && currentObjective.wall == portal.wall)
+        {
+            const int committed = std::max(4096, bodyRadius + 512);
+            const int64_t range = distance2(observation.x, observation.y,
+                                            portal.x, portal.y);
+            if (range <= int64_t(nearby) * nearby)
+                adjacent = committed;
+            else if (range <= int64_t(committed) * committed
+                     && probeMovement(observation.x, observation.y, observation.z,
+                                      observation.sector, portal.x, portal.y,
+                                      observation.sector,
+                                      std::max(256, bodyRadius)).reachable)
+                adjacent = committed;
+        }
         int throughX = 0;
         int throughY = 0;
         if (portal.from == observation.sector
