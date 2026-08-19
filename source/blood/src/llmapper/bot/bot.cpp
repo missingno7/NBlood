@@ -42,6 +42,17 @@ enum TraversalCapability
     kTraversalCurrentlyUnavailable,
 };
 
+enum NavEdgeMode
+{
+    kNavWalk,
+    kNavStep,
+    kNavJump,
+    kNavCrouch,
+    kNavDrop,
+    kNavInteraction,
+    kNavBlocked,
+};
+
 namespace
 {
 constexpr int kDefaultTimeoutSeconds = 30 * 60;
@@ -193,6 +204,20 @@ struct MovementProbe
     int y = 0;
     int sector = -1;
 };
+
+static const char *navEdgeModeName(NavEdgeMode mode)
+{
+    switch (mode)
+    {
+    case kNavStep: return "STEP";
+    case kNavJump: return "JUMP";
+    case kNavCrouch: return "CROUCH";
+    case kNavDrop: return "DROP_SAFE";
+    case kNavInteraction: return "INTERACTION";
+    case kNavBlocked: return "BLOCKED";
+    default: return "WALK";
+    }
+}
 
 static int wrapAngle(int angle)
 {
@@ -728,6 +753,31 @@ struct LLMapperBot::Impl
         int wall = -1;
     };
 
+    struct ObjectMemory
+    {
+        VisibleObject object;
+        bool observed = false;
+        bool collected = false;
+        int lastSeenTick = -1;
+    };
+
+    struct NavLink
+    {
+        int target = -1;
+        NavEdgeMode mode = kNavWalk;
+        int wall = -1;
+    };
+
+    struct NavCell
+    {
+        int id = -1;
+        int sector = -1;
+        LocalWaypoint vertex[3];
+        LocalWaypoint center;
+        int walkArea = -1;
+        std::vector<NavLink> links;
+    };
+
     struct EdgeFailure
     {
         int geometrySignature = 0;
@@ -840,6 +890,8 @@ struct LLMapperBot::Impl
     std::map<int, DoorMemory> doors;
     std::map<int, InteractionMemory> interactions;
     std::vector<PendingWork> pendingWork;
+    std::map<int, ObjectMemory> objectMemory;
+    VisibleObject selectedObject;
     bool recoveryMode = false;
     std::set<int> knownObjects;
     std::set<int> knownKeys;
@@ -923,6 +975,16 @@ struct LLMapperBot::Impl
     bool navigationUsingDetour = false;
     int navigationActionableBlocker = -1;
     std::set<int> navigationRecentWalls;
+    std::vector<LocalWaypoint> navRoute;
+    size_t navRouteIndex = 0;
+    int navRouteSignature = 0;
+    int navRouteTopologyRevision = 0;
+    std::vector<NavCell> navCells;
+    int navTopologySignature = 0;
+    int navTopologyRevision = 0;
+    int navigationFailureSignature = 0;
+    int navigationFailureCount = 0;
+    int lastNavigationFailureTick = -1;
     bool crouchTargetActive = false;
     int followThroughKey = -1;
     int followThroughStartTick = -1;
@@ -1707,11 +1769,63 @@ struct LLMapperBot::Impl
                 // known, but must not create a route from an unseen corner.
                 if (edge == edges.end() && !portal.localGeometry)
                     edges.push_back(portal);
-                else if (edge != edges.end())
-                    *edge = portal;
+            else if (edge != edges.end())
+                *edge = portal;
             }
             else if (edge != edges.end())
                 edges.erase(edge);
+            if (!portal.localGeometry && (portal.traversable || portal.jumpable))
+            {
+                // A visible two-sided Build opening is a known route in both
+                // directions.  Keeping only the observed wall direction made
+                // DFS backtracking impossible after a one-way sector entry.
+                Portal reverse = portal;
+                reverse.from = portal.to;
+                reverse.to = portal.from;
+                reverse.floorZ = portal.fromFloorZ;
+                reverse.ceilingZ = portal.fromCeilingZ;
+                reverse.fromFloorZ = portal.toFloorZ;
+                reverse.fromCeilingZ = portal.toCeilingZ;
+                reverse.toFloorZ = portal.fromFloorZ;
+                reverse.toCeilingZ = portal.fromCeilingZ;
+                reverse.floorDelta = -portal.floorDelta;
+                int reverseWallId = -1;
+                if (inRange(reverse.from, 0, numsectors))
+                {
+                    const sectortype &reverseSector = sector[reverse.from];
+                    for (int i = 0; i < reverseSector.wallnum; ++i)
+                    {
+                        const int candidateWallId = reverseSector.wallptr + i;
+                        if (!inRange(candidateWallId, 0, numwalls))
+                            continue;
+                        const walltype &candidateWall = wall[candidateWallId];
+                        const walltype &candidateEnd = wall[candidateWall.point2];
+                        const bool sameSegment =
+                            (candidateWall.x == portal.x1 && candidateWall.y == portal.y1
+                             && candidateEnd.x == portal.x2 && candidateEnd.y == portal.y2)
+                            || (candidateWall.x == portal.x2 && candidateWall.y == portal.y2
+                                && candidateEnd.x == portal.x1 && candidateEnd.y == portal.y1);
+                        if (candidateWall.nextsector == reverse.to && sameSegment)
+                        {
+                            reverseWallId = candidateWallId;
+                            break;
+                        }
+                    }
+                }
+                if (reverseWallId < 0)
+                    continue;
+                reverse.wall = reverseWallId;
+                auto &reverseEdges = knownGraph[reverse.from];
+                auto reverseEdge = std::find_if(reverseEdges.begin(), reverseEdges.end(),
+                                                [&reverse](const Portal &known)
+                {
+                    return known.wall == reverse.wall && known.to == reverse.to;
+                });
+                if (reverseEdge == reverseEdges.end())
+                    reverseEdges.push_back(reverse);
+                else
+                    *reverseEdge = reverse;
+            }
             if (portal.localGeometry && !knownEdge)
                 continue;
             const bool blockedInteractivePortal = portal.interactionAffordance;
@@ -1804,6 +1918,12 @@ struct LLMapperBot::Impl
 
         for (const VisibleObject &object : observation.objects)
         {
+            ObjectMemory &remembered = objectMemory[object.sprite];
+            const bool firstObjectObservation = !remembered.observed;
+            remembered.object = object;
+            remembered.observed = true;
+            remembered.collected = false;
+            remembered.lastSeenTick = observation.tick;
             if (object.kind == kObjectKey && knownKeys.insert(object.type - kItemKeyBase + 1).second)
                 ++knowledgeRevision;
             if (knownObjects.insert(object.sprite).second)
@@ -1816,6 +1936,8 @@ struct LLMapperBot::Impl
                 lastSemanticProgressTick = observation.tick;
                 ++knowledgeRevision;
             }
+            if (firstObjectObservation)
+                event("object_remembered", object.kind == kObjectKey ? "kind=key" : "kind=pickup");
         }
 
         for (int key = 1; key < 8; ++key)
@@ -2157,7 +2279,45 @@ struct LLMapperBot::Impl
                 bestDistance = distance;
             }
         }
+        if (best)
+        {
+            selectedObject = *best;
+            return &selectedObject;
+        }
+        for (const auto &entry : objectMemory)
+        {
+            const ObjectMemory &memory = entry.second;
+            if (!memory.observed || memory.collected || memory.object.kind != kind)
+                continue;
+            if (memory.object.sprite < 0 || memory.object.sprite >= kMaxSprites
+                || sprite[memory.object.sprite].sectnum < 0)
+                continue;
+            const int distance = distance2(observation.x, observation.y,
+                                           memory.object.x, memory.object.y);
+            if (distance < bestDistance)
+            {
+                selectedObject = memory.object;
+                bestDistance = distance;
+                best = &selectedObject;
+            }
+        }
         return best;
+    }
+
+    bool objectStillPresent(const ObjectMemory &memory) const
+    {
+        const int id = memory.object.sprite;
+        if (id < 0 || id >= kMaxSprites)
+            return false;
+        const spritetype &candidate = sprite[id];
+        if (candidate.sectnum < 0)
+            return false;
+        if (memory.object.kind == kObjectEnemy)
+            return candidate.statnum == kStatDude && validXSprite(candidate.extra)
+                && xsprite[candidate.extra].health > 0;
+        if (memory.object.kind == kObjectKey || memory.object.kind == kObjectPickup)
+            return candidate.statnum == kStatItem || candidate.statnum == kStatThing;
+        return true;
     }
 
     InteractionMemory *selectNewInteraction(bool includeRecovery = false)
@@ -2175,6 +2335,8 @@ struct LLMapperBot::Impl
                      && memory.reversible && !memory.recoveryAttempted))
                 continue;
             if (memory.unavailableFromSector == observation.sector)
+                continue;
+            if (memory.fromSector != observation.sector && !includeRecovery)
                 continue;
             // A currently traversable portal is already a valid exploration
             // frontier.  Its optional Wallpush metadata must not turn the
@@ -2731,7 +2893,8 @@ struct LLMapperBot::Impl
         if (lastDamageTick >= 0 && observation.tick - lastDamageTick <= 2 * kTicsPerSec)
             return true;
         const VisibleObject *enemy = selectObject(kObjectEnemy);
-        return enemy && enemy->sector == observation.sector
+        return enemy && !unreachableEnemies.count(enemy->sprite)
+            && enemy->sector == observation.sector
             && distance2(enemy->x, enemy->y, observation.x, observation.y) <= 4096 * 4096;
     }
 
@@ -2842,14 +3005,27 @@ struct LLMapperBot::Impl
                     if (portal.wall == currentObjective.wall
                         && portal.to == currentObjective.targetSector)
                         return steerPortal(portal);
-            }
-            Portal route;
-            if (!findKnownRoute(currentObjective.targetSector, route))
-            {
-                invalidateObjective("frontier_no_current_route");
+                auto known = knownGraph.find(observation.sector);
+                if (known != knownGraph.end())
+                    for (const Portal &portal : known->second)
+                        if (portal.wall == currentObjective.wall
+                            && portal.to == currentObjective.targetSector)
+                            return steerPortal(portal);
+                retirePendingFrontier(currentObjective.wall, currentObjective.sector,
+                                      currentObjective.targetSector);
+                invalidateObjective("frontier_not_currently_observable");
                 return GINPUT{};
             }
-            return steerPortal(route);
+            if (observation.sector != currentObjective.sector)
+            {
+                Portal sourceRoute;
+                if (findKnownRoute(currentObjective.sector, sourceRoute))
+                    return steerPortal(sourceRoute);
+                invalidateObjective("frontier_no_current_source_route");
+                return GINPUT{};
+            }
+            invalidateObjective("frontier_source_state_changed");
+            return GINPUT{};
         }
         if (currentObjective.type == kObjectivePickup
             || currentObjective.type == kObjectiveKey)
@@ -2867,8 +3043,26 @@ struct LLMapperBot::Impl
             }
             if (!object)
             {
-                completeObjective("object_collected_or_no_longer_visible");
-                return GINPUT{};
+                auto remembered = objectMemory.find(currentObjective.id);
+                if (remembered == objectMemory.end()
+                    || !remembered->second.observed
+                    || remembered->second.collected)
+                {
+                    completeObjective("pickup_confirmed_collected");
+                    return GINPUT{};
+                }
+                if (!objectStillPresent(remembered->second))
+                {
+                    remembered->second.collected = true;
+                    event("pickup_confirmed_collected", "source=sprite_removed_or_inventory");
+                    completeObjective("pickup_confirmed_collected");
+                    return GINPUT{};
+                }
+                // The observation is deliberately non-omniscient.  Keep
+                // pursuing the last known pose while a corner or moving
+                // wall temporarily occludes the pickup.
+                selectedObject = remembered->second.object;
+                object = &selectedObject;
             }
             if (object->sector != observation.sector)
             {
@@ -2897,12 +3091,20 @@ struct LLMapperBot::Impl
                 completeObjective("threat_gone");
                 return GINPUT{};
             }
+            int rangedWeapon = kWeaponNone;
+            if (rangedWeaponAvailable(rangedWeapon))
+            {
+                // A reachable enemy is not a reason to close to melee.  The
+                // same visible target can be attacked while the player holds
+                // the current position or strafes independently.
+                return aimAndShoot(*enemy, rangedWeapon);
+            }
             if (directObjectReachable(*enemy))
                 return navigateTo(enemy->x, enemy->y, enemy->z, enemy->sector,
                                   enemy->sprite, kTraversalUnknown, true);
-            int rangedWeapon = kWeaponNone;
-            if (rangedWeaponAvailable(rangedWeapon))
-                return aimAndShoot(*enemy, rangedWeapon);
+            unreachableEnemies.insert(enemy->sprite);
+            lastDamageTick = -1;
+            event("threat_deferred", "reason=no_ranged_weapon_and_no_direct_body_path");
             invalidateObjective("threat_not_reachable");
         }
         return GINPUT{};
@@ -3006,6 +3208,338 @@ struct LLMapperBot::Impl
         return result;
     }
 
+    static int64_t navCross(const LocalWaypoint &a, const LocalWaypoint &b,
+                            const LocalWaypoint &c)
+    {
+        return int64_t(b.x - a.x) * (c.y - a.y)
+            - int64_t(b.y - a.y) * (c.x - a.x);
+    }
+
+    static bool navPointInTriangle(const LocalWaypoint &p, const LocalWaypoint *v)
+    {
+        const int64_t a = navCross(v[0], v[1], p);
+        const int64_t b = navCross(v[1], v[2], p);
+        const int64_t c = navCross(v[2], v[0], p);
+        return (a >= 0 && b >= 0 && c >= 0)
+            || (a <= 0 && b <= 0 && c <= 0);
+    }
+
+    int navGeometrySignature() const
+    {
+        int signature = 17;
+        std::set<int> sectors = observedSectors;
+        if (inRange(observation.sector, 0, numsectors))
+            sectors.insert(observation.sector);
+        for (int sectorId : sectors)
+        {
+            if (!inRange(sectorId, 0, numsectors))
+                continue;
+            const sectortype &sectorRecord = sector[sectorId];
+            signature = signature * 31 + sectorId;
+            signature = signature * 31 + sectorRecord.wallptr;
+            signature = signature * 31 + sectorRecord.wallnum;
+            signature = signature * 31 + sectorRecord.floorz;
+            signature = signature * 31 + sectorRecord.ceilingz;
+            for (int i = 0; i < sectorRecord.wallnum; ++i)
+            {
+                const int wallId = sectorRecord.wallptr + i;
+                if (!inRange(wallId, 0, numwalls))
+                    continue;
+                const walltype &wallRecord = wall[wallId];
+                signature = signature * 31 + wallRecord.x;
+                signature = signature * 31 + wallRecord.y;
+                signature = signature * 31 + wallRecord.point2;
+                signature = signature * 31 + wallRecord.nextsector;
+                signature = signature * 31 + wallRecord.cstat;
+            }
+        }
+        return signature;
+    }
+
+    void addNavLink(int from, int to, NavEdgeMode mode, int wallId)
+    {
+        if (from < 0 || to < 0 || from == to)
+            return;
+        NavCell &cell = navCells[from];
+        for (const NavLink &link : cell.links)
+            if (link.target == to && link.wall == wallId)
+                return;
+        cell.links.push_back({ to, mode, wallId });
+    }
+
+    int nearestNavCell(int sectorId, int x, int y) const
+    {
+        int best = -1;
+        int bestDistance = INT32_MAX;
+        for (const NavCell &cell : navCells)
+        {
+            if (cell.sector != sectorId)
+                continue;
+            if (navPointInTriangle({ x, y }, cell.vertex))
+                return cell.id;
+            const int currentDistance = distance2(x, y, cell.center.x, cell.center.y);
+            if (currentDistance < bestDistance)
+            {
+                bestDistance = currentDistance;
+                best = cell.id;
+            }
+        }
+        return best;
+    }
+
+    void buildNavSector(int sectorId)
+    {
+        if (!inRange(sectorId, 0, numsectors))
+            return;
+        const sectortype &sectorRecord = sector[sectorId];
+        std::vector<LocalWaypoint> polygon;
+        for (int i = 0; i < sectorRecord.wallnum; ++i)
+        {
+            const int wallId = sectorRecord.wallptr + i;
+            if (inRange(wallId, 0, numwalls))
+                polygon.push_back({ wall[wallId].x, wall[wallId].y });
+        }
+        if (polygon.size() < 3)
+            return;
+
+        int64_t area = 0;
+        for (size_t i = 0; i < polygon.size(); ++i)
+        {
+            const LocalWaypoint &a = polygon[i];
+            const LocalWaypoint &b = polygon[(i + 1) % polygon.size()];
+            area += int64_t(a.x) * b.y - int64_t(b.x) * a.y;
+        }
+        const bool ccw = area > 0;
+        std::vector<int> remaining;
+        for (size_t i = 0; i < polygon.size(); ++i)
+            remaining.push_back(int(i));
+        const size_t guardLimit = polygon.size() * polygon.size();
+        size_t guard = 0;
+        while (remaining.size() >= 3 && guard++ < guardLimit)
+        {
+            bool clipped = false;
+            for (size_t i = 0; i < remaining.size(); ++i)
+            {
+                const int previous = remaining[(i + remaining.size() - 1) % remaining.size()];
+                const int current = remaining[i];
+                const int next = remaining[(i + 1) % remaining.size()];
+                const int64_t turn = navCross(polygon[previous], polygon[current], polygon[next]);
+                if ((ccw && turn <= 0) || (!ccw && turn >= 0))
+                    continue;
+                LocalWaypoint triangle[3] = { polygon[previous], polygon[current], polygon[next] };
+                bool containsVertex = false;
+                for (int other : remaining)
+                {
+                    if (other == previous || other == current || other == next)
+                        continue;
+                    if (navPointInTriangle(polygon[other], triangle))
+                    {
+                        containsVertex = true;
+                        break;
+                    }
+                }
+                if (containsVertex)
+                    continue;
+                NavCell cell;
+                cell.id = int(navCells.size());
+                cell.sector = sectorId;
+                for (int k = 0; k < 3; ++k)
+                    cell.vertex[k] = triangle[k];
+                cell.center = { (triangle[0].x + triangle[1].x + triangle[2].x) / 3,
+                                (triangle[0].y + triangle[1].y + triangle[2].y) / 3 };
+                navCells.push_back(cell);
+                remaining.erase(remaining.begin() + i);
+                clipped = true;
+                break;
+            }
+            if (!clipped)
+                break;
+        }
+        // A malformed/overlapping Build loop should not erase all navigation
+        // knowledge.  A fan is only a bounded fallback; every segment is
+        // still validated by copied-state clipmove before execution.
+        if (remaining.size() >= 3)
+        {
+            const int base = remaining.front();
+            for (size_t i = 1; i + 1 < remaining.size(); ++i)
+            {
+                NavCell cell;
+                cell.id = int(navCells.size());
+                cell.sector = sectorId;
+                cell.vertex[0] = polygon[base];
+                cell.vertex[1] = polygon[remaining[i]];
+                cell.vertex[2] = polygon[remaining[i + 1]];
+                cell.center = { (cell.vertex[0].x + cell.vertex[1].x + cell.vertex[2].x) / 3,
+                                (cell.vertex[0].y + cell.vertex[1].y + cell.vertex[2].y) / 3 };
+                navCells.push_back(cell);
+            }
+        }
+    }
+
+    NavEdgeMode navModeForPortal(const Portal &portal) const
+    {
+        if (portal.interactionAffordance && !portal.traversable)
+            return kNavInteraction;
+        if (portal.jumpable)
+            return kNavJump;
+        if (portal.crouchable)
+            return kNavCrouch;
+        if (portal.dropSafe)
+            return kNavDrop;
+        if (portal.floorDelta != 0)
+            return kNavStep;
+        if (portal.walkable)
+            return kNavWalk;
+        return kNavBlocked;
+    }
+
+    void ensureNavTopology()
+    {
+        const int signature = navGeometrySignature();
+        if (signature == navTopologySignature && !navCells.empty())
+            return;
+        navTopologySignature = signature;
+        navCells.clear();
+        std::set<int> sectors = observedSectors;
+        if (inRange(observation.sector, 0, numsectors))
+            sectors.insert(observation.sector);
+        for (int sectorId : sectors)
+            buildNavSector(sectorId);
+
+        for (size_t i = 0; i < navCells.size(); ++i)
+            for (size_t j = i + 1; j < navCells.size(); ++j)
+            {
+                if (navCells[i].sector != navCells[j].sector)
+                    continue;
+                bool shared = false;
+                for (int a = 0; a < 3 && !shared; ++a)
+                    for (int b = 0; b < 3 && !shared; ++b)
+                    {
+                        const LocalWaypoint &a1 = navCells[i].vertex[a];
+                        const LocalWaypoint &a2 = navCells[i].vertex[(a + 1) % 3];
+                        const LocalWaypoint &b1 = navCells[j].vertex[b];
+                        const LocalWaypoint &b2 = navCells[j].vertex[(b + 1) % 3];
+                        shared = (a1.x == b2.x && a1.y == b2.y
+                                  && a2.x == b1.x && a2.y == b1.y)
+                            || (a1.x == b1.x && a1.y == b1.y
+                                && a2.x == b2.x && a2.y == b2.y);
+                    }
+                if (shared)
+                {
+                    addNavLink(int(i), int(j), kNavWalk, -1);
+                    addNavLink(int(j), int(i), kNavWalk, -1);
+                }
+            }
+
+        for (const auto &entry : knownGraph)
+            for (const Portal &portal : entry.second)
+            {
+                if (!(portal.traversable || portal.jumpable)
+                    || !observedSectors.count(portal.from)
+                    || !observedSectors.count(portal.to))
+                    continue;
+                const int from = nearestNavCell(portal.from, portal.x, portal.y);
+                const int to = nearestNavCell(portal.to, portal.x, portal.y);
+                if (from >= 0 && to >= 0)
+                {
+                    const NavEdgeMode mode = navModeForPortal(portal);
+                    addNavLink(from, to, mode, portal.wall);
+                    addNavLink(to, from, mode, portal.wall);
+                }
+            }
+
+        int nextArea = 0;
+        for (NavCell &cell : navCells)
+            cell.walkArea = -1;
+        for (NavCell &cell : navCells)
+        {
+            if (cell.walkArea >= 0)
+                continue;
+            std::deque<int> queue;
+            queue.push_back(cell.id);
+            cell.walkArea = nextArea;
+            while (!queue.empty())
+            {
+                const int current = queue.front();
+                queue.pop_front();
+                for (const NavLink &link : navCells[current].links)
+                {
+                    if (link.mode != kNavWalk && link.mode != kNavStep
+                        && link.mode != kNavDrop)
+                        continue;
+                    if (navCells[link.target].walkArea < 0)
+                    {
+                        navCells[link.target].walkArea = nextArea;
+                        queue.push_back(link.target);
+                    }
+                }
+            }
+            ++nextArea;
+        }
+        ++navTopologyRevision;
+        char detail[128];
+        snprintf(detail, sizeof(detail), "revision=%d cells=%u areas=%d sectors=%u",
+                 navTopologyRevision, unsigned(navCells.size()), nextArea,
+                 unsigned(sectors.size()));
+        event("nav_topology_rebuilt", detail);
+    }
+
+    bool buildNavRoute(int targetX, int targetY, int targetSector, int signature)
+    {
+        if (targetSector != observation.sector)
+            return false;
+        ensureNavTopology();
+        const int start = nearestNavCell(observation.sector, observation.x, observation.y);
+        const int target = nearestNavCell(targetSector, targetX, targetY);
+        if (start < 0 || target < 0 || start == target)
+            return false;
+        std::deque<int> queue;
+        std::vector<int> parent(navCells.size(), -1);
+        std::vector<bool> reached(navCells.size(), false);
+        queue.push_back(start);
+        reached[start] = true;
+        while (!queue.empty() && !reached[target])
+        {
+            const int current = queue.front();
+            queue.pop_front();
+            for (const NavLink &link : navCells[current].links)
+            {
+                if (link.mode != kNavWalk && link.mode != kNavStep
+                    && link.mode != kNavDrop)
+                    continue;
+                if (!reached[link.target])
+                {
+                    reached[link.target] = true;
+                    parent[link.target] = current;
+                    queue.push_back(link.target);
+                }
+            }
+        }
+        if (!reached[target])
+            return false;
+        std::vector<int> cells;
+        for (int cursor = target; cursor >= 0; cursor = parent[cursor])
+        {
+            cells.push_back(cursor);
+            if (cursor == start)
+                break;
+        }
+        if (cells.back() != start)
+            return false;
+        navRoute.clear();
+        for (auto it = cells.rbegin(); it != cells.rend(); ++it)
+            if (*it != start)
+                navRoute.push_back(navCells[*it].center);
+        navRouteIndex = 0;
+        navRouteSignature = signature;
+        navRouteTopologyRevision = navTopologyRevision;
+        char detail[160];
+        snprintf(detail, sizeof(detail), "cells=%u target=(%d,%d) area=%d",
+                 unsigned(navRoute.size()), targetX, targetY, navCells[target].walkArea);
+        event("nav_route_selected", detail);
+        return !navRoute.empty();
+    }
+
     bool collisionProbe(int startX, int startY, int startZ, int startSector,
                         int targetX, int targetY, int targetSector, int tolerance) const
     {
@@ -3030,6 +3564,68 @@ struct LLMapperBot::Impl
         navigationDetourWall = -1;
         navigationDetourDepth = 0;
         navigationRecentWalls.clear();
+        navRoute.clear();
+        navRouteIndex = 0;
+        navRouteSignature = 0;
+        navigationFailureSignature = 0;
+        navigationFailureCount = 0;
+        lastNavigationFailureTick = -1;
+    }
+
+    NavEdgeMode classifyNavigationBlock(int wallId, int x, int y) const
+    {
+        if (!inRange(wallId, 0, numwalls))
+            return kNavBlocked;
+        const walltype &wallRecord = wall[wallId];
+        if (!inRange(wallRecord.point2, 0, numwalls))
+            return kNavBlocked;
+        if (!inRange(wallRecord.nextsector, 0, numsectors))
+        {
+            if (inRange(wallRecord.extra, 1, kMaxXWalls)
+                && xwall[wallRecord.extra].triggerPush)
+                return kNavInteraction;
+            return kNavBlocked;
+        }
+        if (wallRecord.cstat & 1)
+        {
+            if (inRange(wallRecord.extra, 1, kMaxXWalls)
+                && xwall[wallRecord.extra].triggerPush)
+                return kNavInteraction;
+            return kNavBlocked;
+        }
+        const int fromFloor = getflorzofslope(observation.sector, x, y);
+        const int toFloor = getflorzofslope(wallRecord.nextsector, x, y);
+        const int fromCeiling = getceilzofslope(observation.sector, x, y);
+        const int toCeiling = getceilzofslope(wallRecord.nextsector, x, y);
+        const int clearance = std::min(fromFloor - fromCeiling, toFloor - toCeiling);
+        const int width = int(std::sqrt(double(distance2(
+            wallRecord.x, wallRecord.y, wall[wallRecord.point2].x,
+            wall[wallRecord.point2].y))));
+        const int floorDelta = toFloor - fromFloor;
+        const int body = playerBodyClearance();
+        const int rise = playerJumpRiseLimit();
+        bool mechanism = false;
+        if (inRange(wallRecord.extra, 1, kMaxXWalls)
+            && xwall[wallRecord.extra].triggerPush)
+            mechanism = true;
+        if (inRange(wallRecord.nextsector, 0, numsectors)
+            && sector[wallRecord.nextsector].extra > 0
+            && sector[wallRecord.nextsector].extra < kMaxXSectors
+            && xsector[sector[wallRecord.nextsector].extra].Wallpush)
+            mechanism = true;
+        if (width >= kPlayerPassageWidth && clearance >= body
+            && std::abs(floorDelta) <= kMaxWalkableStep)
+            return floorDelta == 0 ? kNavWalk : kNavStep;
+        if (width >= kPlayerPassageWidth && clearance >= body
+            && !mechanism && floorDelta < 0 && -floorDelta <= rise)
+            return kNavJump;
+        if (width >= kPlayerPassageWidth && clearance >= body
+            && floorDelta > 0 && floorDelta <= rise)
+            return kNavDrop;
+        if (inRange(wallRecord.extra, 1, kMaxXWalls)
+            && xwall[wallRecord.extra].triggerPush)
+            return kNavInteraction;
+        return kNavBlocked;
     }
 
     bool chooseNavigationDetour(const MovementProbe &blocked)
@@ -3172,6 +3768,36 @@ struct LLMapperBot::Impl
             return steerTo(x, y, false, shoot, targetId, targetSector, capability);
         }
 
+        if (!navRoute.empty() && navRouteSignature == signature
+            && navRouteTopologyRevision == navTopologyRevision)
+        {
+            const LocalWaypoint &waypoint = navRoute[navRouteIndex];
+            if (distance2(observation.x, observation.y, waypoint.x, waypoint.y)
+                <= tolerance * tolerance)
+            {
+                ++navRouteIndex;
+                if (navRouteIndex >= navRoute.size())
+                    navRoute.clear();
+                else
+                    event("nav_retarget_original");
+            }
+            if (!navRoute.empty())
+            {
+                const LocalWaypoint &next = navRoute[navRouteIndex];
+                const MovementProbe segment = probeMovement(
+                    observation.x, observation.y, observation.z, observation.sector,
+                    next.x, next.y, observation.sector, tolerance);
+                if (segment.reachable)
+                {
+                    event("nav_cell_waypoint", "source=derived_triangle_cell");
+                    return steerTo(next.x, next.y, false, shoot, targetId,
+                                   observation.sector, capability);
+                }
+                event("nav_segment_failed", "source=derived_triangle_cell");
+                navRoute.clear();
+            }
+        }
+
         if (navigationWaypointActive)
         {
             if (distance2(observation.x, observation.y, navigationWaypointX,
@@ -3199,6 +3825,28 @@ struct LLMapperBot::Impl
 
         if (direct.wall >= 0)
         {
+            const NavEdgeMode blockMode = classifyNavigationBlock(direct.wall, direct.x, direct.y);
+            const int nextSector = inRange(direct.wall, 0, numwalls)
+                ? wall[direct.wall].nextsector : -1;
+            char classification[192];
+            snprintf(classification, sizeof(classification),
+                     "wall=%d mode=%s nextsector=%d stop=(%d,%d)", direct.wall,
+                     navEdgeModeName(blockMode), nextSector, direct.x, direct.y);
+            event("navigation_block_classified", classification);
+            if (blockMode == kNavWalk || blockMode == kNavStep || blockMode == kNavDrop)
+            {
+                char detail[96];
+                snprintf(detail, sizeof(detail), "wall=%d mode=%s", direct.wall,
+                         navEdgeModeName(blockMode));
+                event("nav_edge", detail);
+                return steerTo(x, y, false, shoot, targetId, targetSector, capability);
+            }
+            if (blockMode == kNavJump)
+            {
+                event("nav_edge", "mode=JUMP");
+                return steerTo(x, y, false, shoot, targetId, targetSector,
+                               kTraversalJumpable);
+            }
             bool actionable = false;
             for (const InteractionCandidate &candidate : observation.interactions)
             {
@@ -3213,16 +3861,46 @@ struct LLMapperBot::Impl
                      direct.wall, targetId, actionable ? 1 : 0, direct.x, direct.y);
             event("navigation_blocked", detail);
             if (rememberCollisionInteraction(direct.wall))
+                event("navigation_interaction_opportunity", "source=clipmove_collision_hit");
+            ensureNavTopology();
+            if (buildNavRoute(x, y, targetSector, signature))
             {
-                navigationActionableBlocker = direct.wall;
-                event("navigation_interaction_blocker", "source=clipmove_collision_hit");
+                const LocalWaypoint &waypoint = navRoute.front();
+                return steerTo(waypoint.x, waypoint.y, false, false, targetId,
+                               observation.sector, capability);
             }
             if (chooseNavigationDetour(direct))
                 return steerTo(navigationWaypointX, navigationWaypointY, false, false,
                                targetId, observation.sector, capability);
         }
-        event("navigation_failed", "reason=no_bounded_collision_safe_detour");
-        return steerTo(x, y, false, false, targetId, targetSector, capability);
+        if (navigationFailureSignature != signature)
+        {
+            navigationFailureSignature = signature;
+            navigationFailureCount = 0;
+        }
+        ++navigationFailureCount;
+        if (navigationFailureCount == 1)
+            event("navigation_failed", "reason=no_bounded_collision_safe_detour");
+        if (navigationFailureCount >= 12 && currentObjective.active
+            && currentObjective.type != kObjectiveInteraction)
+        {
+            if (currentObjective.type == kObjectiveFrontier)
+            {
+                const int edgeId = currentObjective.wall * 65536
+                    + currentObjective.targetSector;
+                const Portal *failedPortal = findPortalForEdge(edgeId);
+                if (failedPortal)
+                {
+                    recordEdgeFailure(*failedPortal, "local_portal_failed",
+                                      "navigation_failed_bounded");
+                    retirePendingFrontier(currentObjective.wall, currentObjective.sector,
+                                          currentObjective.targetSector);
+                }
+            }
+            event("navigation_failed_bounded", "reason=objective_temporarily_unreachable");
+            invalidateObjective("navigation_failed_bounded");
+        }
+        return GINPUT{};
     }
 
     void preparePortalWaypoint(const Portal &portal)
@@ -3686,8 +4364,9 @@ struct LLMapperBot::Impl
 
         if (const VisibleObject *key = selectObject(kObjectKey))
         {
-            Portal route;
-            if (directObjectReachable(*key))
+            // Remembered remote pickups remain pending knowledge; they do
+            // not outrank a local room's interactions or frontier.
+            if (key->sector == observation.sector && directObjectReachable(*key))
             {
                 Objective objective;
                 objective.type = kObjectiveKey;
@@ -3697,22 +4376,10 @@ struct LLMapperBot::Impl
                 selectObjective(objective, "COLLECT_VISIBLE_KEY");
                 return executeObjective();
             }
-            if (findKnownRoute(key->sector, route))
-            {
-                Objective objective;
-                objective.type = kObjectiveKey;
-                objective.id = key->sprite;
-                objective.sector = key->sector;
-                objective.targetSector = key->sector;
-                selectObjective(objective, "NAVIGATE_TO_VISIBLE_KEY");
-                return executeObjective();
-            }
-            unreachableObjects.insert(key->sprite);
         }
         if (const VisibleObject *pickup = selectObject(kObjectPickup))
         {
-            Portal route;
-            if (directObjectReachable(*pickup))
+            if (pickup->sector == observation.sector && directObjectReachable(*pickup))
             {
                 Objective objective;
                 objective.type = kObjectivePickup;
@@ -3722,17 +4389,6 @@ struct LLMapperBot::Impl
                 selectObjective(objective, "COLLECT_VISIBLE_PICKUP");
                 return executeObjective();
             }
-            if (findKnownRoute(pickup->sector, route))
-            {
-                Objective objective;
-                objective.type = kObjectivePickup;
-                objective.id = pickup->sprite;
-                objective.sector = pickup->sector;
-                objective.targetSector = pickup->sector;
-                selectObjective(objective, "NAVIGATE_TO_VISIBLE_PICKUP");
-                return executeObjective();
-            }
-            unreachableObjects.insert(pickup->sprite);
         }
         if (observation.exitHere)
         {
