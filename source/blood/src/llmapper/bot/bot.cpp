@@ -27,6 +27,7 @@
 #include "../../gameutil.h"
 #include "../../globals.h"
 #include "../../levels.h"
+#include "../../view.h"
 #include "../../network.h"
 #include "../../player.h"
 #include "../../trig.h"
@@ -8376,6 +8377,79 @@ void LLMapperBot::OnLevelExit(int exitType)
     snprintf(detail, sizeof(detail), "exit_type=%d", exitType);
     m_impl->event("level_completed", detail);
     gQuitGame = true;
+}
+
+void LLMapperBot::DrawStatus()
+{
+    if (!m_enabled || !m_visible || !m_impl || !gGameStarted)
+        return;
+
+    const int seconds = (gFrame * kTicsPerFrame) / kTicsPerSec;
+    const LLMapperBot::Impl &bot = *m_impl;
+    char line[128];
+    int y = 4;
+    const int x = 2;
+
+    // Line 1: the clock, so anything seen on screen can be named by time.
+    snprintf(line, sizeof(line), "T %d:%02d  sect %d  depth %d  seen %d",
+             seconds / 60, seconds % 60, bot.observation.sector,
+             bot.sectorDepth(bot.observation.sector),
+             int(bot.visitedSectors.size()));
+    viewDrawText(3, line, x, y, -128, 0, 0, true, 256);
+    y += 8;
+
+    // Line 2: what it is trying to do and why.
+    const char *reason = bot.mission.reason ? bot.mission.reason : "-";
+    snprintf(line, sizeof(line), "%s", bot.currentGoal.empty()
+             ? reason : bot.currentGoal.c_str());
+    viewDrawText(3, line, x, y, -128, 0, 0, true, 256);
+    y += 8;
+
+    // Line 3: the object of that intent, and how far off it is.
+    if (bot.currentObjective.active)
+    {
+        int anchorX = 0;
+        int anchorY = 0;
+        const int distance = bot.objectiveAnchor(anchorX, anchorY)
+            ? int(std::sqrt(double(distance2(bot.observation.x, bot.observation.y,
+                                             anchorX, anchorY))))
+            : -1;
+        snprintf(line, sizeof(line), "obj t%d id%d ->s%d d%d %ds",
+                 int(bot.currentObjective.type), bot.currentObjective.id,
+                 bot.currentObjective.targetSector, distance,
+                 bot.currentObjective.startedTick >= 0
+                     ? (bot.observation.tick - bot.currentObjective.startedTick) / kTicsPerSec
+                     : 0);
+    }
+    else
+        snprintf(line, sizeof(line), "obj none  reason %s", reason);
+    viewDrawText(3, line, x, y, -128, 0, 0, true, 256);
+    y += 8;
+
+    // Line 4: the shape of what it still has to do.
+    int pending = 0;
+    int dormant = 0;
+    for (size_t i = 0; i < bot.ledger.size(); ++i)
+    {
+        if (bot.ledger[i].hops < 0)
+            continue;
+        if (bot.ledger[i].dormantUntil > bot.observation.tick)
+            ++dormant;
+        else
+            ++pending;
+    }
+    snprintf(line, sizeof(line), "todo %d  asleep %d  keys %u  hp %d",
+             pending, dormant, unsigned(bot.heldKeys.size()), bot.observation.health / 16);
+    viewDrawText(3, line, x, y, -128, 0, 0, true, 256);
+    y += 8;
+
+    // Line 5: only when something is actively in the bot's way.
+    const int quiet = bot.observation.tick - bot.lastSemanticProgressTick;
+    if (quiet > 3 * kTicsPerSec)
+    {
+        snprintf(line, sizeof(line), "no progress %ds", quiet / kTicsPerSec);
+        viewDrawText(3, line, x, y, -128, 0, 0, true, 256);
+    }
 }
 
 void LLMapperBot::Finish(const char *reason)

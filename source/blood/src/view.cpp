@@ -57,6 +57,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "tile.h"
 #include "trig.h"
 #include "view.h"
+#include "llmapper/bot/bot.h"
 #include "warp.h"
 #include "weapon.h"
 #ifdef NOONE_EXTENSIONS
@@ -4075,6 +4076,7 @@ RORHACK:
     {
         DrawStatSprite(2048, xdim-15, 20);
     }
+    gLLMapperBot.DrawStatus();
     viewDisplayMessage();
     CalcFrameRate();
 #if 0

@@ -41,6 +41,10 @@ public:
     void OnLevelExit(int exitType);
     // Called during shutdown/restart to flush telemetry and the demo.
     void Finish(const char *reason = nullptr);
+    // Draws a short status readout in a visible run.  Times shown here match
+    // the game_time field in the telemetry, so a moment seen on screen can
+    // be looked up directly in the run log.
+    void DrawStatus();
 
 private:
     LLMapperBot(const LLMapperBot &) = delete;
