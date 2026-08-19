@@ -166,6 +166,16 @@ constexpr int kRouteSmoothingSpan = 2048;
 // states the real figure per door; this only guards against a mechanism
 // that never settles.
 constexpr int kMaxDoorWaitTicks = 20 * kTicsPerSec;
+// Grace period after an accepted Use during which the bot keeps watching
+// for the world to change, before deciding nothing came of it.
+constexpr int kMechanismSettleTicks = 3 * kTicsPerSec;
+// How fast the view returns to level while simply travelling.
+constexpr int kLookLevelRate = 24;
+// Damage arriving this close together counts as one continuing source, and
+// this much health lost to it means the ground itself is the problem.
+constexpr int kDamageBurstWindow = kTicsPerSec;
+constexpr int kDamageBurstSevere = 200;
+constexpr int kHazardAvoidTicks = 30 * kTicsPerSec;
 // Slack demanded on top of the body envelope before a gap counts as
 // passable.  A gap exactly the height of the player is not one the engine
 // will move him through.
@@ -217,6 +227,7 @@ struct Portal
     int x2 = 0;
     int y2 = 0;
     int key = 0;
+    int mechanismTx = 0;
     int openingWidth = 0;
     int floorDelta = 0;
     int clearance = 0;
@@ -565,6 +576,7 @@ static Observation observeWorld()
             candidate.target.x = candidate.x;
             candidate.target.y = candidate.y;
             candidate.target.wallPush = true;
+            candidate.target.mechanismTx = xwall[wallRecord.extra].txID;
             candidate.target.x1 = wallRecord.x;
             candidate.target.y1 = wallRecord.y;
             candidate.target.x2 = nextWall.x;
@@ -657,6 +669,7 @@ static Observation observeWorld()
             {
                 const XWALL &extra = xwall[wallRecord.extra];
                 portal.wallPush = extra.triggerPush != 0;
+                portal.mechanismTx = extra.txID;
                 portal.key = extra.key;
                 portal.locked = extra.locked != 0;
                 portal.wallState = extra.state;
@@ -757,6 +770,7 @@ static Observation observeWorld()
                     candidate.target.x = adjacentX;
                     candidate.target.y = adjacentY;
                     candidate.target.wallPush = true;
+                    candidate.target.mechanismTx = xwall[adjacentWall.extra].txID;
                     candidate.target.x1 = adjacentWall.x;
                     candidate.target.y1 = adjacentWall.y;
                     candidate.target.x2 = adjacentNext.x;
@@ -1219,6 +1233,7 @@ struct LLMapperBot::Impl
     unsigned heldKeyMask = 0;
     unsigned lastHeldKeyMask = 0;
     std::map<int, int> lockedDoorKey;
+    mutable std::map<int, int> mechanismReceivers;
     mutable std::vector<int> routeGateWall;
     mutable std::vector<int> routeGateSector;
     std::map<int, int> inertBoundaries;
@@ -1228,6 +1243,11 @@ struct LLMapperBot::Impl
     int lastAcceptedUseTick = -1;
     int clearingSector = -1;
     int clearingWall = -1;
+    int healthLostSinceObservation = 0;
+    int damageBurstStartTick = -1;
+    int damageBurstCount = 0;
+    int damageBurstHealth = 0;
+    std::map<int, int> hazardSectors;   // sector -> tick it stops being avoided
     std::set<int> reopenableConnections;
     int openedRouteWall = -1;
     int openedRouteFrom = -1;
@@ -1476,8 +1496,38 @@ struct LLMapperBot::Impl
     // The extended sector a push surface operates, or -1 when the surface is
     // a mechanism in its own right.  Several walls around one door sector
     // all drive that sector, and to the bot they are one thing to do.
+    // The sector listening on this channel.  Cached: the scan is over every
+    // sector, and the wiring does not change during a level.
+    int mechanismReceiver(int tx) const
+    {
+        if (tx <= 0)
+            return -1;
+        auto known = mechanismReceivers.find(tx);
+        if (known != mechanismReceivers.end())
+            return known->second;
+        int found = -1;
+        for (int i = 0; i < numsectors; ++i)
+        {
+            const int extra = sector[i].extra;
+            if (extra > 0 && extra < kMaxXSectors && xsector[extra].rxID == tx)
+            {
+                found = i;
+                break;
+            }
+        }
+        mechanismReceivers[tx] = found;
+        return found;
+    }
+
     int mechanismSector(const Portal &target, int targetSector) const
     {
+        // A channel names the mechanism outright, whichever surface is used.
+        if (target.wallPush && target.mechanismTx > 0)
+        {
+            const int receiver = mechanismReceiver(target.mechanismTx);
+            if (receiver >= 0)
+                return receiver;
+        }
         if (target.sectorPush && inRange(target.to, 0, numsectors))
             return target.to;
         if (target.sectorPushCurrent && inRange(target.from, 0, numsectors))
@@ -1599,11 +1649,15 @@ struct LLMapperBot::Impl
             if (memory.target.wallPush && hit == 0 && inRange(target, 0, numwalls))
             {
                 const int mechanism = mechanismSector(memory.target, memory.targetSector);
+                if (!inRange(wall[target].extra, 1, kMaxXWalls)
+                    || !xwall[wall[target].extra].triggerPush)
+                    return false;
+                if (memory.target.mechanismTx > 0
+                    && xwall[wall[target].extra].txID == memory.target.mechanismTx)
+                    return true;
                 if (mechanism >= 0
                     && (wall[target].nextsector == mechanism
-                        || wallOwnerSector(target) == mechanism)
-                    && inRange(wall[target].extra, 1, kMaxXWalls)
-                    && xwall[wall[target].extra].triggerPush)
+                        || wallOwnerSector(target) == mechanism))
                     return true;
             }
             if (memory.target.sectorPush && hit == 6 && target == memory.target.to)
@@ -1716,6 +1770,8 @@ struct LLMapperBot::Impl
         const int candidateMechanism = candidate.kind == kInteractionWall
             ? mechanismSector(candidate.target, candidate.targetSector) : -1;
         memory.id = candidateMechanism >= 0 ? candidateMechanism : candidate.id;
+        if (candidateMechanism >= 0 && candidate.targetSector < 0)
+            memory.targetSector = candidateMechanism;
         const bool sideChanged = memory.observed && memory.fromSector != candidate.fromSector;
         // Among several surfaces driving one mechanism, the useful one is the
         // one the player can reach and face right now.
@@ -1783,6 +1839,12 @@ struct LLMapperBot::Impl
             snprintf(detail, sizeof(detail), "kind=%d id=%d before=%d after=%d", int(memory.kind), memory.id,
                      memory.beforeState, newState);
             event("interaction_world_delta", detail);
+            // The bot just changed the world on purpose.  Anything it had
+            // given up on around this mechanism deserves another look: on
+            // AGTST4 the frontier into the door's own sector went dormant
+            // seconds before the door was opened, so when it did open there
+            // was no live opportunity left to carry the bot through it.
+            rearmAroundMechanism(memory);
             lastSemanticProgressTick = observation.tick;
         }
         updateFollowThrough(memory);
@@ -1801,6 +1863,59 @@ struct LLMapperBot::Impl
             // State refresh is local knowledge maintenance.  It does not
             // expose objects in sectors the bot has never observed.
             event("interaction_state_refreshed", "source=known_world_revisit");
+        }
+    }
+
+    // Re-arm work that a mechanism's effect could plausibly have unblocked.
+    // Keyed on the sector the mechanism drives, so this stays a statement
+    // about the machine rather than about any particular map.
+    void rearmAroundMechanism(const InteractionMemory &memory)
+    {
+        const int driven = memory.targetSector >= 0
+            ? memory.targetSector
+            : mechanismSector(memory.target, memory.targetSector);
+        if (!inRange(driven, 0, numsectors))
+            return;
+        int rearmed = 0;
+        const sectortype &record = sector[driven];
+        for (int i = 0; i < record.wallnum; ++i)
+        {
+            const int wallId = record.wallptr + i;
+            if (!inRange(wallId, 0, numwalls))
+                continue;
+            if (suppressedUntil.erase(3000000 + wallId * 8 + int(kObjectiveFrontier)))
+                ++rearmed;
+            suppressionCount.erase(3000000 + wallId * 8 + int(kObjectiveFrontier));
+            const int neighbour = wall[wallId].nextsector;
+            if (inRange(neighbour, 0, numsectors))
+            {
+                failedEdges.erase(wallId * 65536 + neighbour);
+                localFailureSignatures.erase(wallId * 65536 + neighbour);
+                if (inRange(wall[wallId].nextwall, 0, numwalls))
+                {
+                    failedEdges.erase(wall[wallId].nextwall * 65536 + driven);
+                    if (suppressedUntil.erase(3000000 + wall[wallId].nextwall * 8
+                                              + int(kObjectiveFrontier)))
+                        ++rearmed;
+                }
+            }
+        }
+        if (suppressedUntil.erase(4000000 + driven))
+            ++rearmed;
+        navEdgeFailures.erase(
+            std::remove_if(navEdgeFailures.begin(), navEdgeFailures.end(),
+                           [&](const NavEdgeFailure &failure)
+                           {
+                               return failure.wall >= 0 && inRange(failure.wall, 0, numwalls)
+                                   && (wallOwnerSector(failure.wall) == driven
+                                       || wall[failure.wall].nextsector == driven);
+                           }),
+            navEdgeFailures.end());
+        if (rearmed > 0)
+        {
+            char detail[160];
+            snprintf(detail, sizeof(detail), "mechanism_sector=%d rearmed=%d", driven, rearmed);
+            event("opportunities_rearmed_by_world_change", detail);
         }
     }
 
@@ -1825,7 +1940,9 @@ struct LLMapperBot::Impl
         }
         else if (gMe->posture == kPostureStand)
             gStandingClearance = playerBodyClearance();
-        if (lastObservedHealth >= 0 && observation.health < lastObservedHealth)
+        healthLostSinceObservation = lastObservedHealth >= 0
+            ? std::max(0, lastObservedHealth - observation.health) : 0;
+        if (healthLostSinceObservation > 0)
             lastDamageTick = observation.tick;
         lastObservedHealth = observation.health;
         if (observation.sector != lastGeometryTelemetrySector)
@@ -2053,6 +2170,7 @@ struct LLMapperBot::Impl
 
         trackBoundaryStates();
         trackCombatOutcomes();
+        trackEnvironmentalDamage();
         updateLocalCoverage();
 
         for (const Portal &portal : observation.portals)
@@ -2848,6 +2966,8 @@ struct LLMapperBot::Impl
                     continue;
                 if (edge.key && !hasKey(edge.key))
                     continue;
+                if (hazardousSector(edge.to))
+                    continue;
                 int cost = 1;
                 if (!(edge.traversable || edge.jumpable))
                 {
@@ -3087,6 +3207,75 @@ struct LLMapperBot::Impl
                  "wall=%d from=%d to=%d clearance=%d floor_delta=%d reason=no_known_affordance_from_this_side",
                  portal.wall, portal.from, portal.to, portal.clearance, portal.floorDelta);
         event("boundary_inert", detail);
+    }
+
+    bool hazardousSector(int sectorId) const
+    {
+        auto known = hazardSectors.find(sectorId);
+        return known != hazardSectors.end() && observation.tick < known->second;
+    }
+
+    // Somewhere adjacent that is not currently hurting the bot.
+    int escapeHazard() const
+    {
+        int fallback = -1;
+        for (const Portal &portal : observation.portals)
+        {
+            if (portal.from != observation.sector || portal.to == observation.sector)
+                continue;
+            if (!(portal.traversable || portal.jumpable))
+                continue;
+            if (hazardousSector(portal.to))
+                continue;
+            if (doorTiming(portal.to).closing)
+                continue;
+            if (portal.to != lastTransitionFrom)
+                return portal.wall;
+            fallback = portal.wall;
+        }
+        return fallback;
+    }
+
+    // Watch for damage that is not coming from anything the bot could fight.
+    void trackEnvironmentalDamage()
+    {
+        const int lost = healthLostSinceObservation;
+        if (lost <= 0)
+        {
+            if (damageBurstStartTick >= 0
+                && observation.tick - damageBurstStartTick > kDamageBurstWindow)
+            {
+                damageBurstStartTick = -1;
+                damageBurstCount = 0;
+            }
+            return;
+        }
+        if (damageBurstStartTick < 0
+            || observation.tick - damageBurstStartTick > kDamageBurstWindow)
+        {
+            damageBurstStartTick = observation.tick;
+            damageBurstCount = 0;
+            // Health before this observation's loss, so a single heavy hit
+            // registers at once instead of reading as zero damage so far.
+            damageBurstHealth = observation.health + lost;
+        }
+        ++damageBurstCount;
+        const int bled = damageBurstHealth - observation.health;
+        if (damageBurstCount < 3 && bled < kDamageBurstSevere)
+            return;
+        if (selectObject(kObjectEnemy))
+            return;   // something is shooting: that is combat, not terrain
+        if (!inRange(observation.sector, 0, numsectors))
+            return;
+        if (!hazardousSector(observation.sector))
+        {
+            char detail[192];
+            snprintf(detail, sizeof(detail),
+                     "sector=%d hits=%d lost=%d health=%d",
+                     observation.sector, damageBurstCount, bled, observation.health);
+            event("hazard_sector_detected", detail);
+        }
+        hazardSectors[observation.sector] = observation.tick + kHazardAvoidTicks;
     }
 
     // Which boundary of the sector the bot is standing in leads out of it.
@@ -4962,8 +5151,20 @@ struct LLMapperBot::Impl
             }
             if (interaction.engineAccepted && interaction.state == 2)
             {
+                // Stay for the result.  Walking off the moment the engine
+                // accepted the Use meant the bot was elsewhere by the time
+                // the geometry finished moving, so it never observed the
+                // route it had just created and never used it.  Re-pressing
+                // is already blocked while the mechanism moves, so holding
+                // here is safe; the engine's own remaining travel time
+                // bounds the wait.
                 const DoorTiming opening = doorTiming(interaction.targetSector);
-                if (opening.moving && opening.remainingTicks <= kMaxDoorWaitTicks)
+                const bool watchWorthwhile = opening.moving
+                    || (interaction.targetSector >= 0
+                        && !visitedSectors.count(interaction.targetSector)
+                        && observation.tick - interaction.lastActivationTick
+                            < kMechanismSettleTicks);
+                if (watchWorthwhile && opening.remainingTicks <= kMaxDoorWaitTicks)
                 {
                     const int key = interactionMemoryKey(interaction);
                     if (lastInteractionWaitKey != key)
@@ -5546,6 +5747,8 @@ struct LLMapperBot::Impl
                             if (getflorzofslope(sectorId, cx, cy)
                                 - getceilzofslope(sectorId, cx, cy) < required)
                                 continue;
+                            if (blockedBySolidSprite(sectorId, cx, cy))
+                                continue;
                             const int64_t clear = nearestWallDistance2(sectorId, cx, cy);
                             if (clear > bestClearance)
                             {
@@ -5600,6 +5803,28 @@ struct LLMapperBot::Impl
         grid.signature = sectorGeometrySignature(sectorId);
     }
 
+    // Does a solid sprite stand where the player wants to be?  Build's
+    // blocking bit (cstat 1) is the same thing clipmove honours.
+    bool blockedBySolidSprite(int sectorId, int x, int y) const
+    {
+        if (!inRange(sectorId, 0, numsectors))
+            return false;
+        const int reach = playerClipRadius();
+        for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
+             nSprite = nextspritesect[nSprite])
+        {
+            const spritetype &record = sprite[nSprite];
+            if (!(record.cstat & CSTAT_SPRITE_BLOCK))
+                continue;
+            if (gMe && gMe->pSprite && nSprite == gMe->pSprite->index)
+                continue;
+            const int64_t margin = int64_t(reach) + (record.clipdist << 2);
+            if (distance2(x, y, record.x, record.y) < margin * margin)
+                return true;
+        }
+        return false;
+    }
+
     int64_t nearestWallDistance2(int sectorId, int x, int y) const
     {
         const sectortype &sectorRecord = sector[sectorId];
@@ -5625,6 +5850,14 @@ struct LLMapperBot::Impl
         int signature = llmapper::mixHash(17, record.floorz);
         signature = llmapper::mixHash(signature, record.ceilingz);
         signature = llmapper::mixHash(signature, record.wallnum);
+        for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
+             nSprite = nextspritesect[nSprite])
+        {
+            if (!(sprite[nSprite].cstat & CSTAT_SPRITE_BLOCK))
+                continue;
+            signature = llmapper::mixHash(signature, sprite[nSprite].x);
+            signature = llmapper::mixHash(signature, sprite[nSprite].y);
+        }
         for (int i = 0; i < record.wallnum; ++i)
         {
             const int wallId = record.wallptr + i;
@@ -5764,6 +5997,8 @@ struct LLMapperBot::Impl
                 // the corner of a thin obstruction entirely.  Ask the engine
                 // whether the two squares can actually see each other; a
                 // one-sided wall between them blocks the ray.
+                if (blockedBySolidSprite(cell.sector, midX, midY))
+                    continue;
                 const int eyeZ = getflorzofslope(cell.sector, cell.center.x, cell.center.y)
                     - kCoverageEyeOffset;
                 const int otherZ = getflorzofslope(cell.sector, other.center.x, other.center.y)
@@ -7127,6 +7362,20 @@ struct LLMapperBot::Impl
             if (std::abs(delta) < 96)
                 input.forward = 2047;
         }
+        // Travelling: return the view to level.  Nothing ever undid the
+        // downward aim an interaction had asked for, so once the bot had
+        // stooped to look at one low switch it walked the rest of the level
+        // staring at the floor.
+        {
+            const int currentLook = fix16_to_int(gMe->q16look);
+            if (currentLook != 0)
+            {
+                const int correction = std::max(-kLookLevelRate,
+                                                std::min(kLookLevelRate, -currentLook));
+                input.q16mlook = fix16_from_int(correction);
+                noteCameraOwner("NAVIGATION", targetId, targetAngle, 0);
+            }
+        }
         if (use && targetDistance2 < kActionApproachRange * kActionApproachRange
             && std::abs(delta) < 96)
             input.keyFlags.action = 1;
@@ -7416,6 +7665,24 @@ struct LLMapperBot::Impl
         // exploration choice -- but merely passing through an idle door that
         // happens to close on a timer is normal, and treating that as an
         // emergency made the bot bounce in and out of every doorway.
+        if (hazardousSector(observation.sector))
+        {
+            const int out = escapeHazard();
+            const Portal *away = out >= 0 ? portalByWall(out, observation.sector, -1) : nullptr;
+            if (away)
+            {
+                if (currentGoal != "LEAVE_HAZARD")
+                {
+                    char detail[160];
+                    snprintf(detail, sizeof(detail), "sector=%d via_wall=%d to=%d health=%d",
+                             observation.sector, away->wall, away->to, observation.health);
+                    event("leave_hazard", detail);
+                }
+                setGoal("LEAVE_HAZARD", away->wall);
+                return composeInput(intentFromInput(steerPortal(*away)), combat, use);
+            }
+        }
+
         const DoorTiming standingIn = doorTiming(observation.sector);
         if (standingIn.closing)
         {
