@@ -179,6 +179,8 @@ constexpr int kHazardAvoidTicks = 30 * kTicsPerSec;
 // Probes at a surface the engine will not name as a target before the bot
 // goes and tries a different surface of the same mechanism.
 constexpr int kSurfaceRetryProbes = 8;
+// Pitchfork reach, used when a breakable obstacle must be hit by hand.
+constexpr int kMeleeReach = 1024;
 // Slack demanded on top of the body envelope before a gap counts as
 // passable.  A gap exactly the height of the player is not one the engine
 // will move him through.
@@ -235,6 +237,7 @@ struct Portal
     int floorDelta = 0;
     int clearance = 0;
     bool wallPush = false;
+    bool shootable = false;
     bool sectorPush = false;
     bool sectorPushCurrent = false;
     bool directUse = false;
@@ -672,6 +675,7 @@ static Observation observeWorld()
             {
                 const XWALL &extra = xwall[wallRecord.extra];
                 portal.wallPush = extra.triggerPush != 0;
+                portal.shootable = extra.triggerVector != 0 && !extra.isTriggered;
                 portal.mechanismTx = extra.txID;
                 portal.key = extra.key;
                 portal.locked = extra.locked != 0;
@@ -699,7 +703,8 @@ static Observation observeWorld()
             }
             if (sector[portal.from].extra > 0 && sector[portal.from].extra < kMaxXSectors)
                 portal.sectorPushCurrent = xsector[sector[portal.from].extra].Push != 0;
-            portal.interactionAffordance = portal.wallPush || portal.sectorPush || portal.sectorPushCurrent;
+            portal.interactionAffordance = portal.wallPush || portal.sectorPush
+                || portal.sectorPushCurrent || portal.shootable;
             portal.currentlyAvailable = portal.traversable || portal.interactionAffordance;
             if (!portal.currentlyAvailable)
             {
@@ -709,7 +714,25 @@ static Observation observeWorld()
             portal.directUse = (portal.wallPush || portal.sectorPush || portal.sectorPushCurrent)
                 && (!portal.traversable || std::abs(portal.floorDelta) > kMaxWalkableStep);
 
-            if (portal.interactionAffordance)
+            if (portal.shootable)
+            {
+                InteractionCandidate candidate;
+                candidate.kind = kInteractionWall;
+                candidate.id = wallIndex;
+                candidate.fromSector = result.sector;
+                candidate.targetSector = portal.to;
+                candidate.x = midX;
+                candidate.y = midY;
+                candidate.z = midZ;
+                candidate.reversible = false;
+                candidate.target = portal;
+                setInteractionGeometry(candidate.target);
+                candidate.x = candidate.target.x;
+                candidate.y = candidate.target.y;
+                candidate.z = candidate.target.z;
+                result.interactions.push_back(candidate);
+            }
+            else if (portal.interactionAffordance)
             {
                 InteractionCandidate candidate;
                 candidate.kind = kInteractionWall;
@@ -1062,6 +1085,8 @@ struct LLMapperBot::Impl
     struct UseIntent
     {
         bool action = false;
+        bool shoot = false;
+        int weapon = 0;
     };
     std::set<int> jumpFallbackEdges;
     std::set<int> openedRoutes;
@@ -4146,6 +4171,105 @@ struct LLMapperBot::Impl
         return true;
     }
 
+    // Break a wall Blood marks as answering to weapon impact.  Any weapon
+    // will do the job; the pitchfork is the fallback when nothing else is
+    // to hand, since refusing to try it would leave the route shut.
+    GINPUT shootObstacle(InteractionMemory &memory)
+    {
+        setGoal("BREAK_OBSTACLE", memory.id);
+        GINPUT input = {};
+        // Aim at the wall, not at an ActionScan pose.  A push mechanism is
+        // approached along the surface normal and aimed at the middle of the
+        // sector's height; for a shot that means firing at the ceiling, and
+        // from off to one side, at nothing at all.  A wall spans the full
+        // height, so the shot is simply level, straight at its midpoint.
+        const int aimAngle = getangle(memory.x - observation.x, memory.y - observation.y);
+        const int turn = angleDelta(aimAngle, observation.angle);
+        const int horizontal = std::max(1, int(std::sqrt(double(distance2(
+            observation.x, observation.y, memory.x, memory.y)))));
+        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+        const int eyeZ = gMe->pSprite->z - stand.eyeAboveZ;
+        const int aimZ = std::max(memory.target.interactionTopZ + 256,
+                                  std::min(memory.target.interactionBottomZ - 256, eyeZ));
+        const int desiredLook = lookAngleForTarget(eyeZ, aimZ, horizontal);
+        const int lookDelta = desiredLook - fix16_to_int(gMe->q16look);
+
+        int weapon = 0;
+        const bool ranged = rangedWeaponAvailable(weapon);
+        if (!ranged && meleeWeaponAvailable())
+            weapon = kWeaponPitchfork;
+        if (!weapon)
+        {
+            memory.unavailableFromSector = observation.sector;
+            event("break_obstacle_unarmed", "reason=no_weapon_available");
+            return input;
+        }
+        // Melee has to be within reach; a firearm needs a clear shot.  Firing
+        // from wherever the approach happened to stop just buries the burst
+        // in whatever stands between the bot and the target: the ammunition
+        // drains, the aim reads as perfect, and the wall never registers.
+        const bool clearShot = cansee(observation.x, observation.y, eyeZ,
+                                      observation.sector, memory.x, memory.y, aimZ,
+                                      memory.fromSector >= 0 ? memory.fromSector
+                                                             : observation.sector);
+        const int reach = weapon == kWeaponPitchfork ? kMeleeReach : kActionApproachRange * 2;
+        const int distance2ToWall = distance2(observation.x, observation.y,
+                                              memory.x, memory.y);
+        if (distance2ToWall > reach * reach || !clearShot)
+        {
+            noteCameraOwner("NAVIGATION", memory.id, aimAngle, 0);
+            return navigateTo(memory.x, memory.y, memory.z, memory.fromSector,
+                              memory.id, kTraversalUnknown);
+        }
+
+        input.q16turn = fix16_from_int(turn);
+        input.q16mlook = fix16_from_int(lookDelta / 4);
+        noteCameraOwner("BREAK_OBSTACLE", memory.id, aimAngle, desiredLook);
+        if (gMe->curWeapon != weapon)
+        {
+            input.syncFlags.weaponChange = 1;
+            input.newWeapon = uint8_t(weapon);
+            if (memory.activationCount == 0)
+            {
+                char detail[176];
+                snprintf(detail, sizeof(detail), "wall=%d weapon=%d ranged=%d distance=%d",
+                         memory.target.wall, weapon, ranged ? 1 : 0, horizontal);
+                event("break_obstacle_started", detail);
+            }
+            return input;
+        }
+        if (std::abs(turn) < 96 && std::abs(lookDelta) < 96 && clearShot)
+        {
+            input.buttonFlags.shoot = 1;
+            memory.attempted = true;
+            memory.state = 1;
+            memory.lastActivationTick = observation.tick;
+            ++memory.activationCount;
+            if ((memory.activationCount % 8) == 1)
+            {
+                int wallState = -1;
+                int triggered = -1;
+                if (inRange(memory.target.wall, 0, numwalls)
+                    && inRange(wall[memory.target.wall].extra, 1, kMaxXWalls))
+                {
+                    const XWALL &record = xwall[wall[memory.target.wall].extra];
+                    wallState = record.state;
+                    triggered = record.isTriggered;
+                }
+                const int ammo = weapon - 1 >= 0
+                    && weapon - 1 < int(sizeof(gMe->ammoCount) / sizeof(gMe->ammoCount[0]))
+                    ? gMe->ammoCount[weapon - 1] : -1;
+                char detail[256];
+                snprintf(detail, sizeof(detail),
+                         "wall=%d weapon=%d shots=%d state=%d triggered=%d ammo=%d turn=%d look=%d distance=%d",
+                         memory.target.wall, weapon, memory.activationCount,
+                         wallState, triggered, ammo, turn, lookDelta, horizontal);
+                event("break_obstacle_shot", detail);
+            }
+        }
+        return input;
+    }
+
     GINPUT steerInteraction(InteractionMemory &memory)
     {
         if (memory.fromSector != observation.sector)
@@ -4170,6 +4294,9 @@ struct LLMapperBot::Impl
             memory.unavailableFromSector = observation.sector;
             return GINPUT{};
         }
+
+        if (memory.target.shootable)
+            return shootObstacle(memory);
 
         int hit = -1;
         int target = -1;
@@ -7537,6 +7664,13 @@ struct LLMapperBot::Impl
             }
             return input;
         }
+        if (use.weapon && gMe->curWeapon != use.weapon)
+        {
+            input.syncFlags.weaponChange = 1;
+            input.newWeapon = uint8_t(use.weapon);
+        }
+        else if (use.shoot)
+            input.buttonFlags.shoot = 1;
         if (move.valid)
         {
             input.forward = int16_t(move.forward);
@@ -7899,6 +8033,9 @@ struct LLMapperBot::Impl
             GINPUT objectiveInput = executeObjective();
             move = intentFromInput(objectiveInput);
             use.action = objectiveInput.keyFlags.action != 0;
+            use.shoot = objectiveInput.buttonFlags.shoot != 0;
+            use.weapon = objectiveInput.syncFlags.weaponChange
+                ? objectiveInput.newWeapon : 0;
             return composeInput(move, combat, use);
         }
 
