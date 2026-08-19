@@ -800,9 +800,43 @@ static Observation observeWorld()
             {
                 const int radius = gMe && gMe->pSprite
                     ? (gMe->pSprite->clipdist << 2) : 128;
-                int obstruction = solidSpriteAt(portal.from, portal.x, portal.y, radius);
-                if (obstruction < 0)
-                    obstruction = solidSpriteAt(portal.to, portal.x, portal.y, radius);
+                // Sample across the opening rather than only its midpoint.
+                // A barricade often covers part of a doorway and leaves a
+                // gap at one end; judging the whole boundary by its centre
+                // either shuts a passable door or waves the bot at a solid
+                // one.  Where a clear stretch exists, aim at the middle of
+                // that stretch instead of at the middle of the wall.
+                const int samples = 9;
+                int clearFirst = -1;
+                int clearLast = -1;
+                int obstruction = -1;
+                for (int step = 0; step < samples; ++step)
+                {
+                    const int px = portal.x1
+                        + int(int64_t(portal.x2 - portal.x1) * step / (samples - 1));
+                    const int py = portal.y1
+                        + int(int64_t(portal.y2 - portal.y1) * step / (samples - 1));
+                    int hit = solidSpriteAt(portal.from, px, py, radius);
+                    if (hit < 0)
+                        hit = solidSpriteAt(portal.to, px, py, radius);
+                    if (hit >= 0)
+                    {
+                        obstruction = hit;
+                        continue;
+                    }
+                    if (clearFirst < 0)
+                        clearFirst = step;
+                    clearLast = step;
+                }
+                if (clearFirst >= 0 && obstruction >= 0)
+                {
+                    const int middle = (clearFirst + clearLast) / 2;
+                    portal.x = portal.x1
+                        + int(int64_t(portal.x2 - portal.x1) * middle / (samples - 1));
+                    portal.y = portal.y1
+                        + int(int64_t(portal.y2 - portal.y1) * middle / (samples - 1));
+                    obstruction = -1;
+                }
                 if (obstruction >= 0)
                 {
                     portal.walkable = false;
@@ -6291,6 +6325,28 @@ struct LLMapperBot::Impl
             && !grid->second.cells.empty();
     }
 
+    // The closest cell of one walk area -- somewhere the bot can get to on
+    // foot from where it is standing.
+    int nearestNavCellInArea(int x, int y, int area) const
+    {
+        if (area < 0)
+            return -1;
+        int best = -1;
+        int bestDistance = INT32_MAX;
+        for (const NavCell &cell : navCells)
+        {
+            if (cell.walkArea != area)
+                continue;
+            const int currentDistance = distance2(x, y, cell.center.x, cell.center.y);
+            if (currentDistance < bestDistance)
+            {
+                bestDistance = currentDistance;
+                best = cell.id;
+            }
+        }
+        return best;
+    }
+
     int nearestNavCell(int sectorId, int x, int y) const
     {
         const int exact = navCellAt(sectorId, x >> kNavGridShift, y >> kNavGridShift);
@@ -6896,18 +6952,29 @@ struct LLMapperBot::Impl
     {
         ensureNavTopology();
         const int start = nearestNavCell(observation.sector, observation.x, observation.y);
-        // NOTE: this uses the loose lookup, which falls back to the nearest
-        // cell in *any* sector when the destination has none of its own.
-        // That is what makes the bot walk into a wall while aiming at a
-        // sector too narrow to stand in.  navCellInSector() below is the
-        // strict alternative and is correct in principle, but swapping it in
-        // costs AGTST4 two thirds of its exploration -- routes that legitimately
-        // pass through thin geometry stop resolving.  Fixing that properly
-        // means representing thin sectors as real transit rather than as
-        // cells, which is not done yet.
-        const int target = nearestNavCell(targetSector, targetX, targetY);
         if (start < 0)
             return false;
+        int target = navCellInSector(targetSector, targetX, targetY);
+        if (target < 0)
+        {
+            // The mesh holds only sectors the bot has stood in, so a
+            // frontier's far side has no cells of its own.  Aim at the
+            // nearest cell the bot can actually walk to -- one in its own
+            // walk area -- rather than the nearest cell anywhere, which is
+            // routinely across a wall and turns a crossable boundary into an
+            // unreachable one.
+            target = nearestNavCellInArea(targetX, targetY,
+                                          navCells[size_t(start)].walkArea);
+        }
+        // NOTE: the last resort is still the loose lookup, which can land in
+        // another sector entirely.  navCellInSector() above is the strict
+        // answer and is correct in principle, but making it the only answer
+        // costs AGTST4 two thirds of its exploration -- routes that
+        // legitimately pass through thin geometry stop resolving.  Fixing
+        // that properly means representing thin sectors as real transit
+        // rather than as cells, which is not done yet.
+        if (target < 0)
+            target = nearestNavCell(targetSector, targetX, targetY);
         std::vector<NavRouteStep> route;
         if (!llmapper::planNavRoute(navCells, start, target, targetX, targetY, targetSector, -1,
                                     navEdgeFailures, 0, route))
