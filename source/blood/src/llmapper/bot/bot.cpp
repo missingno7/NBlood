@@ -1274,6 +1274,7 @@ struct LLMapperBot::Impl
     mutable std::vector<int> routeGateWall;
     mutable std::vector<int> routeGateSector;
     std::map<int, int> inertBoundaries;
+    std::set<int> narrowSectors;
     std::map<int, bool> boundaryOpen;
     std::map<int, int> boundaryClearance;
     int lastCrossingWall = -1;
@@ -2888,6 +2889,16 @@ struct LLMapperBot::Impl
 
     const Portal *portalByWall(int wall, int from, int to) const
     {
+        // Live observation first.  The cached graph is remembered structure;
+        // its traversability is only as fresh as the last time that boundary
+        // was looked at.  Consulting it first meant a door that had just
+        // opened still read as shut, so the crossing fell through to ordinary
+        // navigation and the bot spent two seconds not going through a door
+        // it was standing in front of -- long enough to be caught by one
+        // that closes.
+        for (const Portal &portal : observation.portals)
+            if (portal.wall == wall && portal.to == to)
+                return &portal;
         auto known = knownGraph.find(from);
         if (known != knownGraph.end())
         {
@@ -2895,9 +2906,6 @@ struct LLMapperBot::Impl
                 if (portal.wall == wall && portal.to == to)
                     return &portal;
         }
-        for (const Portal &portal : observation.portals)
-            if (portal.wall == wall && portal.to == to)
-                return &portal;
         return portalByWallId(wall);
     }
 
@@ -3069,6 +3077,13 @@ struct LLMapperBot::Impl
             {
                 if (portal.to < 0 || visitedSectors.count(portal.to))
                     continue;
+                // A sector with no standable square is thin -- a step, a
+                // ledge, a door track.  The player passes through such a
+                // place rather than standing in it, so it is poor as a
+                // destination but perfectly good as transit, and refusing it
+                // outright severed real routes.
+                if (!sectorHasStandableSpace(portal.to))
+                    noteTooNarrow(portal);
                 const int edgeId = portal.wall * 65536 + portal.to;
                 llmapper::Opportunity opportunity;
                 opportunity.sector = from;
@@ -3232,6 +3247,17 @@ struct LLMapperBot::Impl
                 return &memory;
         }
         return nullptr;
+    }
+
+    void noteTooNarrow(const Portal &portal)
+    {
+        if (!narrowSectors.insert(portal.to).second)
+            return;
+        char detail[176];
+        snprintf(detail, sizeof(detail),
+                 "sector=%d via_wall=%d width=%d reason=no_standable_space_for_player",
+                 portal.to, portal.wall, portal.openingWidth);
+        event("boundary_too_narrow", detail);
     }
 
     void noteInertBoundary(const Portal &portal)
@@ -5847,6 +5873,45 @@ struct LLMapperBot::Impl
         return entry == navCellIndex.end() ? -1 : entry->second;
     }
 
+    // Strict: only ever returns a cell of the sector asked for.
+    int navCellInSector(int sectorId, int x, int y) const
+    {
+        const int exact = navCellAt(sectorId, x >> kNavGridShift, y >> kNavGridShift);
+        if (exact >= 0)
+            return exact;
+        int best = -1;
+        int bestDistance = INT32_MAX;
+        for (const NavCell &cell : navCells)
+        {
+            if (cell.sector != sectorId)
+                continue;
+            const int currentDistance = distance2(x, y, cell.center.x, cell.center.y);
+            if (currentDistance < bestDistance)
+            {
+                bestDistance = currentDistance;
+                best = cell.id;
+            }
+        }
+        return best;
+    }
+
+    // Can the player physically occupy this sector at all?  Answered from
+    // the same body envelope the grid is built with, so a slot narrower than
+    // Caleb is simply not somewhere he can go.
+    bool sectorHasStandableSpace(int sectorId)
+    {
+        if (!inRange(sectorId, 0, numsectors))
+            return false;
+        auto grid = sectorGrids.find(sectorId);
+        if (grid == sectorGrids.end()
+            || grid->second.signature != sectorGeometrySignature(sectorId))
+        {
+            buildNavSector(sectorId);
+            grid = sectorGrids.find(sectorId);
+        }
+        return grid != sectorGrids.end() && !grid->second.cells.empty();
+    }
+
     int nearestNavCell(int sectorId, int x, int y) const
     {
         const int exact = navCellAt(sectorId, x >> kNavGridShift, y >> kNavGridShift);
@@ -5924,13 +5989,14 @@ struct LLMapperBot::Impl
             // the bot plan between columns it can never fit past.  Relax it
             // only where insisting would leave the sector unrepresented,
             // which is the case for small chambers like a doorway.
-            // NOTE: this is half the player's real half-width.  Demanding
-            // the full radius is physically correct and stops the bot
-            // planning between columns it cannot fit past (AGTST5), but it
-            // also costs it the crouch door on AGTST2, which it then reaches
-            // too late and is crushed by.  Half is the setting that keeps
-            // both regression maps passing; the narrow-gap case is a known
-            // gap in the model rather than a solved problem.
+            // NOTE: half the player's real half-width.  The full radius is
+            // physically correct and is what stops the bot planning between
+            // bars it cannot fit past (AGTST5 completes with it, and AGTST4
+            // loses its remaining repeated transitions).  It costs AGTST2,
+            // whose squeeze door does not tolerate the ~2s the bot currently
+            // loses between the door opening and the crossing starting.
+            // Half keeps AGTST1 and AGTST2 passing; see the report for the
+            // measured trade.
             const int64_t margin = pass <= 2 ? int64_t(radius) * radius / 2 : 0;
             const int required = pass < 4 ? clearance : 0;
             int insideSquares = 0;
@@ -5989,6 +6055,48 @@ struct LLMapperBot::Impl
                 grid.cells.clear();
             }
         }
+        // A sector too thin to hold a standable square is still crossed --
+        // a step, a ledge, a door track.  Give it a transit cell at each of
+        // its doorways so routes can pass through, even though nothing will
+        // choose to stand there.  Without this the strict destination lookup
+        // severs every route that runs through such a place.
+        if (grid.cells.empty())
+        {
+            for (int i = 0; i < sectorRecord.wallnum; ++i)
+            {
+                const int wallId = sectorRecord.wallptr + i;
+                if (!inRange(wallId, 0, numwalls) || !inRange(wall[wallId].point2, 0, numwalls))
+                    continue;
+                if (!inRange(wall[wallId].nextsector, 0, numsectors))
+                    continue;
+                const walltype &start = wall[wallId];
+                const walltype &end = wall[start.point2];
+                const int midX = (start.x + end.x) / 2;
+                const int midY = (start.y + end.y) / 2;
+                const int gx = midX >> kNavGridShift;
+                const int gy = midY >> kNavGridShift;
+                bool present = false;
+                for (const GridCell &cell : grid.cells)
+                    if (cell.gx == gx && cell.gy == gy)
+                        present = true;
+                if (present)
+                    continue;
+                GridCell cell;
+                cell.gx = gx;
+                cell.gy = gy;
+                cell.x = midX;
+                cell.y = midY;
+                grid.cells.push_back(cell);
+            }
+            if (!grid.cells.empty())
+            {
+                char detail[128];
+                snprintf(detail, sizeof(detail), "sector=%d transit_cells=%u",
+                         sectorId, unsigned(grid.cells.size()));
+                event("nav_sector_transit_only", detail);
+            }
+        }
+
         // A sector the player is standing in always contains at least the
         // player's own square, even if it is off-grid or too tight above.
         if (observation.sector == sectorId)
@@ -6377,6 +6485,15 @@ struct LLMapperBot::Impl
     {
         ensureNavTopology();
         const int start = nearestNavCell(observation.sector, observation.x, observation.y);
+        // NOTE: this uses the loose lookup, which falls back to the nearest
+        // cell in *any* sector when the destination has none of its own.
+        // That is what makes the bot walk into a wall while aiming at a
+        // sector too narrow to stand in.  navCellInSector() below is the
+        // strict alternative and is correct in principle, but swapping it in
+        // costs AGTST4 two thirds of its exploration -- routes that legitimately
+        // pass through thin geometry stop resolving.  Fixing that properly
+        // means representing thin sectors as real transit rather than as
+        // cells, which is not done yet.
         const int target = nearestNavCell(targetSector, targetX, targetY);
         if (start < 0)
             return false;
