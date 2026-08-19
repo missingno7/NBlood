@@ -162,6 +162,17 @@ constexpr int kMaxActivationAttempts = 3;
 // Longest straight shortcut route smoothing may create.  Long enough to
 // remove grid staircases, short enough that it cannot skip a corner.
 constexpr int kRouteSmoothingSpan = 2048;
+// Upper bound on waiting for one mechanism to finish travelling.  Blood
+// states the real figure per door; this only guards against a mechanism
+// that never settles.
+constexpr int kMaxDoorWaitTicks = 20 * kTicsPerSec;
+// Slack demanded on top of the body envelope before a gap counts as
+// passable.  A gap exactly the height of the player is not one the engine
+// will move him through.
+constexpr int kFitMargin = 512;
+// Largest heading error the bot will walk through rather than pivot for.
+// 512 of 2048 is 90 degrees.
+constexpr int kMoveWhileTurning = 512;
 constexpr int kLookUpLimit = 289;
 constexpr int kLookDownLimit = -347;
 
@@ -1215,6 +1226,8 @@ struct LLMapperBot::Impl
     std::map<int, int> boundaryClearance;
     int lastCrossingWall = -1;
     int lastAcceptedUseTick = -1;
+    int clearingSector = -1;
+    int clearingWall = -1;
     std::set<int> reopenableConnections;
     int openedRouteWall = -1;
     int openedRouteFrom = -1;
@@ -2002,6 +2015,11 @@ struct LLMapperBot::Impl
                          observation.sector, repeatedBacktrackCount);
                 event("repeated_backtrack", detail);
             }
+        }
+        if (clearingSector >= 0 && clearingSector != observation.sector)
+        {
+            clearingSector = -1;
+            clearingWall = -1;
         }
         if (visitedSectors.insert(observation.sector).second)
         {
@@ -2987,6 +3005,9 @@ struct LLMapperBot::Impl
             const int reach = hops[size_t(sectorId)];
             if (reach < 0)
                 continue;
+            // A doorway is a threshold, not a room worth surveying.
+            if (movingSectorHazard(sectorId))
+                continue;
             int cellX = 0;
             int cellY = 0;
             int unobserved = 0;
@@ -3066,6 +3087,102 @@ struct LLMapperBot::Impl
                  "wall=%d from=%d to=%d clearance=%d floor_delta=%d reason=no_known_affordance_from_this_side",
                  portal.wall, portal.from, portal.to, portal.clearance, portal.floorDelta);
         event("boundary_inert", detail);
+    }
+
+    // Which boundary of the sector the bot is standing in leads out of it.
+    // Prefer continuing away from where the bot came from, so leaving a
+    // doorway still counts as making progress rather than retreating.
+    int escapeMovingSector() const
+    {
+        int fallback = -1;
+        for (const Portal &portal : observation.portals)
+        {
+            if (portal.from != observation.sector || portal.to == observation.sector)
+                continue;
+            if (!(portal.traversable || portal.jumpable))
+                continue;
+            if (movingSectorHazard(portal.to))
+                continue;
+            if (portal.to != lastTransitionFrom)
+                return portal.wall;
+            fallback = portal.wall;
+        }
+        return fallback;
+    }
+
+    // The far side of a door sector, entered from `from`.
+    int sectorBeyondDoor(int doorSector, int from) const
+    {
+        if (!inRange(doorSector, 0, numsectors))
+            return -1;
+        const sectortype &record = sector[doorSector];
+        for (int i = 0; i < record.wallnum; ++i)
+        {
+            const int wallId = record.wallptr + i;
+            if (!inRange(wallId, 0, numwalls))
+                continue;
+            const int next = wall[wallId].nextsector;
+            if (inRange(next, 0, numsectors) && next != from && next != doorSector)
+                return next;
+        }
+        return -1;
+    }
+
+    struct DoorTiming
+    {
+        bool moving = false;      // geometry is travelling right now
+        bool closing = false;     // and travelling toward the shut state
+        bool autoCloses = false;  // reverts on its own once it settles
+        int remainingTicks = 0;   // until the current travel finishes
+        int holdTicks = 0;        // how long it stays open once open
+        int openClearance = 0;    // floor-to-ceiling gap when fully open
+    };
+
+    // Blood drives a sector mechanism by stepping `busy` between 0 and
+    // 65536 over 12*busyTime ticks, then posts the reverse command after
+    // 12*waitTime ticks.  Read that rather than inferring it.
+    DoorTiming doorTiming(int sectorId) const
+    {
+        DoorTiming timing;
+        if (!inRange(sectorId, 0, numsectors))
+            return timing;
+        const int extra = sector[sectorId].extra;
+        if (extra <= 0 || extra >= kMaxXSectors)
+            return timing;
+        const XSECTOR &record = xsector[extra];
+        const int busy = int(record.busy) & 0xffff;
+        // Opening is the OFF->ON direction; which one is "open" is decided
+        // by the geometry the two states describe, not by the state number.
+        const int gapOn = record.onFloorZ - record.onCeilZ;
+        const int gapOff = record.offFloorZ - record.offCeilZ;
+        timing.openClearance = std::max(gapOn, gapOff);
+        const bool openingIsOn = gapOn >= gapOff;
+        const int travelToOpen = kTicsPerSec * int(openingIsOn ? record.busyTimeA
+                                                               : record.busyTimeB) / 10;
+        const int travelToShut = kTicsPerSec * int(openingIsOn ? record.busyTimeB
+                                                               : record.busyTimeA) / 10;
+        timing.holdTicks = kTicsPerSec * int(openingIsOn ? record.waitTimeA
+                                                         : record.waitTimeB) / 10;
+        timing.autoCloses = timing.holdTicks > 0;
+        timing.moving = busy != 0;
+        if (!timing.moving)
+            return timing;
+        // `busy` is the fraction travelled toward the ON state.
+        const bool headingOn = record.state != 0;
+        // Walking into a gap that is still widening is fine; walking into
+        // one that is narrowing is how the bot gets crushed.
+        timing.closing = headingOn != openingIsOn;
+        const int travel = (headingOn == openingIsOn) ? travelToOpen : travelToShut;
+        const int fraction = headingOn ? (65536 - busy) : busy;
+        timing.remainingTicks = travel > 0 ? int((int64_t(travel) * fraction) / 65536) : 0;
+        return timing;
+    }
+
+    // Is this sector a piece of machinery the player should not loiter in?
+    bool movingSectorHazard(int sectorId) const
+    {
+        const DoorTiming timing = doorTiming(sectorId);
+        return timing.moving || timing.autoCloses;
     }
 
     // Watch known boundaries flip between blocked and traversable.  This is
@@ -3759,8 +3876,14 @@ struct LLMapperBot::Impl
     bool interactionNeedsReactivation(const InteractionMemory &memory) const
     {
         if (!memory.attempted || !memory.activated || !memory.reversible
-            || !memory.traversed || memory.target.wall < 0
+            || memory.target.wall < 0
             || memory.target.to < 0 || memory.target.from != observation.sector)
+            return false;
+        // Crossing it once is not a precondition for wanting it open again;
+        // a door the bot opened but never reached is exactly the case that
+        // most needs reopening.
+        if (!memory.traversed && !visitedSectors.count(memory.targetSector)
+            && memory.activationCount >= kMaxActivationAttempts)
             return false;
         // Leave alone while it is finishing motion the bot asked for.
         if (memory.activationCount > 0 && interactionStillBusy(memory))
@@ -4839,6 +4962,31 @@ struct LLMapperBot::Impl
             }
             if (interaction.engineAccepted && interaction.state == 2)
             {
+                const DoorTiming opening = doorTiming(interaction.targetSector);
+                if (opening.moving && opening.remainingTicks <= kMaxDoorWaitTicks)
+                {
+                    const int key = interactionMemoryKey(interaction);
+                    if (lastInteractionWaitKey != key)
+                    {
+                        lastInteractionWaitKey = key;
+                        char detail[192];
+                        snprintf(detail, sizeof(detail),
+                                 "kind=%d id=%d target_sector=%d remaining_s=%d hold_s=%d",
+                                 int(interaction.kind), interaction.id,
+                                 interaction.targetSector,
+                                 opening.remainingTicks / kTicsPerSec,
+                                 opening.holdTicks / kTicsPerSec);
+                        event("interaction_waiting_for_settle", detail);
+                    }
+                    // Wait *at* the opening, not wherever the bot happens to
+                    // be, so it can step through the moment there is room.
+                    const Portal *gap = portalByWall(interaction.target.wall,
+                                                     interaction.fromSector,
+                                                     interaction.targetSector);
+                    if (gap)
+                        return steerPortal(*gap);
+                    return GINPUT{};
+                }
                 lastInteractionWaitKey = -1;
                 completeObjective("engine_accepted_and_settled");
                 return GINPUT{};
@@ -6635,16 +6783,39 @@ struct LLMapperBot::Impl
             && portalCrossingPoint(portal, throughX, throughY))
         {
             const TraversalCapability posture = portalPosture(portal);
-            if (posture == kTraversalCurrentlyUnavailable)
+            const DoorTiming beyond = doorTiming(portal.to);
+            if (posture == kTraversalCurrentlyUnavailable || beyond.closing)
             {
                 // The opening is not passable yet.  Face it and wait rather
                 // than walking into it: pushing at a door that is still
                 // moving is how the bot ended up shouldering a closing door
                 // on the way back instead of ducking under an open one.
+                // Wait at the threshold, not back in the room.  Waiting
+                // where it happened to be standing meant the bot only began
+                // walking once the door was open, and arrived as it shut.
                 GINPUT hold = {};
-                hold.q16turn = fix16_from_int(angleDelta(
-                    getangle(throughX - observation.x, throughY - observation.y),
-                    observation.angle));
+                const int toGap = angleDelta(
+                    getangle(portal.x - observation.x, portal.y - observation.y),
+                    observation.angle);
+                hold.q16turn = fix16_from_int(toGap);
+                const int stand = playerClipRadius() + 192;
+                if (distance2(observation.x, observation.y, portal.x, portal.y)
+                        > stand * stand
+                    && std::abs(toGap) < 96)
+                    hold.forward = 2047;
+                // The engine already says how much room this will leave.
+                const DoorTiming ahead = doorTiming(portal.to);
+                const bool willNeedCrouch = ahead.openClearance > 0
+                    && ahead.openClearance < playerStandingClearance();
+                if (willNeedCrouch)
+                {
+                    hold.buttonFlags.crouch = 1;
+                    if (!crouchTargetActive)
+                    {
+                        crouchTargetActive = true;
+                        event("crouch_started", "reason=door_will_open_low");
+                    }
+                }
                 if (lastCrossingWall != -portal.wall - 1)
                 {
                     lastCrossingWall = -portal.wall - 1;
@@ -6938,13 +7109,24 @@ struct LLMapperBot::Impl
             if (gMe && gMe->posture == kPostureCrouch)
                 event("crouch_posture_observed", "phase=MOVE_CROUCHED");
         }
-        // The bot has no mouse inertia to model. Aim the player/camera at the
-        // target in one correction, then let the next frame issue Use once the
-        // observed heading confirms alignment.
+        // Aim the camera at the target, but do not stop to do it.
+        //
+        // Requiring the heading to be within ~17 degrees before applying any
+        // forward input made the bot halt and pivot on the spot every time a
+        // new objective pointed somewhere other than straight ahead -- the
+        // "look back, look front, then continue" that shows up at every
+        // doorway, and which is fatal in one that closes.  A player walks and
+        // turns at once, so decompose the direction of travel into the
+        // engine's current forward/strafe basis and keep moving while the
+        // turn resolves.
         input.q16turn = fix16_from_int(delta);
         const int targetDistance2 = distance2(observation.x, observation.y, x, y);
-        if (std::abs(delta) < 96 && (!use || targetDistance2 > kUseStopRange * kUseStopRange))
-            input.forward = 2047;
+        if (!use || targetDistance2 > kUseStopRange * kUseStopRange)
+        {
+            // Turn toward the target and walk once roughly facing it.
+            if (std::abs(delta) < 96)
+                input.forward = 2047;
+        }
         if (use && targetDistance2 < kActionApproachRange * kActionApproachRange
             && std::abs(delta) < 96)
             input.keyFlags.action = 1;
@@ -7229,6 +7411,44 @@ struct LLMapperBot::Impl
             return composeInput(move, combat, use);
         }
 
+        // Standing in a doorway while it is actually travelling is how the
+        // bot gets crushed.  Getting out then is more urgent than any
+        // exploration choice -- but merely passing through an idle door that
+        // happens to close on a timer is normal, and treating that as an
+        // emergency made the bot bounce in and out of every doorway.
+        const DoorTiming standingIn = doorTiming(observation.sector);
+        if (standingIn.closing)
+        {
+            if (clearingSector != observation.sector)
+            {
+                clearingSector = observation.sector;
+                clearingWall = escapeMovingSector();
+                if (clearingWall >= 0)
+                {
+                    char detail[208];
+                    snprintf(detail, sizeof(detail),
+                             "sector=%d via_wall=%d moving=%d auto_closes=%d remaining_s=%d hold_s=%d",
+                             observation.sector, clearingWall, standingIn.moving ? 1 : 0,
+                             standingIn.autoCloses ? 1 : 0,
+                             standingIn.remainingTicks / kTicsPerSec,
+                             standingIn.holdTicks / kTicsPerSec);
+                    event("clear_moving_sector", detail);
+                }
+            }
+            const Portal *out = clearingWall >= 0
+                ? portalByWall(clearingWall, observation.sector, -1) : nullptr;
+            if (out)
+            {
+                setGoal("CLEAR_MOVING_SECTOR", out->wall);
+                return composeInput(intentFromInput(steerPortal(*out)), combat, use);
+            }
+        }
+        else if (clearingSector == observation.sector)
+        {
+            clearingSector = -1;
+            clearingWall = -1;
+        }
+
         // One selection point, one commitment, one reason.
         //
         // The bot keeps executing the mission it already chose.  It only
@@ -7300,6 +7520,7 @@ struct LLMapperBot::Impl
                 exploreDestination = openedRouteTo;
                 exploreCrossingWall = openedRouteWall;
                 exploreCrossingFrom = openedRouteFrom;
+
                 if (currentObjective.active)
                     invalidateObjective("superseded_by_opened_route", false);
                 selectObjective(objective, "CONSUME_OPENED_ROUTE");
