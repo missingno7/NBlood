@@ -187,6 +187,9 @@ constexpr int kHazardAvoidTicks = 30 * kTicsPerSec;
 // Probes at a surface the engine will not name as a target before the bot
 // goes and tries a different surface of the same mechanism.
 constexpr int kSurfaceRetryProbes = 8;
+// Ground that has to be covered before the bot counts as having closed on a
+// target.  Linear, in world units: a quarter of a navigation grid square.
+constexpr int kProgressStep = 24;
 // Pitchfork reach, used when a breakable obstacle must be hit by hand.
 constexpr int kMeleeReach = 1024;
 constexpr int kLookUpLimit = 289;
@@ -1885,7 +1888,13 @@ struct LLMapperBot::Impl
             memory.unavailableAttempts = 0;
             memory.unavailablePose = 0;
         }
-        if (memory.state == 1 && newState != memory.beforeState)
+        // One delta per activation, not one per observation.  An activation
+        // transaction begins when the bot acts and ends when the world
+        // answers; without that bound a burst of shots at one wall
+        // rediscovered the same effect every tick, and each rediscovery
+        // refreshed the semantic-progress clock and hid a real stall.
+        if (memory.state == 1 && !memory.observedKnownWorldDelta
+            && newState != memory.beforeState)
         {
             memory.state = 2;
             memory.activated = true;
@@ -4415,7 +4424,17 @@ struct LLMapperBot::Impl
         {
             input.buttonFlags.shoot = 1;
             memory.attempted = true;
-            memory.state = 1;
+            // One transaction covers the whole burst.  Re-snapshotting the
+            // pre-state for every projectile meant the bot never had a fixed
+            // "before" to compare against, so the same effect was discovered
+            // over and over and the shooting never concluded.
+            if (memory.activationCount == 0)
+            {
+                memory.beforeState = interactionStateSignature(memory);
+                memory.observedKnownWorldDelta = false;
+            }
+            if (memory.state != 2)
+                memory.state = 1;
             memory.lastActivationTick = observation.tick;
             ++memory.activationCount;
             if ((memory.activationCount % 8) == 1)
@@ -4469,7 +4488,18 @@ struct LLMapperBot::Impl
         }
 
         if (memory.target.shootable)
+        {
+            // Once the wall has answered, stop.  A vector-activated wall is
+            // not necessarily destroyed by the first hit, but it has done
+            // something, and continuing to fire is ammunition spent on a
+            // solved problem.
+            if (memory.state == 2 || memory.observedKnownWorldDelta)
+            {
+                event("break_obstacle_answered", "reason=world_delta_observed");
+                return GINPUT{};
+            }
             return shootObstacle(memory);
+        }
 
         int hit = -1;
         int target = -1;
@@ -5563,6 +5593,15 @@ struct LLMapperBot::Impl
                 invalidateObjective("interaction_rejected");
                 return GINPUT{};
             }
+            // A vector activation has no Use for the engine to accept, so it
+            // reports its own success: the world answering is the whole of
+            // the evidence there is.
+            if (interaction.target.shootable
+                && (interaction.state == 2 || interaction.observedKnownWorldDelta))
+            {
+                completeObjective("vector_activation_answered");
+                return GINPUT{};
+            }
             return steerInteraction(interaction);
         }
         if (currentObjective.type == kObjectiveFrontier
@@ -5782,10 +5821,32 @@ struct LLMapperBot::Impl
 
         const int currentDistance2 = distance2(observation.x, observation.y,
                                                movementTargetX, movementTargetY);
-        const bool horizontalProgress = currentDistance2 + 4096 < targetBestDistance2;
+        // Compare distances, not squares of distances.  A fixed slack on d^2
+        // is a different amount of ground at every range: eighty units out
+        // it means real movement, eight thousand units out a single step
+        // clears it, so almost anything counted as closing on the target and
+        // the stuck detector never fired.
+        const int currentDistance = int(std::sqrt(double(currentDistance2)));
+        const int bestDistance = int(std::sqrt(double(targetBestDistance2)));
+        // Closing on the target: strictly nearer than the bot has yet been.
+        const bool horizontalProgress = bestDistance - currentDistance >= kProgressStep;
         const bool verticalProgress = std::abs(observation.z - targetLastZ) >= 256;
-        const bool sectorProgress = movementTargetSector >= 0 && observation.sector != movementTargetSector;
-        if (horizontalProgress || verticalProgress)
+        // Arriving in the target sector is progress.  This read the other way
+        // round, so being anywhere else counted as having got somewhere --
+        // which reset the jump budget after every failed hop.
+        const bool sectorProgress = movementTargetSector >= 0
+            && observation.sector == movementTargetSector;
+        // Walking is not the same as closing, and the two answer different
+        // questions.  The stuck detector asks whether the bot is going
+        // anywhere at all -- a detour round a corner runs away from the
+        // target for a while and is still perfectly good movement -- while
+        // the jump budget and the record distance ask whether it is getting
+        // nearer.  Conflating them either strands the bot on every concave
+        // room or lets it bounce in place for ever.
+        const int stepped = int(std::sqrt(double(distance2(
+            observation.x, observation.y, targetLastX, targetLastY))));
+        const bool moving = stepped >= kProgressStep;
+        if (horizontalProgress || sectorProgress)
         {
             if (jumpAttempts > 0)
             {
@@ -5793,15 +5854,27 @@ struct LLMapperBot::Impl
                 snprintf(detail, sizeof(detail), "target=%d dx=%d dy=%d dz=%d attempts=%d",
                          movementTargetId, observation.x - targetLastX, observation.y - targetLastY,
                          observation.z - targetLastZ, jumpAttempts);
-                event(horizontalProgress || sectorProgress ? "jump_succeeded" : "jump_progress", detail);
-                if (horizontalProgress || sectorProgress)
-                    jumpAttempts = 0;
+                event("jump_succeeded", detail);
+                jumpAttempts = 0;
             }
+            targetBestDistance2 = std::min(targetBestDistance2, currentDistance2);
+        }
+        else if (jumpAttempts > 0 && verticalProgress)
+        {
+            // Height alone is not traversal.  Report it, but do not let it
+            // buy another jump.
+            char detail[128];
+            snprintf(detail, sizeof(detail), "target=%d dx=%d dy=%d dz=%d attempts=%d",
+                     movementTargetId, observation.x - targetLastX, observation.y - targetLastY,
+                     observation.z - targetLastZ, jumpAttempts);
+            event("jump_progress", detail);
+        }
+        if (horizontalProgress || verticalProgress || moving)
+        {
             targetLastX = observation.x;
             targetLastY = observation.y;
             targetLastZ = observation.z;
             targetLastDistance2 = currentDistance2;
-            targetBestDistance2 = std::min(targetBestDistance2, currentDistance2);
             targetLastProgressTick = observation.tick;
         }
     }
