@@ -80,7 +80,9 @@ def classify_stop(result: str, mode: str, recent: collections.Counter,
             + recent["interaction_refused"]):
         return "interaction_unresolved"
     if (recent["nav_route_unavailable"] + recent["route_step_failed"]
-            + recent["nav_edge_rejected"] + recent["stationary_deadlock"]):
+            + recent["nav_edge_rejected"] + recent["stationary_deadlock"]
+            + recent["local_portal_failed"]
+            + recent["navigation_escape_failed"]):
         return "navigation_dead_end"
     if recent["jump_traversal"] >= 5:
         return "traversal_execution_stall"
@@ -247,6 +249,12 @@ def summarize_run(map_name: str, mode: str, telemetry: Path,
             "repeated_target_selections": repeat_selections,
             "route_plans": counts["nav_route_selected"],
             "route_plan_failures": counts["nav_route_unavailable"],
+            "portal_plan_failures": counts["local_portal_failed"],
+            "escape_route_failures": counts["navigation_escape_failed"],
+            "interaction_route_failures": sum(
+                1 for row in rows
+                if row.get("event") == "interaction_unavailable"
+                and "NO_ROUTE_TO_APPROACH" in str(row.get("detail", ""))),
             "edge_rejections": counts["nav_edge_rejected"] + counts["route_step_failed"],
             "objective_timeouts": counts["objective_budget_exhausted"],
             "opportunity_suppressions": counts["opportunity_dormant"],
@@ -286,6 +294,9 @@ def flatten(row: dict) -> dict:
         "interactions_activated": objects["interactions_activated"],
         "route_plans": nav["route_plans"],
         "route_failures": nav["route_plan_failures"],
+        "portal_failures": nav["portal_plan_failures"],
+        "escape_failures": nav["escape_route_failures"],
+        "interaction_route_failures": nav["interaction_route_failures"],
         "repeat_selections": nav["repeated_target_selections"],
         "loop_breaks": nav["loop_breaks"],
         "topology_rebuilds": nav["topology_rebuilds"],

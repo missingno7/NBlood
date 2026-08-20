@@ -4130,7 +4130,7 @@ struct LLMapperBot::Impl
         return localFailureSignatures.count(edgeId) != 0 || failure->second.attempts > 0;
     }
 
-    void recordEdgeFailure(const Portal &portal, const char *eventName, const char *reason)
+    bool recordEdgeFailure(const Portal &portal, const char *eventName, const char *reason)
     {
         // Geometry in motion is not evidence about a boundary.  Failing to
         // get through a door mid-travel says only that the bot arrived at
@@ -4144,7 +4144,7 @@ struct LLMapperBot::Impl
                      "wall=%d from=%d to=%d reason=%s evidence=geometry_in_motion",
                      portal.wall, portal.from, portal.to, reason);
             event("edge_failure_withheld", pending);
-            return;
+            return false;
         }
         const int edgeId = portal.wall * 65536 + portal.to;
         EdgeFailure &failure = failedEdges[edgeId];
@@ -4162,6 +4162,7 @@ struct LLMapperBot::Impl
         snprintf(detail, sizeof(detail), "wall=%d from=%d to=%d reason=%s attempts=%d signature=%d",
                  portal.wall, portal.from, portal.to, reason, failure.attempts, signature);
         event(eventName, detail);
+        return true;
     }
 
     const Portal *selectPortal()
@@ -5016,6 +5017,9 @@ struct LLMapperBot::Impl
             if (!(portal.traversable || portal.jumpable))
                 continue;
             if (movingSectorHazard(portal.to))
+                continue;
+            const int edgeId = portal.wall * 65536 + portal.to;
+            if (edgeFailed(edgeId) || localEdgeFailed(edgeId))
                 continue;
             if (portal.to != lastTransitionFrom)
                 return portal.wall;
@@ -6820,6 +6824,19 @@ struct LLMapperBot::Impl
             // Neither the known directed transport graph nor the local mesh
             // currently reaches the required approach layer.
             memory.unavailableFromSector = observation.sector;
+            memory.unavailableState = interactionStateSignature(memory);
+            memory.unavailablePose = navTopologyRevision;
+            char unavailable[192];
+            snprintf(unavailable, sizeof(unavailable),
+                     "kind=%d id=%d from=%d required=%d topology=%d reason=NO_ROUTE_TO_APPROACH",
+                     int(memory.kind), memory.id, observation.sector,
+                     requiredApproachSector, navTopologyRevision);
+            event("interaction_unavailable", unavailable);
+            // Route lifetime and objective lifetime are distinct.  Retain the
+            // useful interaction in memory, but release this execution
+            // attempt so other ledger work can run.  Suppression evidence
+            // will re-arm it after topology/knowledge changes or cooldown.
+            invalidateObjective("interaction_approach_unreachable");
             return GINPUT{};
         }
 
@@ -9028,7 +9045,7 @@ struct LLMapperBot::Impl
             if (record.extra > 0 && record.extra < kMaxXSectors)
             {
                 signature = signature * 31 + xsector[record.extra].state;
-                signature = signature * 31 + xsector[record.extra].busy;
+                signature = signature * 31 + (xsector[record.extra].busy != 0);
             }
             for (int i = 0; i < record.wallnum; ++i)
             {
@@ -9048,7 +9065,7 @@ struct LLMapperBot::Impl
                 if (wallRecord.extra > 0 && wallRecord.extra < kMaxXWalls)
                 {
                     signature = signature * 31 + xwall[wallRecord.extra].state;
-                    signature = signature * 31 + xwall[wallRecord.extra].busy;
+                    signature = signature * 31 + (xwall[wallRecord.extra].busy != 0);
                 }
             }
         }
@@ -10533,6 +10550,12 @@ struct LLMapperBot::Impl
         if (!llmapper::planNavRoute(navCells, start, target, targetX, targetY, targetSector, -1,
                                     navEdgeFailures, 0, route))
         {
+            // This graph has already answered this exact question.  Keep the
+            // negative result for the lifetime of the current navigation
+            // state instead of running the same full search again from every
+            // caller and every decision frame.  resetNavigation() clears the
+            // verdict when the objective or its world evidence changes.
+            navRouteRejectedSignature = signature;
             char failure[224];
             snprintf(failure, sizeof(failure),
                      "start_cell=%d goal_cell=%d dest_sector=%d want=(%d,%d) cells=%u failures=%u start_area=%d goal_area=%d",
@@ -10543,6 +10566,7 @@ struct LLMapperBot::Impl
             event("nav_route_unavailable", failure);
             return false;
         }
+        navRouteRejectedSignature = 0;
         smoothNavRoute(route);
         navRoute = route;
         navRouteIndex = 0;
@@ -11294,17 +11318,71 @@ struct LLMapperBot::Impl
                                capability);
             }
         }
-        if (navigationFailureSignature != signature)
+        int failureSignature = signature;
+        if (currentObjective.active
+            && currentObjective.type == kObjectiveInteraction)
         {
-            navigationFailureSignature = signature;
+            // A moving actuator changes its world-space approach point every
+            // frame, but that is not evidence that a stationary player has
+            // made progress toward it.  Own repeated failure by the stable
+            // work identity, the player's coarse physical pose, and the
+            // topology that answered the route query.  Actual movement or a
+            // rebuilt topology still reopens the question.
+            failureSignature = llmapper::mixHash(
+                objectiveKey(currentObjective), observation.sector);
+            failureSignature = llmapper::mixHash(
+                failureSignature, observation.x >> kNavGridShift);
+            failureSignature = llmapper::mixHash(
+                failureSignature, observation.y >> kNavGridShift);
+            failureSignature = llmapper::mixHash(
+                failureSignature, navTopologyRevision);
+        }
+        else if (!currentObjective.active
+                 && currentGoal == "CLEAR_MOVING_SECTOR")
+        {
+            // Emergency egress is also stable work even when the portal
+            // itself is moving.  Its changing midpoint must not erase the
+            // fact that the player is stationary and this escape hypothesis
+            // has no route from the current topology.
+            failureSignature = llmapper::mixHash(
+                currentGoalTarget, observation.sector);
+            failureSignature = llmapper::mixHash(
+                failureSignature, observation.x >> kNavGridShift);
+            failureSignature = llmapper::mixHash(
+                failureSignature, observation.y >> kNavGridShift);
+            failureSignature = llmapper::mixHash(
+                failureSignature, navTopologyRevision);
+        }
+        if (navigationFailureSignature != failureSignature)
+        {
+            navigationFailureSignature = failureSignature;
             navigationFailureCount = 0;
         }
         ++navigationFailureCount;
         if (navigationFailureCount == 1)
             event("navigation_failed", "reason=no_bounded_collision_safe_detour");
-        if (navigationFailureCount >= kNavigationFailureLimit && currentObjective.active
-            && currentObjective.type != kObjectiveInteraction
-            && currentObjective.type != kObjectiveInvestigate)
+        if (navigationFailureCount >= kNavigationFailureLimit
+            && !currentObjective.active
+            && currentGoal == "CLEAR_MOVING_SECTOR"
+            && clearingWall >= 0)
+        {
+            const Portal *failedEscape = portalByWall(
+                clearingWall, observation.sector, -1);
+            if (failedEscape
+                && recordEdgeFailure(*failedEscape, "navigation_escape_failed",
+                                     "no_bounded_route_to_exit"))
+            {
+                event("moving_sector_escape_reconsidered",
+                      "reason=selected_exit_route_unavailable");
+                clearingWall = -1;
+                resetNavigation();
+                currentGoal.clear();
+                currentGoalTarget = -1;
+            }
+        }
+        else if (navigationFailureCount >= kNavigationFailureLimit
+                 && currentObjective.active
+                 && currentObjective.type != kObjectiveInvestigate)
         {
             event("navigation_failed_bounded", "reason=objective_temporarily_unreachable");
             if (currentObjective.active && currentObjective.type == kObjectiveFrontier)
@@ -12466,7 +12544,18 @@ struct LLMapperBot::Impl
                     movementTargetActive = false;
                     return steerPortal(portal);
                 }
-                recordEdgeFailure(portal, "local_portal_failed", "bounded_collision_safe_approaches_exhausted");
+                if (!localEdgeFailed(edgeId)
+                    && recordEdgeFailure(portal, "local_portal_failed",
+                                         "bounded_collision_safe_approaches_exhausted")
+                    && currentObjective.active)
+                {
+                    // The physical route has exhausted its bounded poses.
+                    // Keeping the objective active only calls this same
+                    // settled failure again next frame; make the work dormant
+                    // while preserving it for changed geometry or backoff.
+                    invalidateObjective("local_portal_failed");
+                    return GINPUT{};
+                }
                 movementTargetActive = false;
             }
         }
@@ -13279,7 +13368,7 @@ struct LLMapperBot::Impl
         if ((standingIn.closing && !sectorSweptOccupancySafe(observation.sector))
             || loiteringInMechanism)
         {
-            if (clearingSector != observation.sector)
+            if (clearingSector != observation.sector || clearingWall < 0)
             {
                 clearingSector = observation.sector;
                 clearingWall = escapeMovingSector();
