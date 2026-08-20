@@ -566,16 +566,16 @@ void ctrlGetInput(void)
         input.forward = 0;
         input.strafe = 0;
     }
-    gInput.forward = clamp(gInput.forward + input.forward, -2048, 2048);
-    gInput.strafe = clamp(gInput.strafe + input.strafe, -2048, 2048);
+    gInput.forward = clamp(gInput.forward + input.forward, -kMaxMoveInput, kMaxMoveInput);
+    gInput.strafe = clamp(gInput.strafe + input.strafe, -kMaxMoveInput, kMaxMoveInput);
     gInput.q16turn = fix16_sadd(gInput.q16turn, input.q16turn);
     gInput.q16mlook = fix16_clamp(fix16_sadd(gInput.q16mlook, input.q16mlook), F16(-127)>>2, F16(127)>>2);
     if (gMe && gMe->pXSprite->health != 0 && !gPaused)
     {
-        CONSTEXPR int upAngle = 289;
-        CONSTEXPR int downAngle = -347;
-        CONSTEXPR double lookStepUp = 4.0*upAngle/60.0;
-        CONSTEXPR double lookStepDown = -4.0*downAngle/60.0;
+        CONSTEXPR int upAngle = kLookUpLimit;
+        CONSTEXPR int downAngle = kLookDownLimit;
+        CONSTEXPR double lookStepUp = 4.0*upAngle/double(kLookLimitVanilla);
+        CONSTEXPR double lookStepDown = -4.0*downAngle/double(kLookLimitVanilla);
         gViewAngle = (gViewAngle + input.q16turn + fix16_from_float(scaleAdjustmentToInterval(gViewAngleAdjust))) & 0x7ffffff;
         if (gViewLookRecenter)
         {

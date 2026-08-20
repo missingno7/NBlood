@@ -4599,7 +4599,7 @@ void MoveDude(spritetype *pSprite)
 
     if (pSprite->flags & 2)
     {
-        int vc = 58254;
+        int vc = kDudeGravity;
         if (bDepth)
         {
             if (bUnderwater)
@@ -4841,7 +4841,7 @@ void MoveDude(spritetype *pSprite)
                 if (nDamage > (30<<4))
                     sfxPlay3DSound(pSprite, 701, 0, 0);
             }
-            nDamage -= 100<<4;
+            nDamage -= kFallDamageFloor;
             if (nDamage > 0)
                 actDamageSprite(nSprite, pSprite, kDamageFall, nDamage);
             zvel[nSprite] = v30;
@@ -4918,11 +4918,11 @@ void MoveDude(spritetype *pSprite)
         int nXSector = sector[pSprite->sectnum].extra;
         if (nXSector > 0 && xsector[nXSector].Underwater)
             return;
-        if (pXSprite->height >= 0x100)
+        if (pXSprite->height >= kDudeAirborneHeight)
             return;
         int nDrag = gDudeDrag;
         if (pXSprite->height > 0)
-            nDrag -= scale(gDudeDrag, pXSprite->height, 0x100);
+            nDrag -= scale(gDudeDrag, pXSprite->height, kDudeAirborneHeight);
         xvel[nSprite] -= mulscale16r(xvel[nSprite], nDrag);
         yvel[nSprite] -= mulscale16r(yvel[nSprite], nDrag);
 

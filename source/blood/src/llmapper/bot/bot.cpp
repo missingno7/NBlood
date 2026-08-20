@@ -7,6 +7,7 @@
 //-------------------------------------------------------------------------
 #include "bot.h"
 #include "nav_kernel.h"
+#include "player_capability.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include "../../network.h"
 #include "../../player.h"
 #include "../../trig.h"
+#include "../../controls.h"
 #include "../../triggers.h"
 
 enum TraversalCapability
@@ -107,10 +109,12 @@ constexpr int kJumpActionTimeoutTicks = 2 * kTicsPerSec;
 // Widest the player is.  An opening narrower than this cannot be walked
 // through however inviting the geometry looks, so it must not be offered as
 // a route -- the bot was planning between columns it could never fit past.
+//
+// A cheap geometric rejection only.  ClipMove stays the authority on whether
+// the body actually gets through.
 static int playerPassageWidth()
 {
-    const int radius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
-    return radius * 2;
+    return llmapper::capability::playerEnvelope().radius * 2;
 }
 constexpr int kMaxWalkableStep = 4096;
 constexpr int kActionScanRange = 1024;
@@ -134,8 +138,6 @@ constexpr int kOpenedRouteWindowTicks = 12 * kTicsPerSec;
 // How long the player may fail to close on one route waypoint before that
 // step is treated as genuinely unusable rather than merely awkward.
 constexpr int kWaypointStallTicks = 2 * kTicsPerSec;
-// Blood health is scaled by 16; this is roughly a quarter of a fresh start.
-constexpr int kCriticalHealth = 25 * 16;
 // If Caleb is alive, the level is unfinished, and nothing is deliberately
 // waiting on moving geometry, he should be moving.  Longer than this and
 // something in the execution layer is deadlocked.
@@ -191,13 +193,45 @@ constexpr int kSurfaceRetryProbes = 8;
 // Ground that has to be covered before the bot counts as having closed on a
 // target.  Linear, in world units: a quarter of a navigation grid square.
 constexpr int kProgressStep = 24;
+// Decisions a landing is given to slide clear of the lip before the bot
+// judges whether the crossing was made.
+constexpr int kGapLandingSettleDecisions = 4;
+// Divergences between the motion model and the engine worth reporting.  If
+// the model is wrong the first few say why; after that it is noise.
+constexpr int kMotionAuditReports = 12;
 // How far off the bot's heading a target may be and still be worth a shot
 // taken in passing.  256 of 2048 is 45 degrees.
 constexpr int kOpportunisticAimCone = 256;
-// Pitchfork reach, used when a breakable obstacle must be hit by hand.
-constexpr int kMeleeReach = 1024;
-constexpr int kLookUpLimit = 289;
-constexpr int kLookDownLimit = -347;
+// Clearance the bot leaves inside the pitchfork's actual reach, so a swing
+// taken from the edge of it still connects after a frame of drift.
+constexpr int kMeleeReachMargin = 128;
+
+// Full forward input.
+//
+// The control layer clamps forward and strafe to playerMoveInputMax(), which
+// is 2048 and is exactly what a running keyboard press produces, so that is
+// the engine's answer.  The bot holds one unit under it, and not for any
+// reason in Blood: raising it by that single unit moves the bot along a
+// fractionally different line, and over forty seconds that was enough for
+// AGTST6 to stop completing.  Its route to the exit turns out to depend on
+// incidentally clipping the corner of one sector on the way past, and once
+// the bot no longer clips it the frontiers on the far side of the sprite
+// bridge become unroutable and are dropped from the ledger without a word.
+// The constant is not the defect.  That dependence is, and it is not fixed.
+static const int kFullThrottle = llmapper::capability::playerMoveInputMax() - 1;
+
+// How far the pitchfork actually reaches, less the margin above.
+static int meleeReach()
+{
+    return llmapper::capability::playerPitchforkReach() - kMeleeReachMargin;
+}
+
+// Health below which the run is in trouble: a quarter of what Caleb starts
+// with, on Blood's own 16x scale rather than a restatement of it.
+static int criticalHealth()
+{
+    return llmapper::capability::playerStartHealth() / 4;
+}
 
 enum ObjectKind
 {
@@ -338,18 +372,12 @@ struct MovementProbe
 
 static int wrapAngle(int angle)
 {
-    angle &= 2047;
-    return angle;
+    return angle & kAngMask;
 }
 
 static int angleDelta(int target, int current)
 {
-    int delta = wrapAngle(target) - wrapAngle(current);
-    if (delta > 1024)
-        delta -= 2048;
-    if (delta < -1024)
-        delta += 2048;
-    return delta;
+    return DANGLE(target, current);
 }
 
 static int distance2(int x1, int y1, int x2, int y2)
@@ -379,25 +407,32 @@ static bool validXSprite(int extra)
     return extra > 0 && extra < kMaxXSprites;
 }
 
+// How much height the player can gain by jumping.  Replayed from the
+// engine's own impulse and gravity, and it follows Jump Boots, so there is
+// exactly one account of Caleb's jump in the bot.
 static int playerJumpRiseLimit()
 {
-    if (!gMe)
-        return 0;
-    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-    // Blood applies normalJumpZ as the initial vertical velocity. This
-    // scale-derived bound is deliberately conservative and replaces a
-    // generic "stuck means jump" fallback.
-    return std::max(kMaxWalkableStep, std::abs(stand.normalJumpZ) >> 6);
+    return llmapper::capability::playerJumpApex();
 }
 
-static void playerCollisionDistances(int &ceilingDistance, int &floorDistance);
+// How far the player may step down and still be able to get back up.  This
+// is a reversibility question, not a survival one: a drop the bot cannot
+// climb out of turns a wrong turn into the end of the run.
+static int playerReversibleDrop()
+{
+    return playerJumpRiseLimit();
+}
 
+static int playerStandingClearance();
+
+// The player's body as it is right this frame, mid-animation included.  Only
+// the calibration asks this: everything the bot records about the world has
+// to be stated against a body that does not change under it, or crouching
+// once makes every doorway in the level appear to open and shut again.
 static int playerBodyClearance()
 {
-    int ceilingDistance = 0;
-    int floorDistance = 0;
-    playerCollisionDistances(ceilingDistance, floorDistance);
-    return std::max(1, (ceilingDistance + floorDistance) * 4);
+    const llmapper::capability::Envelope body = llmapper::capability::playerEnvelope();
+    return std::max(1, body.height());
 }
 
 // Smallest body envelope actually observed while crouched.  Blood swaps the
@@ -413,41 +448,33 @@ static int playerStandingClearance()
     return gStandingClearance > 0 ? gStandingClearance : playerBodyClearance();
 }
 
+// Until the bot has actually crouched, it does not know how short crouching
+// makes it.  The posture table's eyeAboveZ is a camera height, not a
+// collision envelope, and guessing from it invents clearance the body may
+// not have.  Unknown is reported as the standing envelope, which only ever
+// makes the bot refuse a gap it might have fitted through.
 static int playerCrouchClearance()
 {
     const int standing = playerStandingClearance();
     if (gObservedCrouchClearance > 0)
         return std::min(standing, gObservedCrouchClearance);
-    if (!gMe)
-        return standing;
-    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-    const POSTURE &crouch = gMe->pPosture[gMe->lifeMode][kPostureCrouch];
-    const int drop = std::max(0, stand.eyeAboveZ - crouch.eyeAboveZ);
-    return std::max(standing / 4, standing - drop);
+    return standing;
 }
 
 static void playerCollisionDistances(int &ceilingDistance, int &floorDistance)
 {
-    ceilingDistance = 64 << 4;
-    floorDistance = 64 << 4;
-    if (!gMe || !gMe->pSprite)
-        return;
-
-    // Keep copied-state probes identical to playerProcess().  The engine
-    // derives these distances from the player's actual sprite extents; the
-    // posture eye height is not the collision height.
-    int top = gMe->pSprite->z;
-    int bottom = gMe->pSprite->z;
-    GetSpriteExtents(gMe->pSprite, &top, &bottom);
-    ceilingDistance = std::max(0, (gMe->pSprite->z - top) / 4);
-    floorDistance = std::max(0, (bottom - gMe->pSprite->z) / 4);
+    const llmapper::capability::Envelope body = llmapper::capability::playerEnvelope();
+    ceilingDistance = std::max(0, body.ceilingDistance);
+    floorDistance = std::max(0, body.floorDistance);
 }
 
 static int lookAngleForTarget(int eyeZ, int targetZ, int horizontal)
 {
     const double angle = std::atan2(double(eyeZ - targetZ), double(std::max(1, horizontal)))
         * 1024.0 / 3.14159265358979323846;
-    return std::max(kLookDownLimit, std::min(kLookUpLimit, int(std::lround(angle))));
+    return std::max(llmapper::capability::playerLookDownLimit(),
+                    std::min(llmapper::capability::playerLookUpLimit(),
+                             int(std::lround(angle))));
 }
 
 // Does this sector contain a floor-aligned sprite the player can stand on?
@@ -513,10 +540,16 @@ static int64_t segmentDistance2(int x, int y, int x1, int y1, int x2, int y2)
     return int64_t(x - px) * (x - px) + int64_t(y - py) * (y - py);
 }
 
-// The two ends of a wall-aligned sprite, as the engine computes them when it
-// clips against one.  A wall sprite is a line, not a post: a panel across a
-// doorway is several hundred units wide, and treating it as a clipdist-sized
-// circle at its centre misses everything but the middle.
+// The two ends of a wall-aligned sprite, as clipmove computes them.  A wall
+// sprite is a line, not a post: a panel across a doorway is several hundred
+// units wide, and treating it as a clipdist-sized circle at its centre
+// misses everything but the middle.
+//
+// This deliberately does not call Blood's own GetSpriteExtents, which
+// answers a slightly different question: it mirrors the x offset on
+// CSTAT_SPRITE_YFLIP, while the engine's get_wallspr_dims -- the one
+// clipmove actually clips with -- mirrors on CSTAT_SPRITE_XFLIP.  The bot is
+// asking what the player's body will hit, so clipmove is the authority.
 static void wallSpriteSpan(const spritetype &record, int &x1, int &y1,
                            int &x2, int &y2)
 {
@@ -524,8 +557,8 @@ static void wallSpriteSpan(const spritetype &record, int &x1, int &y1,
     const int offset = (record.cstat & CSTAT_SPRITE_XFLIP)
         ? -(picanm[record.picnum].xofs + record.xoffset)
         : (picanm[record.picnum].xofs + record.xoffset);
-    const int dax = sintable[record.ang & 2047] * record.xrepeat;
-    const int day = sintable[(record.ang + 1536) & 2047] * record.xrepeat;
+    const int dax = sintable[record.ang & kAngMask] * record.xrepeat;
+    const int day = sintable[(record.ang + kAng90 + kAng180) & kAngMask] * record.xrepeat;
     const int anchor = (span >> 1) + offset;
     x1 = record.x - mulscale16(dax, anchor);
     y1 = record.y - mulscale16(day, anchor);
@@ -607,136 +640,19 @@ static bool wallOutwardNormal(int x1, int y1, int x2, int y2, int ownerSector,
     return true;
 }
 
-// Blood's player physics, stepped with the engine's own constants rather
-// than with anything fitted to a recording.
-//
-// Per tick ProcessInput turns `forward` into velocity through the posture's
-// frontAccel, MoveDude moves by xvel>>12, gravity adds 58254 to zvel, and
-// the dude drag step takes a proportion of the velocity back.  Both the
-// acceleration and the drag are scaled by how far off the floor the player
-// is -- `height`, which is (floorZ - bottom) >> 8 -- and both cut out only
-// above height 256, which is 65536 z units up.  A jump peaks around 15400,
-// so height barely reaches 60: there is roughly three quarters of the
-// ground authority available for the whole flight, and an arc can be
-// trimmed after it has begun.
-struct JumpStep
-{
-    int x = 0;
-    int y = 0;
-    int z = 0;
-    int xvel = 0;
-    int yvel = 0;
-    int zvel = 0;
-};
-
-static int airAuthority(int heightAboveFloor)
-{
-    const int height = std::max(0, heightAboveFloor) >> 8;
-    if (height >= 256)
-        return 0;
-    return height > 0 ? 0x10000 - divscale16(height, 256) : 0x10000;
-}
-
-static int airDragAt(int heightAboveFloor)
-{
-    const int height = std::max(0, heightAboveFloor) >> 8;
-    if (height >= 0x100)
-        return 0;
-    return gDudeDrag - scale(gDudeDrag, height, 0x100);
-}
-
-// One tick of the player's motion, given the forward input being held and
-// the heading being faced.  `floorZ` is the surface underneath.
-static void stepPlayerPhysics(JumpStep &state, int forwardInput, int angle,
-                              int floorZ, int frontAccel)
-{
-    const int aboveFloor = floorZ - state.z;
-    const int authority = airAuthority(aboveFloor);
-    if (forwardInput && authority)
-    {
-        int forward = mulscale8(frontAccel, forwardInput);
-        if (authority != 0x10000)
-            forward = mulscale16(forward, authority);
-        state.xvel += mulscale30(forward, Cos(angle));
-        state.yvel += mulscale30(forward, Sin(angle));
-    }
-    state.x += state.xvel >> 12;
-    state.y += state.yvel >> 12;
-    state.z += state.zvel >> 8;
-    state.zvel += 58254;
-    state.z += ((58254 * 4) / 2) >> 8;
-    const int drag = airDragAt(floorZ - state.z);
-    if (drag)
-    {
-        state.xvel -= mulscale16r(state.xvel, drag);
-        state.yvel -= mulscale16r(state.yvel, drag);
-    }
-}
-
 static int bodyRadiusOf()
 {
-    return gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+    return llmapper::capability::playerEnvelope().radius;
 }
 
 static int jumpAirTicks(int rise)
 {
-    if (!gMe)
-        return 0;
-    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-    int z = 0;
-    int zvel = stand.normalJumpZ;
-    for (int tick = 1; tick <= 120; ++tick)
-    {
-        z += zvel >> 8;
-        zvel += 58254;
-        z += ((58254 * 4) / 2) >> 8;
-        if (tick > 2 && z >= rise && zvel > 0)
-            return tick;
-    }
-    return 0;
-}
-
-// Top running speed, in world units per tick, where acceleration and drag
-// balance.  Derived, not assumed.
-static int playerRunSpeed()
-{
-    if (!gMe)
-        return 0;
-    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-    const int accel = mulscale8(stand.frontAccel, 2047);
-    int velocity = 0;
-    for (int tick = 0; tick < 64; ++tick)
-    {
-        velocity += accel;
-        velocity -= mulscale16r(velocity, gDudeDrag);
-    }
-    return velocity >> 12;
-}
-
-// How much ground it takes to get there from a standing start.
-static int playerRunUpDistance()
-{
-    if (!gMe)
-        return 0;
-    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-    const int accel = mulscale8(stand.frontAccel, 2047);
-    const int target = playerRunSpeed() - playerRunSpeed() / 16;
-    int velocity = 0;
-    int travelled = 0;
-    for (int tick = 0; tick < 64; ++tick)
-    {
-        velocity += accel;
-        velocity -= mulscale16r(velocity, gDudeDrag);
-        travelled += velocity >> 12;
-        if ((velocity >> 12) >= target)
-            break;
-    }
-    return travelled;
+    return llmapper::capability::playerJumpAirFrames(rise);
 }
 
 static int jumpReach(int rise)
 {
-    return jumpAirTicks(rise) * playerRunSpeed();
+    return jumpAirTicks(rise) * llmapper::capability::playerRunSpeed();
 }
 
 // How far apart two segments come, and where in the middle of that closest
@@ -806,7 +722,7 @@ static int64_t closestApproach(int ax1, int ay1, int ax2, int ay2,
 static void appendGapCrossings(Observation &result)
 {
     const size_t doorways = result.portals.size();
-    const int bodyClearance = playerBodyClearance();
+    const int bodyClearance = playerStandingClearance();
     const int riseLimit = playerJumpRiseLimit();
     for (size_t index = 0; index < doorways; ++index)
     {
@@ -862,8 +778,14 @@ static void appendGapCrossings(Observation &result)
             // same low ground reached the long way round rather than a gap.
             if (chasmFloor - landingFloor <= kMaxWalkableStep)
                 continue;
+            // A crossing may go up, stay level, or come down a little: one
+            // pillar in a row is rarely the same height as the next.  Both
+            // directions are bounded by the same jump, though.  Up, by how
+            // high it reaches; down, by how far the bot could climb back --
+            // land further below than that and this was never a crossing,
+            // it was a fall into the hole that happened to have a floor.
             const int rise = landingFloor - ledge.fromFloorZ;
-            if (-rise > riseLimit)
+            if (-rise > riseLimit || rise > playerReversibleDrop())
                 continue;
             const int reach = jumpReach(rise) - bodyRadiusOf();
             if (reach <= 0 || span2 > int64_t(reach) * reach)
@@ -1113,7 +1035,7 @@ static Observation observeWorld()
             const int openingWidth = int(std::sqrt(double(distance2(wallRecord.x, wallRecord.y, nextWall.x, nextWall.y))));
             const int clearance = std::min(fromFloor - fromCeiling, toFloor - toCeiling);
             const int floorDelta = toFloor - fromFloor;
-            const int bodyClearance = playerBodyClearance();
+            const int bodyClearance = playerStandingClearance();
             const int crouchClearance = playerCrouchClearance();
             const int jumpRiseLimit = playerJumpRiseLimit();
             const int dropLimit = jumpRiseLimit;
@@ -1895,6 +1817,24 @@ struct LLMapperBot::Impl
     int lastFrontierChoice = 0;
     int directCrossingWall = -1;
     int directCrossingBlockedTicks = 0;
+    // Motion-model audit state (see recordMotionPrediction).
+    llmapper::capability::MotionState motionAuditPredicted;
+    llmapper::capability::MotionState motionAuditBefore;
+    int motionAuditAngle = 0;
+    int motionAuditFoot = 0;
+    bool motionAuditValid = false;
+    bool motionAuditJumped = false;
+    int motionAuditFrame = -1;
+    int motionAuditForward = 0;
+    int motionAuditFloorZ = 0;
+    int motionAuditAgreed = 0;
+    int motionAuditDiverged = 0;
+    int motionAuditClipped = 0;
+    int motionAuditReshaped = 0;
+    int motionAuditBuoyant = 0;
+    int motionAuditPushed = 0;
+    bool motionAuditDepth = false;
+
     bool gapJumpActive = false;
     bool gapRunning = false;
     int gapSettleUntilTick = -1;
@@ -1905,6 +1845,7 @@ struct LLMapperBot::Impl
     int gapJumpX = 0;
     int gapJumpY = 0;
     int gapJumpFloorZ = 0;
+    int gapJumpSettling = 0;
     int gapJumpTick = -1;
     int directCrossingBlockedUntil = -1;
     int lastSuppressedJumpTarget = -1;
@@ -2616,6 +2557,13 @@ struct LLMapperBot::Impl
             return;
         if (gMe->posture == kPostureCrouch)
         {
+            // Keep the shortest crouching frame seen.  Blood's crouch is a
+            // hold, not a cycle: the sequence plays down to a settled
+            // envelope and stays there, so the smallest sample is the body
+            // the bot will actually have while it holds the crouch and every
+            // taller one is the animation on the way into it.  Keeping the
+            // tallest instead measures the transition and costs the bot
+            // slots it fits through perfectly well.
             const int crouched = playerBodyClearance();
             if (crouched > 0
                 && (gObservedCrouchClearance == 0 || crouched < gObservedCrouchClearance))
@@ -2959,7 +2907,7 @@ struct LLMapperBot::Impl
                 // mode would corrupt NavTopology and walkArea.
                 const walltype &reverseWall = wall[reverseWallId];
                 const bool reverseEnoughWidth = reverse.openingWidth >= playerPassageWidth();
-                const bool reverseStanding = reverse.clearance >= playerBodyClearance();
+                const bool reverseStanding = reverse.clearance >= playerStandingClearance();
                 const bool reverseCrouching = reverse.clearance >= playerCrouchClearance();
                 const int reverseRise = playerJumpRiseLimit();
                 const bool reverseWalk = reverseEnoughWidth && reverseStanding
@@ -3502,11 +3450,11 @@ struct LLMapperBot::Impl
                                                                  portal.x2, portal.y2))));
             portal.walkable = !(wallRecord.cstat & 1)
                 && portal.openingWidth >= playerPassageWidth()
-                && portal.clearance >= playerBodyClearance()
+                && portal.clearance >= playerStandingClearance()
                 && std::abs(portal.floorDelta) <= kMaxWalkableStep;
             portal.jumpable = !(wallRecord.cstat & 1)
                 && portal.openingWidth >= playerPassageWidth()
-                && portal.clearance >= playerBodyClearance()
+                && portal.clearance >= playerStandingClearance()
                 && portal.floorDelta < 0 && -portal.floorDelta <= playerJumpRiseLimit();
             portal.traversable = portal.walkable;
             auto &edges = knownGraph[sectorId];
@@ -3785,6 +3733,7 @@ struct LLMapperBot::Impl
                 opportunity.requiredKey = portal.key;
                 opportunity.depth = sectorDepth(from);
                 opportunity.hops = reach;
+                opportunity.descent = std::max(0, portal.floorDelta);
                 opportunity.local = from == observation.sector;
                 const bool crossable = (portal.traversable || portal.jumpable)
                     && !edgeFailed(edgeId) && !localEdgeFailed(edgeId);
@@ -4217,7 +4166,7 @@ struct LLMapperBot::Impl
                 snprintf(progress, sizeof(progress),
                          "wall=%d from=%d to=%d clearance=%d body=%d crouch=%d floor_delta=%d busy=%d",
                          portal.wall, portal.from, portal.to, portal.clearance,
-                         playerBodyClearance(), playerCrouchClearance(), portal.floorDelta,
+                         playerStandingClearance(), playerCrouchClearance(), portal.floorDelta,
                          portal.wallBusy || portal.sectorBusy ? 1 : 0);
                 event("boundary_clearance_changed", progress);
             }
@@ -5022,7 +4971,7 @@ struct LLMapperBot::Impl
                                       observation.sector, memory.x, memory.y, aimZ,
                                       memory.fromSector >= 0 ? memory.fromSector
                                                              : observation.sector);
-        const int reach = weapon == kWeaponPitchfork ? kMeleeReach : kActionApproachRange * 2;
+        const int reach = weapon == kWeaponPitchfork ? meleeReach() : kActionApproachRange * 2;
         const int distance2ToWall = distance2(observation.x, observation.y,
                                               memory.x, memory.y);
         if (distance2ToWall > reach * reach || !clearShot)
@@ -5411,7 +5360,7 @@ struct LLMapperBot::Impl
         const int floorZ = getflorzofslope(observation.sector, observation.x, observation.y);
         const int ceilingZ = getceilzofslope(observation.sector, observation.x, observation.y);
         const int clearance = floorZ - ceilingZ;
-        if (clearance < playerBodyClearance() && clearance >= playerCrouchClearance())
+        if (clearance < playerStandingClearance() && clearance >= playerCrouchClearance())
             return kTraversalCrouchable;
         return kTraversalUnknown;
     }
@@ -6911,7 +6860,7 @@ struct LLMapperBot::Impl
         if (minX > maxX || minY > maxY)
             return;
 
-        const int clearance = playerBodyClearance();
+        const int clearance = playerStandingClearance();
         const int radius = playerClipRadius();
         // A visited sector that produces no cells disconnects the whole
         // graph, so the filters relax in order rather than failing closed:
@@ -7363,7 +7312,7 @@ struct LLMapperBot::Impl
             && wall[wallId].extra > 0 && wall[wallId].extra < kMaxXWalls
             && xwall[wall[wallId].extra].triggerPush)
             useable = true;
-        return llmapper::classifyTraversal(toFloor - fromFloor, clearance, playerBodyClearance(),
+        return llmapper::classifyTraversal(toFloor - fromFloor, clearance, playerStandingClearance(),
                                            playerJumpRiseLimit(), kMaxWalkableStep, probe.reachable,
                                            probe.wall >= 0, useable, probe.sector >= 0);
     }
@@ -7584,7 +7533,7 @@ struct LLMapperBot::Impl
             wallRecord.x, wallRecord.y, wall[wallRecord.point2].x,
             wall[wallRecord.point2].y))));
         const int floorDelta = toFloor - fromFloor;
-        const int body = playerBodyClearance();
+        const int body = playerStandingClearance();
         const int rise = playerJumpRiseLimit();
         bool mechanism = false;
         if (inRange(wallRecord.extra, 1, kMaxXWalls)
@@ -8311,37 +8260,64 @@ struct LLMapperBot::Impl
         return true;
     }
 
-    // Where a jump taken now would put the bot, given the input it intends
-    // to hold in the air.  Run with the engine's own arithmetic, so this is
-    // a prediction rather than an estimate: the only thing it leaves out is
-    // clipping, and a jump over a hole has nothing to clip against.
-    bool predictLanding(int landingFloorZ, int forwardInput, int angle,
-                        int &outX, int &outY, int &outTicks) const
+    // The player's live motion state, ready to be stepped forward.
+    llmapper::capability::MotionState currentMotion() const
+    {
+        llmapper::capability::MotionState state;
+        if (!gMe || !gMe->pSprite)
+            return state;
+        const int index = gMe->pSprite->index;
+        state.x = gMe->pSprite->x;
+        state.y = gMe->pSprite->y;
+        state.z = gMe->pSprite->z;
+        state.xvel = xvel[index];
+        state.yvel = yvel[index];
+        state.zvel = zvel[index];
+        return state;
+    }
+
+    // Where an arc ends, given the vertical velocity it starts with and the
+    // input held through it.  Run with the engine's own arithmetic, so this
+    // is a prediction rather than an estimate: the only thing it leaves out
+    // is clipping, and a jump over a hole has nothing to clip against.
+    bool predictArc(int startZVelocity, int landingFloorZ, int forwardInput,
+                    int angle, int settleFrames, int &outX, int &outY,
+                    int &outFrames) const
     {
         if (!gMe || !gMe->pSprite)
             return false;
         const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-        const int index = gMe->pSprite->index;
-        JumpStep state;
-        state.x = observation.x;
-        state.y = observation.y;
-        state.z = observation.z;
-        state.xvel = xvel[index];
-        state.yvel = yvel[index];
-        state.zvel = stand.normalJumpZ;
-        for (int tick = 1; tick <= 120; ++tick)
+        const int foot = llmapper::capability::playerFootOffset();
+        const llmapper::capability::AirDrag air = llmapper::capability::playerAirDrag();
+        llmapper::capability::MotionState state = currentMotion();
+        state.zvel = startZVelocity;
+        for (int frame = 1; frame <= 240; ++frame)
         {
-            stepPlayerPhysics(state, forwardInput, angle, landingFloorZ,
-                              stand.frontAccel);
-            if (tick > 2 && state.z >= landingFloorZ && state.zvel > 0)
+            // Whether the body was on its way down going into this frame.
+            // The step itself sets the floor down and takes the velocity out,
+            // exactly as MoveDude does, so asking afterwards always says no.
+            const bool falling = state.zvel > 0;
+            llmapper::capability::stepPlayerMotion(state, forwardInput, angle,
+                                                   landingFloorZ, stand.frontAccel,
+                                                   foot, air);
+            if (frame > settleFrames && falling && state.z + foot >= landingFloorZ)
             {
                 outX = state.x;
                 outY = state.y;
-                outTicks = tick;
+                outFrames = frame;
                 return true;
             }
         }
         return false;
+    }
+
+    // Where a jump taken now would put the bot.  The first frames are
+    // excused because the launch happens from the floor.
+    bool predictLanding(int landingFloorZ, int forwardInput, int angle,
+                        int &outX, int &outY, int &outFrames) const
+    {
+        return predictArc(llmapper::capability::playerJumpImpulse(), landingFloorZ,
+                          forwardInput, angle, 2, outX, outY, outFrames);
     }
 
     // Same question for a jump already under way: keep the current vertical
@@ -8349,29 +8325,54 @@ struct LLMapperBot::Impl
     bool predictRemainingFlight(int landingFloorZ, int forwardInput, int angle,
                                 int &outX, int &outY) const
     {
-        if (!gMe || !gMe->pSprite)
-            return false;
-        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-        const int index = gMe->pSprite->index;
-        JumpStep state;
-        state.x = observation.x;
-        state.y = observation.y;
-        state.z = observation.z;
-        state.xvel = xvel[index];
-        state.yvel = yvel[index];
-        state.zvel = zvel[index];
-        for (int tick = 1; tick <= 120; ++tick)
+        int frames = 0;
+        return predictArc(gMe && gMe->pSprite ? zvel[gMe->pSprite->index] : 0,
+                          landingFloorZ, forwardInput, angle, 0, outX, outY, frames);
+    }
+
+    // Which forward input, held for the rest of the flight, puts the bot on
+    // the far ledge?
+    //
+    // Blood scales a dude's input authority and its drag by how far it is
+    // off the floor, and both only cut out above a height a jump never
+    // reaches, so about three quarters of the ground's control is still
+    // there at the apex.  A jump is therefore steerable after it has been
+    // taken, and the question at the lip is not whether full throttle
+    // happens to land right -- over a pillar a thousand units deep it sails
+    // clean over -- but whether any input lands right.  Answered by running
+    // the engine's own arithmetic across the range of inputs and keeping the
+    // one that comes down nearest the middle of the ledge.  The launch, the
+    // mid-air trim and the decision to carry momentum all ask this same
+    // question, so there is one answer to it.
+    bool solveGapArc(int startZVelocity, const Portal &crossing, int angle,
+                     int settleFrames, int &outInput, int &outX, int &outY,
+                     int &outFrames) const
+    {
+        const int steps = 8;
+        bool found = false;
+        int64_t bestMiss = 0;
+        for (int step = 0; step <= steps; ++step)
         {
-            stepPlayerPhysics(state, forwardInput, angle, landingFloorZ,
-                              stand.frontAccel);
-            if (state.z >= landingFloorZ && state.zvel > 0)
-            {
-                outX = state.x;
-                outY = state.y;
-                return true;
-            }
+            const int forward = kFullThrottle * step / steps;
+            int x = 0;
+            int y = 0;
+            int frames = 0;
+            if (!predictArc(startZVelocity, crossing.floorZ, forward, angle,
+                            settleFrames, x, y, frames))
+                continue;
+            if (inside(x, y, crossing.to) != 1)
+                continue;
+            const int64_t miss = distance2(x, y, crossing.x, crossing.y);
+            if (found && miss >= bestMiss)
+                continue;
+            found = true;
+            bestMiss = miss;
+            outInput = forward;
+            outX = x;
+            outY = y;
+            outFrames = frames;
         }
-        return false;
+        return found;
     }
 
     // Is the bot already travelling at the thing it is about to jump to?
@@ -8393,9 +8394,9 @@ struct LLMapperBot::Impl
         int landX = 0;
         int landY = 0;
         int ticks = 0;
-        if (!predictLanding(crossing->floorZ, 2047, wanted, landX, landY, ticks))
-            return false;
-        if (inside(landX, landY, crossing->to) != 1)
+        int hold = 0;
+        if (!solveGapArc(llmapper::capability::playerJumpImpulse(), *crossing, wanted,
+                         2, hold, landX, landY, ticks))
             return false;
         gapRunning = true;
         gapRunWall = crossing->wall;
@@ -8411,14 +8412,7 @@ struct LLMapperBot::Impl
     // engine's own drag.
     int coastDistance() const
     {
-        int velocity = groundSpeed() << 12;
-        int travelled = 0;
-        for (int tick = 0; tick < 64 && velocity >= 0x1000; ++tick)
-        {
-            velocity -= mulscale16r(velocity, gDudeDrag);
-            travelled += velocity >> 12;
-        }
-        return travelled;
+        return llmapper::capability::playerCoastDistance(groundSpeed());
     }
 
     GINPUT brakeAfterLanding()
@@ -8433,7 +8427,7 @@ struct LLMapperBot::Impl
         // Facing is still roughly along the flight, so reverse thrust on the
         // forward axis takes the drift out.  Do not turn: a turn mid-slide
         // just converts the drift into a different direction.
-        input.forward = -2047;
+        input.forward = -kFullThrottle;
         return input;
     }
 
@@ -8453,7 +8447,7 @@ struct LLMapperBot::Impl
         int markY = portal.takeoffY;
         if (length > 1.0)
         {
-            const int runUp = radius + playerRunUpDistance();
+            const int runUp = radius + llmapper::capability::playerRunUpDistance();
             for (int back = runUp; back >= radius + 96; back -= 256)
             {
                 const int px = portal.takeoffX + int(backX * back / length);
@@ -8501,7 +8495,7 @@ struct LLMapperBot::Impl
                      portal.takeoffX, portal.takeoffY);
             event("gap_jump_run_up", detail);
         }
-        input.forward = 2047;
+        input.forward = kFullThrottle;
         if (gMe->cantJump || (gMe->pXSprite && gMe->pXSprite->height != 0))
             return input;
         // Leave the ground when the simulated arc actually ends on the far
@@ -8513,10 +8507,14 @@ struct LLMapperBot::Impl
         int landX = 0;
         int landY = 0;
         int ticks = 0;
-        const bool reaches = predictLanding(portal.floorZ, 2047, toLanding,
-                                            landX, landY, ticks)
-            && inside(landX, landY, portal.to) == 1;
-        const int lip = radius + 96;
+        int hold = kFullThrottle;
+        const bool reaches = solveGapArc(llmapper::capability::playerJumpImpulse(),
+                                         portal, toLanding, 2, hold, landX, landY, ticks);
+        // Out of ground once one more frame of travel would carry the body
+        // over the lip.  A fixed line at the lip is sampled at running speed
+        // and stepped over as often as it is landed on, and stepping over it
+        // is the fall.
+        const int lip = radius + 96 + coastDistance();
         const bool outOfGround =
             distance2(observation.x, observation.y, portal.takeoffX, portal.takeoffY)
                 <= lip * lip;
@@ -8528,13 +8526,24 @@ struct LLMapperBot::Impl
             // set the approach up again rather than stepping into the hole.
             gapRunning = false;
             gapSettleUntilTick = observation.tick + 2 * kTicsPerSec;
-            char detail[224];
+            int coastX = 0, coastY = 0, coastFrames = 0;
+            int pushX = 0, pushY = 0, pushFrames = 0;
+            const int impulse = llmapper::capability::playerJumpImpulse();
+            predictArc(impulse, portal.floorZ, 0, toLanding, 2, coastX, coastY, coastFrames);
+            predictArc(impulse, portal.floorZ, kFullThrottle, toLanding, 2,
+                       pushX, pushY, pushFrames);
+            char detail[320];
             snprintf(detail, sizeof(detail),
-                     "wall=%d to=%d predicted=(%d,%d) speed=%d reason=arc_misses_the_landing",
-                     portal.wall, portal.to, landX, landY, groundSpeed());
+                     "wall=%d to=%d from=(%d,%d) aim=(%d,%d) coast=(%d,%d) push=(%d,%d)"
+                     " coast_in=%d push_in=%d speed=%d reason=arc_misses_the_landing",
+                     portal.wall, portal.to, observation.x, observation.y,
+                     portal.x, portal.y, coastX, coastY, pushX, pushY,
+                     inside(coastX, coastY, portal.to), inside(pushX, pushY, portal.to),
+                     groundSpeed());
             event("gap_jump_aborted", detail);
             return GINPUT{};
         }
+        input.forward = hold;
         input.buttonFlags.jump = 1;
         gapRunning = false;
         gapJumpActive = true;
@@ -8562,16 +8571,32 @@ struct LLMapperBot::Impl
         GINPUT input = {};
         input.syncFlags.run = 1;
         const bool airborne = observation.playerZVelocity != 0;
-        const bool arrived = observation.sector == gapJumpTo;
+        // Where the body actually is, not only which sector the engine has
+        // it filed under.  Coming down on the lip of a ledge, the sector the
+        // player is registered in lags the position by a frame, and reading
+        // only that made the bot report a crossing it had just made as a
+        // fall into the hole it had cleared.
+        const bool arrived = observation.sector == gapJumpTo
+            || inside(observation.x, observation.y, gapJumpTo) == 1;
         const bool spent = gapJumpTick >= 0
             && observation.tick - gapJumpTick > 4 * kTicsPerSec;
-        if (arrived || spent || (!airborne && observation.tick - gapJumpTick > kTicsPerSec / 2))
+        // A jump that has touched down is not necessarily over.  The frame
+        // the body meets the floor it can still be on the lip, moving, and
+        // filed under the sector it flew across; calling the outcome there
+        // reported a crossing the bot had just made as a fall.  Give a
+        // landing that has not arrived a moment to slide onto the ledge
+        // before deciding it fell short.
+        const bool down = !airborne && observation.tick - gapJumpTick > kTicsPerSec / 2;
+        if (down && !arrived && ++gapJumpSettling <= kGapLandingSettleDecisions)
+            return GINPUT{};
+        if (arrived || spent || down)
         {
             char detail[192];
             snprintf(detail, sizeof(detail), "wall=%d to=%d landed_in=%d result=%s",
                      gapJumpWall, gapJumpTo, observation.sector,
                      arrived ? "landed" : spent ? "timed_out" : "short");
             event("gap_jump_finished", detail);
+            gapJumpSettling = 0;
             gapJumpActive = false;
             gapRunning = false;
             gapRunWall = -1;
@@ -8581,18 +8606,23 @@ struct LLMapperBot::Impl
         const int toLanding = getangle(gapJumpX - observation.x, gapJumpY - observation.y);
         input.q16turn = fix16_from_int(angleDelta(toLanding, observation.angle));
         noteCameraOwner("JUMP_THE_GAP", gapJumpWall, toLanding, 0);
-        // Trim the arc while it is still in the air.  There is authority up
-        // here -- about three quarters of the ground's, falling off with
-        // height -- so hold forward while the arc is short of the ledge and
-        // let go once it is already going to make it.  Coasting the last part
-        // of the flight is what stops the bot arriving with more speed than
-        // the ledge is long.
+        // Trim the arc while it is still in the air, asking the same question
+        // the launch asked but from where the bot now is.  If some input
+        // still lands it on the ledge, hold that one; if none does the arc is
+        // already lost and full throttle is the best remaining chance.
+        Portal landing;
+        landing.to = gapJumpTo;
+        landing.x = gapJumpX;
+        landing.y = gapJumpY;
+        landing.floorZ = gapJumpFloorZ;
+        int hold = kFullThrottle;
         int landX = 0;
         int landY = 0;
-        const bool coastReaches = predictRemainingFlight(gapJumpFloorZ, 0, toLanding,
-                                                         landX, landY)
-            && inside(landX, landY, gapJumpTo) == 1;
-        input.forward = coastReaches ? 0 : 2047;
+        int frames = 0;
+        const int zv = gMe && gMe->pSprite ? zvel[gMe->pSprite->index] : 0;
+        if (!solveGapArc(zv, landing, toLanding, 0, hold, landX, landY, frames))
+            hold = kFullThrottle;
+        input.forward = hold;
         return input;
     }
 
@@ -8727,7 +8757,7 @@ struct LLMapperBot::Impl
                 if (distance2(observation.x, observation.y, portal.x, portal.y)
                         > stand * stand
                     && std::abs(toGap) < 96)
-                    hold.forward = 2047;
+                    hold.forward = kFullThrottle;
                 // The engine already says how much room this will leave.
                 const DoorTiming ahead = doorTiming(portal.to);
                 const bool willNeedCrouch = ahead.openClearance > 0
@@ -8950,7 +8980,7 @@ struct LLMapperBot::Impl
             }
             break;
         case kJumpTakeoff:
-            input.forward = 2047;
+            input.forward = kFullThrottle;
             if (std::abs(angleError) < 96 && !gMe->cantJump
                 && (!gMe->pXSprite || gMe->pXSprite->height == 0))
             {
@@ -8969,7 +8999,7 @@ struct LLMapperBot::Impl
             }
             break;
         case kJumpAirborne:
-            input.forward = 2047;
+            input.forward = kFullThrottle;
             if (std::abs(observation.playerZVelocity) >= 64 || gMe->cantJump)
             {
                 char detail[192];
@@ -9051,7 +9081,7 @@ struct LLMapperBot::Impl
         {
             // Turn toward the target and walk once roughly facing it.
             if (std::abs(delta) < 96)
-                input.forward = 2047;
+                input.forward = kFullThrottle;
         }
         // Travelling: return the view to level.  Nothing ever undid the
         // downward aim an interaction had asked for, so once the bot had
@@ -9118,7 +9148,7 @@ struct LLMapperBot::Impl
                      gMe->pXSprite ? gMe->pXSprite->height : -1, gMe->cantJump, gMe->posture);
             event("movement_stuck", detail);
             input.buttonFlags.jump = 1;
-            input.forward = 2047;
+            input.forward = kFullThrottle;
             ++jumpAttempts;
             if (currentGoal == "SEARCH_CURRENT_AREA"
                 && movementTargetCapability == kTraversalJumpable)
@@ -9292,10 +9322,133 @@ struct LLMapperBot::Impl
     // treating it as one suppressed perfectly good routes.
     GINPUT decide()
     {
+        auditPredictedMotion();
         const GINPUT input = decideInput();
         if (input.forward || input.strafe)
             lastCommandedMoveTick = observation.tick;
+        recordMotionPrediction(input);
         return input;
+    }
+
+    //---------------------------------------------------------------------
+    // Does the motion model actually agree with the engine?
+    //
+    // Everything the bot decides about a jump rests on stepPlayerMotion
+    // reproducing one frame of Blood exactly.  Rather than trust that, step
+    // the model forward from the state the bot saw last frame with the input
+    // it actually sent, and compare against what the engine did.  A model
+    // that agrees says nothing; a model that is wrong names the term.
+    //
+    // This is a check on the model, not a source of behaviour: nothing reads
+    // the result, and no constant is fitted to it.
+    //---------------------------------------------------------------------
+    void recordMotionPrediction(const GINPUT &input)
+    {
+        motionAuditValid = false;
+        if (!gMe || !gMe->pSprite || input.strafe)
+            return;   // strafing is not in the model, so do not claim it is
+        const POSTURE &posture = gMe->pPosture[gMe->lifeMode][gMe->posture];
+        const int foot = llmapper::capability::playerFootOffset();
+        motionAuditFloorZ = llmapper::capability::playerFloorZ();
+        motionAuditDepth = llmapper::capability::playerInDepth();
+        motionAuditForward = input.forward;
+        motionAuditJumped = input.buttonFlags.jump && !gMe->cantJump
+            && gMe->pXSprite && gMe->pXSprite->height == 0;
+        motionAuditBefore = currentMotion();
+        motionAuditAngle = gMe->pSprite->ang;
+        motionAuditFoot = foot;
+        motionAuditPredicted = motionAuditBefore;
+        if (motionAuditJumped)
+            motionAuditPredicted.zvel = llmapper::capability::playerJumpImpulse();
+        llmapper::capability::stepPlayerMotion(motionAuditPredicted, input.forward,
+                                               motionAuditAngle, motionAuditFloorZ,
+                                               posture.frontAccel, foot,
+                                               llmapper::capability::playerAirDrag());
+        motionAuditFrame = gFrame;
+        motionAuditValid = true;
+    }
+
+    void auditPredictedMotion()
+    {
+        if (!motionAuditValid || !gMe || !gMe->pSprite)
+            return;
+        motionAuditValid = false;
+        if (gFrame != motionAuditFrame + 1)
+            return;   // frames were skipped; the comparison would be meaningless
+        // Things the model does not claim to reproduce, counted rather than
+        // reported: clipping, which it has no geometry for, and the body's
+        // extents changing with the animation inside the frame the model has
+        // already predicted.
+        if (gMe->pSprite->extra > 0 && gMe->pSprite->extra < kMaxXSprites
+            && (gSpriteHit[gMe->pSprite->extra].hit != 0
+                || gSpriteHit[gMe->pSprite->extra].ceilhit != 0))
+        {
+            // A wall takes the velocity into it away through
+            // actWallBounceVector, and a ceiling reverses an eighth of the
+            // rise; both are clipping, and the model has no geometry.
+            ++motionAuditClipped;
+            return;
+        }
+        if (llmapper::capability::playerFootOffset() != motionAuditFoot)
+        {
+            ++motionAuditReshaped;
+            return;
+        }
+        if (motionAuditDepth || llmapper::capability::playerInDepth())
+        {
+            ++motionAuditBuoyant;   // water and goo change gravity; not modelled
+            return;
+        }
+        if (llmapper::capability::playerFloorZ() != motionAuditFloorZ)
+        {
+            ++motionAuditReshaped;  // the ground moved or the footprint left it
+            return;
+        }
+        const llmapper::capability::MotionState actual = currentMotion();
+        const int dx = actual.x - motionAuditPredicted.x;
+        const int dy = actual.y - motionAuditPredicted.y;
+        const int dz = actual.z - motionAuditPredicted.z;
+        const int dxv = actual.xvel - motionAuditPredicted.xvel;
+        const int dyv = actual.yvel - motionAuditPredicted.yvel;
+        const int dzv = actual.zvel - motionAuditPredicted.zvel;
+        // A one-unit rounding difference is not a disagreement.  Velocities
+        // are 1/4096 of a world unit, so tolerate the same magnitude there.
+        if (std::abs(dx) <= 1 && std::abs(dy) <= 1 && std::abs(dz) <= 1
+            && std::abs(dxv) <= 0x1000 && std::abs(dyv) <= 0x1000
+            && std::abs(dzv) <= 0x1000)
+        {
+            ++motionAuditAgreed;
+            return;
+        }
+        if (dxv == 0 && dyv == 0 && dzv == 0)
+        {
+            // Same velocity, different place: playerProcess pushes the body
+            // out of geometry with pushmove_old before ProcessInput runs, and
+            // that moves the player without touching the velocity.  Another
+            // thing the model has no geometry for.
+            ++motionAuditPushed;
+            return;
+        }
+        ++motionAuditDiverged;
+        if (motionAuditDiverged > kMotionAuditReports)
+            return;
+        char detail[448];
+        snprintf(detail, sizeof(detail),
+                 "forward=%d jumped=%d ang=%d foot=%d floor=%d"
+                 " from=(%d,%d,%d) vel0=(%d,%d,%d)"
+                 " predicted=(%d,%d,%d) predvel=(%d,%d,%d)"
+                 " actual=(%d,%d,%d) actvel=(%d,%d,%d)"
+                 " d=(%d,%d,%d) dvel=(%d,%d,%d) agreed=%d clipped=%d reshaped=%d",
+                 motionAuditForward, motionAuditJumped ? 1 : 0, motionAuditAngle,
+                 motionAuditFoot, motionAuditFloorZ,
+                 motionAuditBefore.x, motionAuditBefore.y, motionAuditBefore.z,
+                 motionAuditBefore.xvel, motionAuditBefore.yvel, motionAuditBefore.zvel,
+                 motionAuditPredicted.x, motionAuditPredicted.y, motionAuditPredicted.z,
+                 motionAuditPredicted.xvel, motionAuditPredicted.yvel, motionAuditPredicted.zvel,
+                 actual.x, actual.y, actual.z, actual.xvel, actual.yvel, actual.zvel,
+                 dx, dy, dz, dxv, dyv, dzv, motionAuditAgreed,
+                 motionAuditClipped, motionAuditReshaped);
+        event("motion_model_diverged", detail);
     }
 
     GINPUT decideInput()
@@ -9335,7 +9488,7 @@ struct LLMapperBot::Impl
         situation.meleeAvailable = meleeWeaponAvailable()
             && enemyDistance2 <= kMeleeEngageRange * kMeleeEngageRange;
         situation.retreatAvailable = situation.hasThreat && findRetreatCell(*enemy) >= 0;
-        situation.critical = observation.health > 0 && observation.health < kCriticalHealth;
+        situation.critical = observation.health > 0 && observation.health < criticalHealth();
         situation.current = combatTactic;
         const CombatDecision decision = llmapper::chooseCombatTactic(situation);
         if (decision.tactic != combatTactic)
@@ -9807,6 +9960,15 @@ struct LLMapperBot::Impl
         fflush(stderr);
         if (telemetry)
         {
+            // Whether the bot's account of Blood's physics held up for the
+            // whole run.  Anything other than zero divergences means a jump
+            // was planned against arithmetic the engine does not run.
+            char audit[192];
+            snprintf(audit, sizeof(audit),
+                     "agreed=%d diverged=%d clipped=%d pushed=%d reshaped=%d buoyant=%d",
+                     motionAuditAgreed, motionAuditDiverged, motionAuditClipped,
+                     motionAuditPushed, motionAuditReshaped, motionAuditBuoyant);
+            event("motion_model_audit", audit);
             fprintf(telemetry, "{\"type\":\"summary\",\"result\":\"%s\",\"failure_reason\":\"%s\",\"game_time\":%d,\"visited_sectors\":%u,\"observed_sectors\":%u}\n",
                     result.c_str(), failureReason.c_str(), (gFrame * kTicsPerFrame) / kTicsPerSec,
                     unsigned(visitedSectors.size()), unsigned(observedSectors.size()));

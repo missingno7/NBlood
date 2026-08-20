@@ -371,7 +371,15 @@ static bool deeperThan(const Opportunity &candidate, const Opportunity &best)
 {
     if (candidate.depth != best.depth)
         return candidate.depth > best.depth;
-    return candidate.hops < best.hops;
+    if (candidate.hops != best.hops)
+        return candidate.hops < best.hops;
+    // Equally deep and equally close, so prefer the one that does not cost
+    // height.  A drop is cheap to take and expensive to undo -- a chain of
+    // individually survivable ones walks the bot down into somewhere it
+    // cannot climb out of -- while a ledge across the way leaves the rest of
+    // the level exactly as reachable as it was.  Without this the tie falls
+    // to whichever was discovered first, which is always the plain doorway.
+    return candidate.descent < best.descent;
 }
 
 Mission selectMission(const std::vector<Opportunity> &ledger, int tick,

@@ -102,6 +102,10 @@ struct GINPUT
 
 #pragma pack(pop)
 
+// Largest forward/strafe magnitude ctrlGetInput will ever hand to
+// ProcessInput.  Anything driving the player through GINPUT is held to it.
+CONSTEXPR int kMaxMoveInput = 2048;
+
 extern GINPUT gInput, gNetInput;
 extern bool bSilentAim;
 extern int32_t gMouseAim; // Should be an int32 due to being passed to OSD

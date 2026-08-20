@@ -1662,11 +1662,11 @@ void ProcessInput(PLAYER *pPlayer)
             yvel[nSprite] -= mulscale30(strafe, x);
         }
     }
-    else if (pXSprite->height < 256)
+    else if (pXSprite->height < kDudeAirborneHeight)
     {
         int speed = 0x10000;
         if (pXSprite->height > 0)
-            speed -= divscale16(pXSprite->height, 256);
+            speed -= divscale16(pXSprite->height, kDudeAirborneHeight);
         int x = Cos(pSprite->ang);
         int y = Sin(pSprite->ang);
         if (pInput->forward)
@@ -1845,11 +1845,11 @@ void ProcessInput(PLAYER *pPlayer)
         else
         {
             if (pInput->buttonFlags.lookUp)
-                pPlayer->q16look = fix16_min(pPlayer->q16look+F16(4), F16(60));
+                pPlayer->q16look = fix16_min(pPlayer->q16look+F16(4), F16(kLookLimitVanilla));
             if (pInput->buttonFlags.lookDown)
-                pPlayer->q16look = fix16_max(pPlayer->q16look-F16(4), F16(-60));
+                pPlayer->q16look = fix16_max(pPlayer->q16look-F16(4), F16(-kLookLimitVanilla));
         }
-        pPlayer->q16look = fix16_clamp(pPlayer->q16look+pInput->q16mlook, F16(-60), F16(60));
+        pPlayer->q16look = fix16_clamp(pPlayer->q16look+pInput->q16mlook, F16(-kLookLimitVanilla), F16(kLookLimitVanilla));
         if (pPlayer->q16look > 0)
             pPlayer->q16horiz = fix16_from_int(mulscale30(120, Sin(fix16_to_int(pPlayer->q16look)<<3)));
         else if (pPlayer->q16look < 0)
@@ -1859,10 +1859,10 @@ void ProcessInput(PLAYER *pPlayer)
     }
     else
     {
-        CONSTEXPR int upAngle = 289;
-        CONSTEXPR int downAngle = -347;
-        CONSTEXPR double lookStepUp = 4.0*upAngle/60.0;
-        CONSTEXPR double lookStepDown = -4.0*downAngle/60.0;
+        CONSTEXPR int upAngle = kLookUpLimit;
+        CONSTEXPR int downAngle = kLookDownLimit;
+        CONSTEXPR double lookStepUp = 4.0*upAngle/double(kLookLimitVanilla);
+        CONSTEXPR double lookStepDown = -4.0*downAngle/double(kLookLimitVanilla);
         if (pInput->keyFlags.lookCenter && !pInput->buttonFlags.lookUp && !pInput->buttonFlags.lookDown)
         {
             if (pPlayer->q16look < 0)

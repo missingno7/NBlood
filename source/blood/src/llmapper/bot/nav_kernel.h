@@ -235,10 +235,12 @@ struct Opportunity
     int depth;         // exploration-tree depth of the discovering node
     int hops;          // route distance from the bot right now, -1 unreachable
     int dormantUntil;  // tick before which this stays out of the way
+    int descent;       // height given up by taking it, 0 when level or upward
     bool local;        // discovered from, and actionable in, the current sector
     Opportunity()
         : id(-1), kind(kOpportunityFrontier), sector(-1), target(-1), wall(-1),
-          requiredKey(0), depth(0), hops(-1), dormantUntil(0), local(false)
+          requiredKey(0), depth(0), hops(-1), dormantUntil(0), descent(0),
+          local(false)
     {
     }
 };

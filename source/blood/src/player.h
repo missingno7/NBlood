@@ -107,6 +107,13 @@ struct POSTURE
 
 extern POSTURE gPostureDefaults[kModeMax][kPostureMax];
 
+// How far the view may be pitched, in Build angle units.  ProcessInput
+// clamps q16look to these; a vanilla demo uses the narrower original range.
+// Declared here because anything that aims has to respect the same limits.
+CONSTEXPR int kLookUpLimit = 289;
+CONSTEXPR int kLookDownLimit = -347;
+CONSTEXPR int kLookLimitVanilla = 60;
+
 enum
 {
     kWeaponNone         = 0,
