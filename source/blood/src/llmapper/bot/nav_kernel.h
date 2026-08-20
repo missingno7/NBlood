@@ -445,10 +445,11 @@ struct Opportunity
     int hops;          // route distance from the bot right now, -1 unreachable
     int dormantUntil;  // tick before which this stays out of the way
     int descent;       // height given up by taking it, 0 when level or upward
+    int oneWayRisk;    // 0 reversible/unknown-safe, >0 known loss of optionality
     bool local;        // discovered from, and actionable in, the current sector
     Opportunity()
         : id(-1), kind(kOpportunityFrontier), sector(-1), target(-1), wall(-1),
-          requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1), dormantUntil(0), descent(0),
+          requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1), dormantUntil(0), descent(0), oneWayRisk(0),
           local(false)
     {
     }

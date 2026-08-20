@@ -202,8 +202,19 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
             if (edgeFailedAny(failures, current, link.target, link.wall, link.mode,
                               geometrySignature))
                 continue;
-            const int candidateCost = bestCost[size_t(current)]
-                + traversalCost(link.mode);
+            int edgeCost = traversalCost(link.mode);
+            if (link.mode == kNavJump)
+            {
+                // Near-apex jumps are disproportionately fragile: a small
+                // steering or collision error loses the landing entirely.
+                // Prefer a staircase of known supports when it exists while
+                // retaining the direct jump as a valid fallback.
+                const int rise = std::max(0, cells[size_t(current)].z
+                                             - cells[size_t(link.target)].z);
+                const int riseUnits = (rise + 1023) / 1024;
+                edgeCost += riseUnits * riseUnits;
+            }
+            const int candidateCost = bestCost[size_t(current)] + edgeCost;
             if (candidateCost >= bestCost[size_t(link.target)])
                 continue;
             if (bestCost[size_t(link.target)] < 0x3fffffff)
@@ -724,6 +735,8 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
     const Opportunity *keyDoor = 0;
     const Opportunity *localFrontier = 0;
     const Opportunity *remoteFrontier = 0;
+    const Opportunity *riskyLocalFrontier = 0;
+    const Opportunity *riskyRemoteFrontier = 0;
     const Opportunity *localPickup = 0;
     const Opportunity *blocker = 0;
     const Opportunity *localBlocker = 0;
@@ -747,7 +760,14 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
                 keyDoor = &candidate;
             break;
         case kOpportunityFrontier:
-            if (candidate.local)
+            if (candidate.oneWayRisk > 0)
+            {
+                Opportunity const *&risky = candidate.local
+                    ? riskyLocalFrontier : riskyRemoteFrontier;
+                if (!risky || deeperThan(candidate, *risky))
+                    risky = &candidate;
+            }
+            else if (candidate.local)
             {
                 if (!localFrontier || deeperThan(candidate, *localFrontier))
                     localFrontier = &candidate;
@@ -832,6 +852,20 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
     {
         mission.kind = kMissionExpose;
         mission.opportunity = coverage->id;
+    }
+    // A physically possible one-way route is retained as a last-resort
+    // hypothesis.  It follows every currently actionable reversible task so
+    // the bot does not discard its known options merely to enter a smaller
+    // component, but it still wins over declaring the map exhausted.
+    else if (riskyLocalFrontier)
+    {
+        mission.kind = kMissionContinue;
+        mission.opportunity = riskyLocalFrontier->id;
+    }
+    else if (riskyRemoteFrontier)
+    {
+        mission.kind = kMissionReturnToBranch;
+        mission.opportunity = riskyRemoteFrontier->id;
     }
     mission.reason = missionReason(mission.kind);
     return mission;

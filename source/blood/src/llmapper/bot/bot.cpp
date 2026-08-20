@@ -128,8 +128,10 @@ constexpr int kActionScanRange = 1024;
 constexpr int kActionApproachRange = 2048;
 constexpr int kUseStopRange = kActionApproachRange;
 constexpr int kInteractionTimeoutTicks = 6 * kTicsPerSec;
-constexpr int kExplosiveMinStandOff = 1536;
-constexpr int kExplosiveMaxStandOff = 2560;
+// Added to the engine's real damaging radius.  This is clearance for Caleb's
+// body plus a small uncertainty allowance, not a guessed explosion size.
+constexpr int kExplosiveSafetyMargin = 256;
+constexpr int kExplosiveThrowAllowance = 1536;
 constexpr int kExplosivePrimeTicks = kTicsPerSec / 3;
 constexpr int kExplosiveOutcomeTicks = 6 * kTicsPerSec;
 // Every committed objective is bounded.  An objective that stops making
@@ -307,6 +309,7 @@ struct Portal
     bool locked = false;
     bool interactionAffordance = false;
     bool blockedBySprite = false;
+    int blockerSprite = -1;
     // A crossing made through the air over a gap rather than through a
     // doorway.  The two sectors do not touch; the takeoff is on this side of
     // the drop and the landing is the far lip.
@@ -346,6 +349,9 @@ struct InteractionCandidate
     bool reversible = false;
     llmapper::ActivationMode activationMode = llmapper::kActivateUse;
     unsigned requiredEffects = llmapper::kEffectNone;
+    int causalWall = -1;
+    int causalFrom = -1;
+    int causalTo = -1;
     Portal target;
 };
 
@@ -563,11 +569,31 @@ struct StandableSurface
     int ceilingZ = 0;
 };
 
+// GetSpriteExtents is Blood's visual/gameplay extent helper.  Build collision
+// applies the tile y-offset through spriteheightofs(..., 1), which can differ
+// by a small but decisive amount: probing the visual top may start just below
+// the collision top and make getzrange report the sector floor.  Navigation
+// needs the plane Caleb's body collides with.
+static void spriteCollisionExtents(int spriteId, int &top, int &bottom)
+{
+    if (!inRange(spriteId, 0, kMaxSprites))
+    {
+        top = bottom = 0;
+        return;
+    }
+    int height = 0;
+    bottom = sprite[spriteId].z + spriteheightofs(spriteId, &height, 1);
+    top = bottom - height;
+}
+
 // Enumerate every floor the engine can resolve at one XY, probing from just
 // above each candidate plane.  One query from the sector ceiling only finds
 // the topmost sprite and collapses stacked bridges; probing each known plane
 // preserves every physically distinct support while still leaving GetZRange
-// authoritative on footprint, one-sidedness, slope and clipping.
+// authoritative on footprint, one-sidedness, slope and clipping.  Build's
+// getzrange treats the top extent of blocking face/wall sprites as a floor as
+// well as floor-aligned sprites.  Use that same physical answer here instead
+// of maintaining a narrower orientation-specific idea of support.
 static std::vector<StandableSurface> standableSurfacesAt(
     int sectorId, int x, int y, int radius, int requiredClearance)
 {
@@ -603,13 +629,20 @@ static std::vector<StandableSurface> standableSurfacesAt(
          nSprite = nextspritesect[nSprite])
     {
         const spritetype &record = sprite[nSprite];
+        if (gMe && gMe->pSprite && nSprite == gMe->pSprite->index)
+            continue;
         if (!(record.cstat & CSTAT_SPRITE_BLOCK))
             continue;
         const int alignment = record.cstat & CSTAT_SPRITE_ALIGNMENT_MASK;
-        if (alignment != CSTAT_SPRITE_ALIGNMENT_FLOOR
-            && alignment != CSTAT_SPRITE_ALIGNMENT_SLOPE)
-            continue;
-        const int surfaceZ = spriteGetZOfSlope(uint16_t(nSprite), { x, y });
+        int surfaceZ = 0;
+        if (alignment == CSTAT_SPRITE_ALIGNMENT_FLOOR
+            || alignment == CSTAT_SPRITE_ALIGNMENT_SLOPE)
+            surfaceZ = spriteGetZOfSlope(uint16_t(nSprite), { x, y });
+        else
+        {
+            int bottom = 0;
+            spriteCollisionExtents(nSprite, surfaceZ, bottom);
+        }
         probe(SupportRef(kSupportSpriteFloor, nSprite), surfaceZ, 0xc000 | nSprite);
     }
     return result;
@@ -698,7 +731,7 @@ static int solidSpriteAt(int sectorId, int x, int y, int radius)
         // Something hanging clear above head height is not in the way.
         int top = 0;
         int bottom = 0;
-        GetSpriteExtents(&record, &top, &bottom);
+        spriteCollisionExtents(nSprite, top, bottom);
         if (bottom < floorZ - headroom || top > floorZ)
             continue;
         if (alignment == CSTAT_SPRITE_ALIGNMENT_WALL)
@@ -748,6 +781,56 @@ static bool wallOutwardNormal(int x1, int y1, int x2, int y2, int ownerSector,
 static int bodyRadiusOf()
 {
     return llmapper::capability::playerEnvelope().radius;
+}
+
+// Blood stores explosion radii in the EXPLOSION table in 1/16 map units;
+// CheckProximity shifts XY deltas by four before comparing them.  Keep that
+// conversion next to the engine table so navigation never grows a second,
+// guessed set of TNT/barrel distances.
+static int engineExplosionRadius(int explosionType)
+{
+    if (!inRange(explosionType, 0, kExplosionMax))
+        return 0;
+    return int(explodeInfo[explosionType].radius) << 4;
+}
+
+static int explosiveWeaponRadius(int weapon)
+{
+    switch (weapon)
+    {
+    case kWeaponTNT:
+        return engineExplosionRadius(kExplosionStandard);
+    case kWeaponNapalm:
+        // The projectile and its secondary radius-damage path are both
+        // engine-defined; the larger is the conservative deliberate-action
+        // envelope.
+        return std::max(engineExplosionRadius(kExplosionNapalm), 128 << 4);
+    default:
+        return 0;
+    }
+}
+
+static int explosiveSpriteRadius(const spritetype &record)
+{
+    switch (record.type)
+    {
+    case kThingArmedTNTStick:
+        return engineExplosionRadius(kExplosionSmall);
+    case kThingArmedProxBomb:
+    case kThingArmedRemoteBomb:
+    case kThingArmedTNTBundle:
+        return engineExplosionRadius(kExplosionStandard);
+    case kThingTNTBarrel:
+        return engineExplosionRadius(kExplosionLarge);
+    default:
+        return 0;
+    }
+}
+
+static int safeExplosionSeparation(int damagingRadius)
+{
+    return damagingRadius > 0
+        ? damagingRadius + bodyRadiusOf() + kExplosiveSafetyMargin : 0;
 }
 
 static int jumpAirTicks(int rise)
@@ -1328,6 +1411,7 @@ static Observation observeWorld()
                 int clearFirst = -1;
                 int clearLast = -1;
                 int obstruction = -1;
+                std::vector<int> operableObstructions;
                 for (int step = 0; step < samples; ++step)
                 {
                     const int px = portal.x1
@@ -1340,6 +1424,11 @@ static Observation observeWorld()
                     if (hit >= 0)
                     {
                         obstruction = hit;
+                        const spritetype &blocker = sprite[hit];
+                        if (validXSprite(blocker.extra)
+                            && (xsprite[blocker.extra].Push
+                                || xsprite[blocker.extra].Vector))
+                            appendUnique(operableObstructions, hit);
                         continue;
                     }
                     if (clearFirst < 0)
@@ -1364,17 +1453,58 @@ static Observation observeWorld()
                     portal.traversable = false;
                     portal.capability = kTraversalCurrentlyUnavailable;
                     portal.blockedBySprite = true;
+                    portal.blockerSprite = obstruction;
                     // Blocked, but not necessarily hopeless: a barricade the
                     // player can operate is progression work, not a wall.
-                    const spritetype &blocker = sprite[obstruction];
-                    if (validXSprite(blocker.extra)
-                        && (xsprite[blocker.extra].Push || xsprite[blocker.extra].Vector))
+                    if (!operableObstructions.empty())
                         portal.interactionAffordance = true;
+                }
+
+                // A sprite barricade is operated as a sprite, not as the
+                // otherwise ordinary wall portal it happens to cover.  Keep
+                // the approach on the reachable side of the obstruction;
+                // a long-range visibility observation of the same sprite in
+                // the unopened destination sector must not make the useful
+                // action look unreachable.
+                if (portal.blockedBySprite)
+                {
+                    for (int blockerId : operableObstructions)
+                    {
+                        const spritetype &blocker = sprite[blockerId];
+                        const XSPRITE &extra = xsprite[blocker.extra];
+                        InteractionCandidate candidate;
+                        candidate.kind = kInteractionSprite;
+                        candidate.id = blockerId;
+                        candidate.fromSector = result.sector;
+                        candidate.targetSector = portal.to;
+                        candidate.x = blocker.x;
+                        candidate.y = blocker.y;
+                        candidate.z = blocker.z;
+                        candidate.reversible = true;
+                        candidate.activationMode = extra.Vector
+                            ? llmapper::kActivateVector : llmapper::kActivateUse;
+                        candidate.target.wall = -1;
+                        candidate.target.from = result.sector;
+                        candidate.target.to = portal.to;
+                        candidate.target.x = blocker.x;
+                        candidate.target.y = blocker.y;
+                        candidate.target.shootable = extra.Vector != 0;
+                        candidate.target.mechanismTx = extra.txID;
+                        candidate.target.blockedBySprite = true;
+                        candidate.target.blockerSprite = blockerId;
+                        setSpriteInteractionGeometry(candidate.target, blockerId);
+                        candidate.z = candidate.target.z;
+                        result.interactions.push_back(candidate);
+                    }
                 }
             }
             if (sector[portal.from].extra > 0 && sector[portal.from].extra < kMaxXSectors)
                 portal.sectorPushCurrent = xsector[sector[portal.from].extra].Push != 0;
-            portal.interactionAffordance = portal.wallPush || portal.sectorPush
+            // Preserve a sprite affordance discovered by the collision scan.
+            // Assignment here used to erase it, leaving a portal correctly
+            // classified as sprite-blocked but with no actionable blocker.
+            portal.interactionAffordance = portal.interactionAffordance
+                || portal.wallPush || portal.sectorPush
                 || portal.sectorPushCurrent || portal.shootable;
             portal.currentlyAvailable = portal.traversable || portal.interactionAffordance;
             if (!portal.currentlyAvailable)
@@ -1551,8 +1681,18 @@ static Observation observeWorld()
             // the observer's side, but mere long-range visibility must not
             // continually rewrite the remembered approach to wherever the
             // player happens to be standing.
-            interaction.fromSector = distance2(result.x, result.y,
-                                                candidate.x, candidate.y)
+            // Vector activation is explicitly a remote interaction.  The
+            // cansee() result above proves that the current physical layer
+            // is a valid firing region even when the actuator belongs to a
+            // different sector.  Requiring its containing sector first can
+            // strand a shootable trigger behind the very transition it
+            // controls (AGTST11).  Use remains local and keeps the stable
+            // containing-sector approach unless it is actually in reach.
+            const bool remoteVector = validXSprite(candidate.extra)
+                && xsprite[candidate.extra].Vector;
+            interaction.fromSector = remoteVector
+                ? result.sector
+                : distance2(result.x, result.y, candidate.x, candidate.y)
                     <= kActionScanRange * kActionScanRange
                 ? result.sector : candidate.sectnum;
             interaction.targetSector = candidate.sectnum;
@@ -1629,6 +1769,11 @@ struct LLMapperBot::Impl
         int inspectY = 0;
         int inspectZ = 0;
         bool inspectPoseValid = false;
+        // Keep one route family for the lifetime of an interaction objective.
+        // 1 uses the exact support mesh; 2 uses the broader directed sector
+        // transport graph.  This prevents layered geometry from changing the
+        // route policy merely because the actor crossed a sector boundary.
+        int interactionRouteMode = 0;
         // Some world actions are only useful if Caleb is carried by the
         // mechanism they start.  This is a physical precondition of the
         // action, independent of which wall/sprite/sector acts as its
@@ -1712,6 +1857,10 @@ struct LLMapperBot::Impl
         bool engineAccepted = false;
         bool observedLocalEffect = false;
         bool observedKnownWorldDelta = false;
+        int consecutiveNoEffectAttempts = 0;
+        int causalWall = -1;
+        int causalFrom = -1;
+        int causalTo = -1;
         bool recoveryAttempted = false;
         bool traversed = false;
         bool activationPoseOnReceiver = false;
@@ -1719,6 +1868,13 @@ struct LLMapperBot::Impl
         int effectStartedTick = -1;
         int effectWeapon = 0;
         int effectAmmoBefore = -1;
+        int effectProjectile = -1;
+        int effectBlastRadius = 0;
+        int vectorShotsResolved = 0;
+        int confirmedVectorHits = 0;
+        int firstVectorHitTick = -1;
+        bool firingSolutionReported = false;
+        bool blockedFiringSolutionReported = false;
         std::vector<Portal> beforePortals;
         Portal target;
     };
@@ -1785,6 +1941,7 @@ struct LLMapperBot::Impl
     int lastAttacker = -1;
     int lastAttackerDamageType = -1;
     bool combatRetreatUnavailableEmitted = false;
+    bool hazardEscapeUnavailableEmitted = false;
     int lastCombatTacticEvent = -1;
     // One place converts a wanted change in the player's pitch into the
     // q16mlook the engine expects.  Outside a vanilla demo, ProcessInput
@@ -1841,6 +1998,7 @@ struct LLMapperBot::Impl
     unsigned pendingEffectPrerequisites = llmapper::kEffectNone;
     int lastObservedSector = -1;
     int lastGeometryTelemetrySector = -1;
+    bool worldLoadedTelemetryEmitted = false;
     bool localDynamicJumpAttempted = false;
     int localDynamicJumpUntilTick = -1;
     int localJumpProbeCount = 0;
@@ -1951,7 +2109,9 @@ struct LLMapperBot::Impl
     int navPoseSignatureValue = 0;
     int navDynamicSignatureValue = 0;
     int navTopologyRevision = 0;
-    int navPoseStableTicks = 0;
+    bool rearmFrontiersOnNextTopologyRebuild = false;
+    int navPoseChangedTick = 0;
+    int navPoseRebuildTick = 0;
     bool navMeshInMotion = false;
     int lastDynamicPrerequisiteProbeSignature = 0;
     int lastNavWaypointEvent = -1;
@@ -1980,6 +2140,13 @@ struct LLMapperBot::Impl
     std::set<int> engagedEnemies;
     std::map<int, int> enemyHealth;
     std::set<int> countedKills;
+    std::set<int> reportedSpriteSupports;
+    std::set<int> reportedRejectedSpriteSupports;
+    std::set<int> reportedSpriteSupportLinks;
+    std::set<int64_t> reportedSpriteSupportTakeoffs;
+    std::set<int> reportedRaisedPortalAudits;
+    std::set<int64_t> reportedRaisedPortalRoutes;
+    bool reportedNavStartReconnect = false;
     int lastLedgerDumpTick = -1;
     int lastFailedOpportunity = -1;
     std::map<int, int> suppressionEvidence;
@@ -2028,6 +2195,7 @@ struct LLMapperBot::Impl
     mutable std::vector<int> routeGateSector;
     std::map<int, int> inertBoundaries;
     std::set<int> narrowSectors;
+    std::set<int> transitOnlySectors;
     // A wall can expose different connections at different support poses.
     // Collapsing those alternatives to one bit made a stacked bridge's open
     // layer and closed layer overwrite one another every observation tick.
@@ -2083,6 +2251,10 @@ struct LLMapperBot::Impl
     int openedRouteFrom = -1;
     int openedRouteTo = -1;
     int openedRouteTick = -1;
+    int recentInvestigatedWall = -1;
+    int recentInvestigatedFrom = -1;
+    int recentInvestigatedTo = -1;
+    int recentInvestigatedTick = -1;
 
     void openFiles()
     {
@@ -2274,6 +2446,31 @@ struct LLMapperBot::Impl
                     memory.observedKnownWorldDelta = false;
                     retirePendingInteraction(entry.first);
                 }
+                else if (key > 0 && !hasKey(key))
+                {
+                    // ActionScan is authoritative about why the activation
+                    // was refused.  The map record visible to navigation may
+                    // not advertise its key beforehand (sprite exit switches
+                    // are one example), so learn the abstract prerequisite
+                    // from the real Use result and keep the action pending.
+                    // This is not a failed interaction: it is useful work that
+                    // cannot be performed with the current inventory.
+                    memory.key = key;
+                    memory.locked = true;
+                    memory.state = 0;
+                    memory.attempted = false;
+                    memory.activated = false;
+                    const int opportunity = interactionOpportunityId(entry.first);
+                    suppressedUntil.erase(opportunity);
+                    suppressionEvidence.erase(opportunity);
+                    suppressionCount.erase(opportunity);
+                    char prerequisite[160];
+                    snprintf(prerequisite, sizeof(prerequisite),
+                             "kind=%d id=%d required_key=%d reason=engine_rejected_use",
+                             int(memory.kind), memory.id, key);
+                    event("interaction_prerequisite_discovered", prerequisite);
+                    event("opportunity_deferred", prerequisite);
+                }
                 else
                     memory.state = 3;
                 snprintf(interactionDetail, sizeof(interactionDetail),
@@ -2361,6 +2558,63 @@ struct LLMapperBot::Impl
         return mechanismReceivers.find(tx)->second;
     }
 
+    void vectorResolved(int hit, int sectorId, int wallId, int spriteId,
+                        int x, int y, int z)
+    {
+        if (currentGoal != "VECTOR_ACTIVATE" || !currentObjective.active
+            || currentObjective.type != kObjectiveInteraction)
+            return;
+        auto found = interactions.find(currentObjective.interactionKey);
+        if (found == interactions.end())
+            return;
+        InteractionMemory &memory = found->second;
+        if (memory.activationMode != llmapper::kActivateVector)
+            return;
+        ++memory.vectorShotsResolved;
+        const bool intended = (memory.kind == kInteractionSprite
+                               && hit == 3 && spriteId == memory.id)
+            || (memory.kind == kInteractionWall && (hit == 0 || hit == 4)
+                && (wallId == memory.id || wallId == memory.target.wall));
+        if (!intended)
+            return;
+
+        ++memory.confirmedVectorHits;
+        if (memory.firstVectorHitTick < 0)
+            memory.firstVectorHitTick = observation.tick;
+        memory.attempted = true;
+        memory.activated = true;
+        memory.state = 2;
+        memory.observedLocalEffect = true;
+        memory.afterState = interactionStateSignature(memory);
+        lastSemanticProgressTick = observation.tick;
+        recoveryMode = false;
+
+        int tx = memory.target.mechanismTx;
+        int health = -1;
+        int vectorFlag = -1;
+        if (memory.kind == kInteractionSprite && inRange(memory.id, 0, kMaxSprites)
+            && validXSprite(sprite[memory.id].extra))
+        {
+            const XSPRITE &record = xsprite[sprite[memory.id].extra];
+            if (tx <= 0)
+                tx = record.txID;
+            health = record.health;
+            vectorFlag = record.Vector;
+        }
+        const int ammoSlot = gMe ? gMe->curWeapon - 1 : -1;
+        const int ammo = gMe && ammoSlot >= 0
+            && ammoSlot < int(sizeof(gMe->ammoCount) / sizeof(gMe->ammoCount[0]))
+            ? gMe->ammoCount[ammoSlot] : -1;
+        char detail[320];
+        snprintf(detail, sizeof(detail),
+                 "kind=%d instance=%d tx=%d hit=%d sector=%d wall=%d sprite=%d at=(%d,%d,%d) weapon=%d ammo=%d resolved=%d confirmed=%d health=%d vector=%d",
+                 int(memory.kind), memory.id, tx, hit, sectorId, wallId, spriteId,
+                 x, y, z, gMe ? gMe->curWeapon : 0, ammo,
+                 memory.vectorShotsResolved, memory.confirmedVectorHits,
+                 health, vectorFlag);
+        event("ranged_interaction_confirmed", detail);
+    }
+
     int mechanismReceiver(int tx) const
     {
         const std::vector<WorldObjectRef> &receivers = mechanismReceiversFor(tx);
@@ -2416,6 +2670,14 @@ struct LLMapperBot::Impl
                 return 4000000 + mechanism + 1;
         }
         return int(memory.kind) * 1000000 + memory.id + 1;
+    }
+
+    // Ledger identities must not overlap the pickup/frontier namespaces.
+    // interactionMemoryKey is already a structured key and may itself be in
+    // the 4,000,000 range, so adding only 1,000,000 aliases real sprite IDs.
+    static int interactionOpportunityId(int interactionKey)
+    {
+        return 10000000 + interactionKey;
     }
 
     int interactionStateSignature(const InteractionMemory &memory) const
@@ -2653,6 +2915,7 @@ struct LLMapperBot::Impl
             sibling.state = 2;
             sibling.observedLocalEffect = true;
             sibling.observedKnownWorldDelta = true;
+            sibling.consecutiveNoEffectAttempts = 0;
             sibling.afterState = interactionStateSignature(sibling);
         }
     }
@@ -2669,7 +2932,39 @@ struct LLMapperBot::Impl
         const int candidateMechanism = candidate.kind == kInteractionWall
             ? mechanismSector(candidate.target, candidate.targetSector) : -1;
         memory.id = candidateMechanism >= 0 ? candidateMechanism : candidate.id;
-        const bool sideChanged = memory.observed && memory.fromSector != candidate.fromSector;
+        const bool storedApproachReachable = memory.observed
+            && (memory.fromSector == observation.sector
+                || visitedSectors.count(memory.fromSector));
+        const bool candidateApproachReachable = candidate.fromSector == observation.sector
+            || visitedSectors.count(candidate.fromSector);
+        // A pushable sprite seen through its closed portal is reported by
+        // two layers: the portal collision scan supplies the reachable side,
+        // while the general visibility scan supplies the sprite's containing
+        // sector.  Preserve the executable pose until that containing sector
+        // really becomes reachable.
+        const bool preserveReachableSpriteApproach = memory.observed
+            && candidate.kind == kInteractionSprite
+            && storedApproachReachable && !candidateApproachReachable;
+        // Vector visibility proves that the current sector is *a* firing
+        // region; it does not make every sector seen while walking past the
+        // new canonical one.  Keep the first reachable firing layer stable.
+        // This matters for mechanisms observed from a moving support: a later
+        // glimpse from below must not erase the remembered aboard pose.  A
+        // trigger first discovered remotely (AGTST11) still records that
+        // remote sector on the first observation.
+        const bool preserveRemoteVectorApproach = memory.observed
+            && candidate.kind == kInteractionSprite
+            && candidate.activationMode == llmapper::kActivateVector
+            && storedApproachReachable
+            // The containing sector is only the discovery default.  Replace
+            // it once with the first proven remote firing layer (for example
+            // while aboard a platform), then keep that remote layer stable.
+            && memory.fromSector != memory.targetSector
+            && memory.fromSector != candidate.fromSector;
+        const bool sideChanged = memory.observed
+            && memory.fromSector != candidate.fromSector
+            && !preserveReachableSpriteApproach
+            && !preserveRemoteVectorApproach;
         // Among several surfaces driving one mechanism, the useful one is the
         // one the player can reach and face right now.
         const bool closerSurface = memory.observed && candidate.kind == kInteractionWall
@@ -2677,15 +2972,16 @@ struct LLMapperBot::Impl
             && candidate.target.wall != memory.target.wall
             && distance2(observation.x, observation.y, candidate.x, candidate.y)
                 < distance2(observation.x, observation.y, memory.x, memory.y);
-        memory.fromSector = candidate.fromSector;
         memory.targetSector = candidate.targetSector >= 0
             ? candidate.targetSector : candidateMechanism;
         // A reversible mechanism is usable from more than one side, and the
         // side that matters is the one the bot is standing on now.  Keeping
         // the first-seen approach point sent the bot at a pose it could no
         // longer reach once the door it came through closed behind it.
-        if (first || !canonicalSectorPush || sideChanged || closerSurface)
+        if (!preserveReachableSpriteApproach && !preserveRemoteVectorApproach
+            && (first || !canonicalSectorPush || sideChanged || closerSurface))
         {
+            memory.fromSector = candidate.fromSector;
             memory.x = candidate.x;
             memory.y = candidate.y;
             memory.z = candidate.z;
@@ -2713,11 +3009,21 @@ struct LLMapperBot::Impl
         // wall-push, the sector target is resolved through the usable portal
         // and the nearest marker is not necessarily the pose from which
         // ActionScan can see that sector.
-        memory.key = candidate.key;
-        memory.locked = candidate.locked;
+        // Observation can omit a prerequisite that the authoritative Use
+        // path subsequently revealed.  Do not erase learned causal knowledge
+        // merely because the same visible sprite/wall is sampled again.
+        if (candidate.key > 0 || memory.key == 0)
+            memory.key = candidate.key;
+        memory.locked = candidate.locked || memory.locked;
         memory.reversible = candidate.reversible;
         memory.activationMode = candidate.activationMode;
         memory.requiredEffects = candidate.requiredEffects;
+        if (candidate.causalWall >= 0)
+        {
+            memory.causalWall = candidate.causalWall;
+            memory.causalFrom = candidate.causalFrom;
+            memory.causalTo = candidate.causalTo;
+        }
         memory.observed = true;
         memory.target = candidate.target;
         const int receiver = mechanismSector(candidate.target,
@@ -2733,6 +3039,7 @@ struct LLMapperBot::Impl
             memory.state = 2;
             memory.observedLocalEffect = true;
             memory.observedKnownWorldDelta = true;
+            memory.consecutiveNoEffectAttempts = 0;
             memory.afterState = interactionStateSignature(memory);
         }
         const int newState = interactionStateSignature(memory);
@@ -2754,6 +3061,7 @@ struct LLMapperBot::Impl
             memory.activated = true;
             memory.observedLocalEffect = true;
             memory.observedKnownWorldDelta = true;
+            memory.consecutiveNoEffectAttempts = 0;
             recoveryMode = false;
             memory.afterState = newState;
             char detail[128];
@@ -2774,9 +3082,12 @@ struct LLMapperBot::Impl
         {
             recoveryMode = false;
             ++knowledgeRevision;
-            char detail[128];
-            snprintf(detail, sizeof(detail), "kind=%d id=%d sector=%d key=%d", int(memory.kind), memory.id,
-                     memory.fromSector, memory.key);
+            char detail[224];
+            snprintf(detail, sizeof(detail),
+                     "kind=%d id=%d approach_sector=%d target_sector=%d key=%d mode=%d at=(%d,%d,%d) blocker_sprite=%d",
+                     int(memory.kind), memory.id, memory.fromSector,
+                     memory.targetSector, memory.key, int(memory.activationMode),
+                     memory.x, memory.y, memory.z, memory.target.blockerSprite);
             event("discovered_interaction", detail);
             const unsigned missing = memory.requiredEffects
                 & ~availableEffectCapabilities();
@@ -2873,6 +3184,16 @@ struct LLMapperBot::Impl
         observation = observeWorld();
         if (observation.sector < 0)
             return;
+        if (!worldLoadedTelemetryEmitted)
+        {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "total_sectors=%d", numsectors);
+            event("world_loaded", detail);
+            worldLoadedTelemetryEmitted = true;
+        }
+        const int collisionWall = currentMoveWallHit();
+        if (collisionWall >= 0)
+            rememberCollisionInteraction(collisionWall);
         if (gMe->posture == kPostureCrouch)
         {
             // Keep the shortest crouching frame seen.  Blood's crouch is a
@@ -2947,6 +3268,29 @@ struct LLMapperBot::Impl
                      observation.localSectorExtra, observation.localSectorState,
                      observation.localSectorBusy, observation.playerZVelocity);
             event("local_geometry", detail);
+            for (int spriteId = headspritesect[observation.sector]; spriteId >= 0;
+                 spriteId = nextspritesect[spriteId])
+            {
+                const spritetype &record = sprite[spriteId];
+                if (!(record.cstat & CSTAT_SPRITE_BLOCK))
+                    continue;
+                int top = record.z, bottom = record.z;
+                GetSpriteExtents(&record, &top, &bottom);
+                const bool extended = validXSprite(record.extra);
+                char spriteDetail[320];
+                snprintf(spriteDetail, sizeof(spriteDetail),
+                         "sprite=%d type=%d stat=%d picnum=%d voxel=%d repeat=(%d,%d) pos=(%d,%d,%d) cstat=%d alignment=%d clipdist=%d top=%d bottom=%d push=%d vector=%d",
+                         spriteId, int(record.type), int(record.statnum),
+                         int(record.picnum), inRange(record.picnum, 0, MAXTILES)
+                             ? int(tiletovox[record.picnum]) : -1,
+                         int(record.xrepeat), int(record.yrepeat),
+                         int(record.x), int(record.y), int(record.z), int(record.cstat),
+                         int(record.cstat) & CSTAT_SPRITE_ALIGNMENT_MASK,
+                         record.clipdist << 2, top, bottom,
+                         extended && xsprite[record.extra].Push ? 1 : 0,
+                         extended && xsprite[record.extra].Vector ? 1 : 0);
+                event("local_solid_sprite", spriteDetail);
+            }
             lastGeometryTelemetrySector = observation.sector;
         }
         const size_t oldSectors = observedSectors.size();
@@ -3208,7 +3552,13 @@ struct LLMapperBot::Impl
             // Keep blocked boundaries as knowledge.  They are investigation
             // frontiers, not deleted topology.
             if (edge == edges.end())
+            {
                 edges.push_back(portal);
+                // The observed far-side landing is now eligible for the
+                // one-hop support mesh.  Rebuild even if the enclosing
+                // sector/wall identity itself did not change.
+                navTopologySignature = 0;
+            }
             else
                 *edge = portal;
             if (portal.traversable || portal.jumpable)
@@ -3447,6 +3797,7 @@ struct LLMapperBot::Impl
             memory.activated = true;
             memory.observedLocalEffect = true;
             memory.observedKnownWorldDelta = true;
+            memory.consecutiveNoEffectAttempts = 0;
             memory.afterState = interactionStateSignature(memory);
             ++knowledgeRevision;
             lastSemanticProgressTick = observation.tick;
@@ -3470,10 +3821,23 @@ struct LLMapperBot::Impl
                 ++knowledgeRevision;
             if (knownObjects.insert(object.sprite).second)
             {
-                char detail[160];
+                char detail[320];
                 const char *category = itemCategory(object.type);
-                snprintf(detail, sizeof(detail), "sprite=%d kind=%s category=%s sector=%d type=%d",
-                         object.sprite, objectName(object.kind), category ? category : "none", object.sector, object.type);
+                const spritetype &record = sprite[object.sprite];
+                int top = record.z, bottom = record.z;
+                GetSpriteExtents(&record, &top, &bottom);
+                const bool operable = validXSprite(record.extra)
+                    && (xsprite[record.extra].Push || xsprite[record.extra].Vector);
+                snprintf(detail, sizeof(detail),
+                         "sprite=%d kind=%s category=%s sector=%d type=%d pos=(%d,%d,%d) cstat=%d alignment=%d block=%d clipdist=%d top=%d bottom=%d push=%d vector=%d",
+                         object.sprite, objectName(object.kind), category ? category : "none",
+                         object.sector, object.type, int(record.x), int(record.y),
+                         int(record.z), int(record.cstat),
+                         int(record.cstat) & CSTAT_SPRITE_ALIGNMENT_MASK,
+                         (record.cstat & CSTAT_SPRITE_BLOCK) ? 1 : 0,
+                         record.clipdist << 2, top, bottom,
+                         operable && xsprite[record.extra].Push ? 1 : 0,
+                         operable && xsprite[record.extra].Vector ? 1 : 0);
                 event("observed_object", detail);
                 lastSemanticProgressTick = observation.tick;
                 ++knowledgeRevision;
@@ -3493,20 +3857,40 @@ struct LLMapperBot::Impl
             heldKeyMask |= 1u << unsigned(key);
             if (!heldKeys.insert(key).second)
                 continue;
-            // A new key re-arms every remembered door that wanted it, and
-            // clears their dormancy so the progression model changes at
-            // once rather than after a cooldown.
-            int rearmed = 0;
+            // A new key re-arms every remembered opportunity that wanted it,
+            // whether the gated object is a door wall, a sprite switch, or a
+            // sector interaction.  The engine's rejected Use may be the first
+            // place the prerequisite became observable.
+            int rearmedDoors = 0;
             for (const auto &door : lockedDoorKey)
             {
                 if (door.second != key)
                     continue;
                 suppressedUntil.erase(3000000 + door.first * 8 + int(kObjectiveFrontier));
                 suppressionCount.erase(3000000 + door.first * 8 + int(kObjectiveFrontier));
-                ++rearmed;
+                ++rearmedDoors;
             }
-            char detail[96];
-            snprintf(detail, sizeof(detail), "key=%d rearmed_doors=%d", key, rearmed);
+            int rearmedInteractions = 0;
+            for (auto &entry : interactions)
+            {
+                InteractionMemory &memory = entry.second;
+                if (memory.key != key || memory.engineAccepted)
+                    continue;
+                memory.state = 0;
+                memory.attempted = false;
+                memory.activated = false;
+                memory.unavailableAttempts = 0;
+                memory.unavailableFromSector = -1;
+                const int opportunity = interactionOpportunityId(entry.first);
+                suppressedUntil.erase(opportunity);
+                suppressionEvidence.erase(opportunity);
+                suppressionCount.erase(opportunity);
+                ++rearmedInteractions;
+            }
+            char detail[128];
+            snprintf(detail, sizeof(detail),
+                     "key=%d rearmed_doors=%d rearmed_interactions=%d",
+                     key, rearmedDoors, rearmedInteractions);
             event("acquired_key", detail);
             event("key_acquired", detail);
             lastSemanticProgressTick = observation.tick;
@@ -3558,7 +3942,8 @@ struct LLMapperBot::Impl
                 const InteractionMemory &memory = entry.second;
                 if (!memory.observed || !(memory.requiredEffects & gained))
                     continue;
-                const int opportunity = 1000000 + interactionMemoryKey(memory);
+                const int opportunity = interactionOpportunityId(
+                    interactionMemoryKey(memory));
                 suppressedUntil.erase(opportunity);
                 suppressionEvidence.erase(opportunity);
                 suppressionCount.erase(opportunity);
@@ -4136,6 +4521,50 @@ struct LLMapperBot::Impl
             + navTopologyRevision;
     }
 
+    // A frontier failure describes one particular geometry pose.  Once the
+    // support/portal topology has been rebuilt, retaining that verdict until
+    // its wall-clock cooldown expires confuses "failed before the mechanism
+    // moved" with "still impossible now".  Re-arm only frontier work whose
+    // suppression was recorded against older evidence; interaction and item
+    // prerequisites retain their own, capability-specific wake-up rules.
+    void rearmFrontiersForNewTopology()
+    {
+        int rearmed = 0;
+        std::vector<int> stale;
+        const int currentEvidence = worldEvidenceRevision();
+        for (const auto &entry : suppressedUntil)
+        {
+            const int key = entry.first;
+            if (key < 3000000 || key >= 4000000)
+                continue;
+            auto evidence = suppressionEvidence.find(key);
+            if (evidence != suppressionEvidence.end()
+                && evidence->second == currentEvidence)
+                continue;
+            stale.push_back(key);
+        }
+        for (int key : stale)
+        {
+            const int wallId = (key - 3000000 - int(kObjectiveFrontier)) / 8;
+            suppressedUntil.erase(key);
+            suppressionEvidence.erase(key);
+            suppressionCount.erase(key);
+            if (inRange(wallId, 0, numwalls))
+            {
+                failedEdges.erase(wallId * 65536 + wall[wallId].nextsector);
+                localFailureSignatures.erase(wallId * 65536 + wall[wallId].nextsector);
+            }
+            ++rearmed;
+        }
+        if (rearmed > 0)
+        {
+            char detail[96];
+            snprintf(detail, sizeof(detail), "revision=%d count=%d",
+                     navTopologyRevision, rearmed);
+            event("deferred_frontiers_rearmed", detail);
+        }
+    }
+
     int opportunityDormantUntil(int key) const
     {
         auto entry = suppressedUntil.find(key);
@@ -4164,6 +4593,7 @@ struct LLMapperBot::Impl
             {
                 if (portal.to < 0 || visitedSectors.count(portal.to))
                     continue;
+                bool transitHypothesis = false;
                 // A sector with no standable square is thin -- a step, a
                 // ledge, a door track.  The player passes through such a
                 // place rather than standing in it, so it is poor as a
@@ -4171,8 +4601,22 @@ struct LLMapperBot::Impl
                 // outright severed real routes.
                 if (!sectorHasStandableSpace(portal.to))
                 {
-                    noteTooNarrow(portal);
-                    continue;
+                    const int transitWidth = playerClipRadius() * 2 + 64;
+                    if (!portal.traversable || portal.openingWidth < transitWidth)
+                    {
+                        noteTooNarrow(portal);
+                        continue;
+                    }
+                    transitHypothesis = true;
+                    if (transitOnlySectors.insert(portal.to).second)
+                    {
+                        char detail[160];
+                        snprintf(detail, sizeof(detail),
+                                 "sector=%d via_wall=%d width=%d required=%d reason=cross_through_only",
+                                 portal.to, portal.wall, portal.openingWidth,
+                                 transitWidth);
+                        event("boundary_transit_only", detail);
+                    }
                 }
                 const int edgeId = portal.wall * 65536 + portal.to;
                 llmapper::Opportunity opportunity;
@@ -4186,7 +4630,37 @@ struct LLMapperBot::Impl
                 opportunity.local = from == observation.sector;
                 const bool crossable = (portal.traversable || portal.jumpable)
                     && !edgeFailed(edgeId) && !localEdgeFailed(edgeId);
-                if (portal.key && !hasKey(portal.key))
+                // A downward transition taller than Caleb can jump back up
+                // destroys the current component's optionality.  Keep it as
+                // a valid hypothesis, but let every known reversible action
+                // run first.  Geometry supplies this confidence directly;
+                // an unseen destination by itself is not considered risky.
+                if (crossable && portal.floorDelta > playerReversibleDrop())
+                    opportunity.oneWayRisk = portal.floorDelta;
+                if (transitHypothesis)
+                {
+                    // This is evidence that a route may exist, not yet an
+                    // observed actionable obstacle.  Let concrete unexplored
+                    // frontiers run first even when the sliver is beside the
+                    // player; the probe remains available when ordinary
+                    // exploration is exhausted.
+                    opportunity.local = false;
+                    // Once observation or a collision has supplied a concrete
+                    // mechanism for this boundary, the mechanism is the useful
+                    // opportunity.  Keeping the weaker geometry hypothesis as
+                    // well makes selection alternate between inspecting the
+                    // door and actually operating it.
+                    if (knownMechanismFor(portal))
+                        continue;
+                    if (llmapper::investigatedNow(investigatedBoundaries,
+                                                  portal.wall, portal.from,
+                                                  portal.to,
+                                                  portalIdentitySignature(portal)))
+                        continue;
+                    opportunity.kind = llmapper::kOpportunityBlocked;
+                    opportunity.id = 4000000 + portal.to;
+                }
+                else if (portal.key && !hasKey(portal.key))
                 {
                     opportunity.kind = llmapper::kOpportunityLocked;
                     opportunity.id = 3000000 + portal.wall * 8 + int(kObjectiveFrontier);
@@ -4243,31 +4717,51 @@ struct LLMapperBot::Impl
                 continue;
             if (memory.attempted && !interactionNeedsReactivation(memory))
                 continue;
-            if (!inRange(memory.fromSector, 0, int(hops.size())))
+            // Rank an action from the place where its physical prerequisite
+            // can actually be satisfied.  A remotely visible actuator can be
+            // in a visited room while requiring Caleb to stand on an unseen
+            // carrier.  Treating the visible room as the opportunity location
+            // commits the action too early and invents the actuator's XY on
+            // that carrier; leaving it unreachable lets the carrier's normal
+            // exploration frontier be chosen first.
+            // The early-ordering constraint is specific to a ranged actuator
+            // that would send its carrier away if fired from elsewhere.
+            // Ordinary Use mechanisms can also be lift-call controls; making
+            // their last occupied carrier the ledger location prevents a bot
+            // that fell or stepped off from calling the lift back.
+            const int requiredSupport = memory.activationMode == llmapper::kActivateVector
+                ? actionSupportPrerequisite(memory) : -1;
+            const int opportunitySector = requiredSupport >= 0
+                ? requiredSupport : memory.fromSector;
+            if (!inRange(opportunitySector, 0, int(hops.size())))
                 continue;
-            const int reach = hops[size_t(memory.fromSector)];
+            const int reach = hops[size_t(opportunitySector)];
             if (reach < 0)
                 continue;
             llmapper::Opportunity opportunity;
             opportunity.kind = memory.key && !hasKey(memory.key)
                 ? llmapper::kOpportunityLocked : llmapper::kOpportunityInteraction;
-            opportunity.id = 1000000 + interactionMemoryKey(memory);
-            opportunity.sector = memory.fromSector;
+            opportunity.id = interactionOpportunityId(
+                interactionMemoryKey(memory));
+            opportunity.sector = opportunitySector;
             opportunity.target = memory.targetSector;
             opportunity.wall = memory.target.wall;
             opportunity.requiredKey = memory.key;
             opportunity.requiredEffects = memory.requiredEffects;
-            opportunity.depth = sectorDepth(memory.fromSector);
+            opportunity.depth = sectorDepth(opportunitySector);
             opportunity.hops = reach;
-            opportunity.local = memory.fromSector == observation.sector;
+            opportunity.local = opportunitySector == observation.sector;
             opportunity.dormantUntil = opportunityDormantUntil(opportunity.id);
             ledger.push_back(opportunity);
         }
 
-        std::set<int> navSectors = observedSectors;
-        navSectors.insert(visitedSectors.begin(), visitedSectors.end());
-        if (inRange(observation.sector, 0, numsectors))
-            navSectors.insert(observation.sector);
+        std::set<int> navSectors = knownNavSectors();
+        // A locally observed portal exposes the geometry immediately on its
+        // far side even before Caleb has entered that sector.  Include that
+        // one-hop landing layer so a support touching the boundary can be a
+        // prerequisite pose (voxel -> raised sector, bridge -> doorway).
+        // This is bounded to edges observed from known space; it does not
+        // flood through undiscovered map topology.
         for (int sectorId : navSectors)
         {
             if (!inRange(sectorId, 0, int(hops.size())))
@@ -4324,7 +4818,26 @@ struct LLMapperBot::Impl
             const bool suppliesEffectPrerequisite =
                 (pickupEffectCapabilities(memory.object.type)
                     & pendingEffectPrerequisites) != 0;
-            opportunity.local = reach == 0 || suppliesRangedPrerequisite
+            bool physicallyOnTheWay = reach == 0;
+            if (physicallyOnTheWay && memory.object.kind == kObjectPickup)
+            {
+                ensureNavTopology();
+                const int objectCell = navCellInSector(
+                    memory.object.sector, memory.object.x, memory.object.y,
+                    memory.object.z);
+                // Sharing a sector number is not sharing a physical layer.
+                // Retail ROR rooms and bridges can put a visible pickup tens
+                // of thousands of Z units below the player in the same
+                // sector.  Keep optional loot deferred until its collision-
+                // derived support is genuinely local; prerequisites may still
+                // promote it deliberately.
+                physicallyOnTheWay = objectCell >= 0
+                    && (navCells[size_t(objectCell)].support == currentPlayerSupport()
+                        || std::abs(navCells[size_t(objectCell)].z
+                                    - llmapper::capability::playerFloorZ())
+                            <= kMaxWalkableStep);
+            }
+            opportunity.local = physicallyOnTheWay || suppliesRangedPrerequisite
                 || suppliesEffectPrerequisite;
             opportunity.dormantUntil = opportunityDormantUntil(opportunity.id);
             ledger.push_back(opportunity);
@@ -4884,6 +5397,11 @@ struct LLMapperBot::Impl
     // currently shut, the real next step is opening that connection.
     const llmapper::Opportunity *gateBefore(const llmapper::Opportunity &target) const
     {
+        // Work already in Caleb's current sector has no route gate.  A stale
+        // first-gate annotation for that sector must not replace a reachable
+        // pickup or viewpoint with an unrelated boundary interaction.
+        if (target.sector == observation.sector)
+            return nullptr;
         if (!inRange(target.sector, 0, int(routeGateWall.size())))
             return nullptr;
         const int gate = routeGateWall[size_t(target.sector)];
@@ -4938,7 +5456,7 @@ struct LLMapperBot::Impl
             break;
         case llmapper::kOpportunityInteraction:
         {
-            auto memory = interactions.find(opportunity->id - 1000000);
+            auto memory = interactions.find(opportunity->id - 10000000);
             if (memory == interactions.end())
                 return false;
             objective.type = kObjectiveInteraction;
@@ -5004,10 +5522,11 @@ struct LLMapperBot::Impl
         mission = chosen;
         char detail[256];
         snprintf(detail, sizeof(detail),
-                 "reason=%s kind=%d opportunity=%d sector=%d target=%d wall=%d depth=%d hops=%d key=%d from_sector=%d",
+                 "reason=%s kind=%d opportunity=%d sector=%d target=%d wall=%d depth=%d hops=%d key=%d one_way_risk=%d from_sector=%d",
                  chosen.reason, int(opportunity->kind), opportunity->id,
                  opportunity->sector, opportunity->target, opportunity->wall,
                  opportunity->depth, opportunity->hops, opportunity->requiredKey,
+                 opportunity->oneWayRisk,
                  observation.sector);
         event("mission_selected", detail);
         if (backtrack)
@@ -5196,7 +5715,8 @@ struct LLMapperBot::Impl
             if (dead && countedKills.insert(sprite_id).second)
             {
                 char detail[96];
-                snprintf(detail, sizeof(detail), "sprite=%d type=%d", sprite_id, dude.type);
+                snprintf(detail, sizeof(detail), "sprite=%d type=%d",
+                         sprite_id, int(dude.type));
                 event("enemy_killed", detail);
                 lastSemanticProgressTick = observation.tick;
             }
@@ -5354,7 +5874,8 @@ struct LLMapperBot::Impl
             InteractionMemory &memory = entry.second;
             if (!memory.observed)
                 continue;
-            if (objectiveSuppressed(1000000 + interactionMemoryKey(memory)))
+            if (objectiveSuppressed(interactionOpportunityId(
+                    interactionMemoryKey(memory))))
                 continue;
             const bool reactivation = interactionNeedsReactivation(memory);
             if (memory.attempted && !reactivation
@@ -5408,6 +5929,8 @@ struct LLMapperBot::Impl
 
     bool interactionNeedsReactivation(const InteractionMemory &memory) const
     {
+        if (memory.consecutiveNoEffectAttempts >= kMaxActivationAttempts)
+            return false;
         if (supportTransitionUseful(memory))
             return true;
         if (!memory.attempted || !memory.activated || !memory.reversible
@@ -5595,12 +6118,27 @@ struct LLMapperBot::Impl
     int reachableSupportPose(int supportSector, int aimX, int aimY)
     {
         ensureNavTopology();
-        const int start = nearestNavCell(observation.sector, observation.x,
-                                         observation.y,
-                                         llmapper::capability::playerFloorZ());
+        const int start = currentNavStartCell();
         if (start < 0)
             return -1;
-        const int area = navCells[size_t(start)].walkArea;
+        std::vector<char> reachable(navCells.size(), 0);
+        std::deque<int> reachQueue;
+        reachable[size_t(start)] = 1;
+        reachQueue.push_back(start);
+        while (!reachQueue.empty())
+        {
+            const int current = reachQueue.front();
+            reachQueue.pop_front();
+            for (const NavLink &link : navCells[size_t(current)].links)
+            {
+                if (!llmapper::traversableMode(link.mode)
+                    || !inRange(link.target, 0, int(navCells.size()))
+                    || reachable[size_t(link.target)])
+                    continue;
+                reachable[size_t(link.target)] = 1;
+                reachQueue.push_back(link.target);
+            }
+        }
         const SupportRef required(kSupportSectorFloor, supportSector);
         int best = -1;
         int bestAimDistance = INT32_MAX;
@@ -5608,7 +6146,7 @@ struct LLMapperBot::Impl
         for (const NavCell &cell : navCells)
         {
             if (cell.sector != supportSector || cell.support != required
-                || cell.walkArea != area)
+                || !reachable[size_t(cell.id)])
                 continue;
             const int aimDistance = distance2(cell.center.x, cell.center.y, aimX, aimY);
             const int playerDistance = distance2(cell.center.x, cell.center.y,
@@ -5625,6 +6163,55 @@ struct LLMapperBot::Impl
         return best;
     }
 
+    int interactionExplosionRadius(const InteractionMemory &memory,
+                                   int producerWeapon = 0) const
+    {
+        int radius = explosiveWeaponRadius(producerWeapon);
+        if (memory.kind == kInteractionSprite
+            && inRange(memory.id, 0, kMaxSprites)
+            && sprite[memory.id].statnum < kMaxStatus)
+            radius = std::max(radius, explosiveSpriteRadius(sprite[memory.id]));
+        return radius;
+    }
+
+    int findDeliveredExplosive(const InteractionMemory &memory) const
+    {
+        int best = -1;
+        int bestDistance = INT32_MAX;
+        for (int spriteId = headspritestat[kStatThing]; spriteId >= 0;
+             spriteId = nextspritestat[spriteId])
+        {
+            const spritetype &record = sprite[spriteId];
+            if (record.type != kThingArmedTNTBundle
+                && record.type != kThingArmedTNTStick
+                && record.type != kThingArmedRemoteBomb
+                && record.type != kThingArmedProxBomb)
+                continue;
+            const int distance = distance2(record.x, record.y,
+                                           memory.x, memory.y);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = spriteId;
+            }
+        }
+        return best;
+    }
+
+    GINPUT retreatFromExplosion(int hazardX, int hazardY, int targetId)
+    {
+        GINPUT input = {};
+        input.syncFlags.run = 1;
+        const int face = getangle(hazardX - observation.x,
+                                  hazardY - observation.y);
+        const int turn = angleDelta(face, observation.angle);
+        input.q16turn = fix16_from_int(turn);
+        if (std::abs(turn) < 128)
+            input.forward = -kFullThrottle;
+        noteCameraOwner("EXPLOSIVE_RETREAT", targetId, face, 0);
+        return input;
+    }
+
     // Deliver a Vector activation with the weapon's real vector reach.  The
     // target may move itself, operate something remote, or merely change
     // state; Vector is an activation mode and says nothing about destruction.
@@ -5637,23 +6224,29 @@ struct LLMapperBot::Impl
         // sector's height; for a shot that means firing at the ceiling, and
         // from off to one side, at nothing at all.  A wall spans the full
         // height, so the shot is simply level, straight at its midpoint.
-        const int aimAngle = getangle(memory.x - observation.x, memory.y - observation.y);
-        const int turn = angleDelta(aimAngle, observation.angle);
-        const int horizontal = std::max(1, int(std::sqrt(double(distance2(
-            observation.x, observation.y, memory.x, memory.y)))));
-        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
-        const int eyeZ = gMe->pSprite->z - stand.eyeAboveZ;
+        int aimX = memory.x;
+        int aimY = memory.y;
+        // Match FireTommy/FireShotgun's actual vector origin.  Eye height is
+        // close enough for visibility, but not for a thin distant actuator.
+        const int shotZ = gMe->zWeapon;
         const int targetSpan = std::max(1, memory.target.interactionBottomZ
                                            - memory.target.interactionTopZ);
         const int edgeInset = std::min(1024, std::max(64, targetSpan / 4));
-        const int aimZ = std::max(memory.target.interactionTopZ + edgeInset,
-                                  std::min(memory.target.interactionBottomZ - edgeInset,
-                                           eyeZ));
-        const int desiredLook = vectorLookAngleForTarget(eyeZ, aimZ, horizontal);
-        const int lookDelta = desiredLook - fix16_to_int(gMe->q16look);
+        // A sprite actuator may occupy a small opening far above or below
+        // eye level.  Its recorded centre is the engine-authored vector-hit
+        // target; clamping eye height into its bounding box biases toward an
+        // edge and can put the ray into the wall surrounding that opening.
+        // Walls themselves still use the level-shot behaviour described
+        // above because they span the opening.
+        const int preferredAimZ = memory.kind == kInteractionSprite
+            ? memory.z : shotZ;
+        int aimZ = std::max(memory.target.interactionTopZ + edgeInset,
+                            std::min(memory.target.interactionBottomZ - edgeInset,
+                                     preferredAimZ));
 
         int weapon = 0;
-        const bool ranged = rangedWeaponAvailable(weapon);
+        VECTOR_TYPE vectorType = kVectorTine;
+        const bool ranged = vectorWeaponAvailable(weapon, vectorType);
         if (!ranged && meleeWeaponAvailable())
             weapon = kWeaponPitchfork;
         if (!weapon)
@@ -5661,6 +6254,98 @@ struct LLMapperBot::Impl
             memory.unavailableFromSector = observation.sector;
             event("break_obstacle_unarmed", "reason=no_weapon_available");
             return input;
+        }
+
+        // A vector-triggered masked wall can be mostly transparent. Its
+        // geometric midpoint is then a valid line of sight through the
+        // opening, but not a hit on the actuator itself. Search a small,
+        // deterministic set of points on the authored wall surface and keep
+        // only one whose canonical engine vector actually resolves to that
+        // wall. This reasons from collision/hitscan geometry, not texture or
+        // map identity, and avoids relying on weapon spread for success.
+        if (ranged && memory.kind == kInteractionWall
+            && inRange(memory.target.wall, 0, numwalls)
+            && inRange(wall[memory.target.wall].point2, 0, numwalls))
+        {
+            const walltype &start = wall[memory.target.wall];
+            const walltype &end = wall[start.point2];
+            static const int fractions[] = { 1, 3, 5, 7, 8, 9, 11, 13, 15 };
+            bool foundSurface = false;
+            const HITINFO savedHit = gHitInfo;
+            for (int zFraction = 1; zFraction <= 3 && !foundSurface; ++zFraction)
+            {
+                const int candidateZ = memory.target.interactionTopZ
+                    + int(int64_t(memory.target.interactionBottomZ
+                                  - memory.target.interactionTopZ)
+                          * zFraction / 4);
+                for (int fraction : fractions)
+                {
+                    const int candidateX = start.x
+                        + int(int64_t(end.x - start.x) * fraction / 16);
+                    const int candidateY = start.y
+                        + int(int64_t(end.y - start.y) * fraction / 16);
+                    const int candidateAngle = getangle(
+                        candidateX - observation.x, candidateY - observation.y);
+                    const int candidateDistance = std::max(1, int(std::sqrt(
+                        double(distance2(observation.x, observation.y,
+                                         candidateX, candidateY)))));
+                    const int candidateDz = divscale10(candidateZ - shotZ,
+                                                       candidateDistance);
+                    vec3_t adjustedOrigin = {};
+                    const int hit = !VanillaMode()
+                        ? VectorScanROR(gMe->pSprite, 0, shotZ - gMe->pSprite->z,
+                                        Cos(candidateAngle) >> 16,
+                                        Sin(candidateAngle) >> 16, candidateDz,
+                                        gVectorData[vectorType].maxDist, 1,
+                                        &adjustedOrigin)
+                        : VectorScan(gMe->pSprite, 0,
+                                     shotZ - gMe->pSprite->z,
+                                     Cos(candidateAngle) >> 16,
+                                     Sin(candidateAngle) >> 16, candidateDz,
+                                     gVectorData[vectorType].maxDist, 1);
+                    if ((hit == 0 || hit == 4)
+                        && gHitInfo.hitwall == memory.target.wall)
+                    {
+                        aimX = candidateX;
+                        aimY = candidateY;
+                        aimZ = candidateZ;
+                        foundSurface = true;
+                        break;
+                    }
+                }
+            }
+            gHitInfo = savedHit;
+        }
+
+        const int aimAngle = getangle(aimX - observation.x,
+                                      aimY - observation.y);
+        const int turn = angleDelta(aimAngle, observation.angle);
+        const int horizontal = std::max(1, int(std::sqrt(double(distance2(
+            observation.x, observation.y, aimX, aimY)))));
+        const int desiredLook = vectorLookAngleForTarget(shotZ, aimZ, horizontal);
+        const int lookDelta = desiredLook - fix16_to_int(gMe->q16look);
+        const int hazardRadius = interactionExplosionRadius(memory);
+        const int safeDistance = safeExplosionSeparation(hazardRadius);
+        if (safeDistance > 0)
+        {
+            if (!ranged)
+            {
+                memory.unavailableFromSector = observation.sector;
+                event("explosive_interaction_deferred",
+                      "reason=no_safe_ranged_satisfier");
+                return input;
+            }
+            if (memory.effectBlastRadius != hazardRadius)
+            {
+                memory.effectBlastRadius = hazardRadius;
+                char detail[176];
+                snprintf(detail, sizeof(detail),
+                         "kind=%d id=%d radius=%d safe_distance=%d source=engine_explosion_table",
+                         int(memory.kind), memory.id, hazardRadius, safeDistance);
+                event("explosive_safety_envelope", detail);
+            }
+            if (horizontal < safeDistance)
+                return retreatFromExplosion(memory.x, memory.y, memory.id);
         }
         // Melee has to be within reach; a firearm needs a clear shot.  Firing
         // from wherever the approach happened to stop just buries the burst
@@ -5677,15 +6362,51 @@ struct LLMapperBot::Impl
         // what remote receiver the activation may drive.
         const int shotTargetSector = memory.kind == kInteractionSprite
             && memory.targetSector >= 0 ? memory.targetSector : activationSector;
-        const bool clearShot = cansee(observation.x, observation.y, eyeZ,
-                                      observation.sector, memory.x, memory.y,
+        const bool clearShot = cansee(observation.x, observation.y, shotZ,
+                                      observation.sector, aimX, aimY,
                                       aimZ, shotTargetSector);
-        const int reach = weapon == kWeaponPitchfork ? meleeReach() : kActionApproachRange * 2;
+        const int reach = meleeReach();
         const int distance2ToWall = distance2(observation.x, observation.y,
                                               memory.x, memory.y);
-        if (distance2ToWall > reach * reach || !clearShot)
+        if ((!ranged && distance2ToWall > reach * reach) || !clearShot)
         {
             noteCameraOwner("NAVIGATION", memory.id, aimAngle, 0);
+            // If target projection deliberately brought us onto an upright
+            // sprite top, that support is a take-off point, not the final
+            // answer.  A high actuator or opening may only become visible
+            // during the next jump (stacked/ROR geometry is a common Build
+            // example).  Continue the physically implied climb while we are
+            // grounded on the exact support selected for this target; without
+            // this, ordinary steering immediately walks off the narrow top
+            // and reconstructs the same climb forever.
+            const SupportRef standingSupport = currentPlayerSupport();
+            if (standingSupport.kind == kSupportSpriteFloor
+                && gMe && gMe->pXSprite && gMe->pXSprite->height == 0)
+            {
+                ensureNavTopology();
+                const int stance = navCellInSector(activationSector,
+                                                   memory.x, memory.y,
+                                                   memory.z);
+                if (stance >= 0
+                    && navCells[size_t(stance)].support == standingSupport
+                    && memory.z < llmapper::capability::playerFloorZ()
+                    && llmapper::capability::playerJumpImpulse() < 0)
+                {
+                    const int64_t takeoffKey = (int64_t(standingSupport.id) << 32)
+                        ^ uint32_t(memory.id);
+                    if (reportedSpriteSupportTakeoffs.insert(takeoffKey).second)
+                    {
+                        char detail[160];
+                        snprintf(detail, sizeof(detail),
+                                 "sprite=%d target=%d support_z=%d target_z=%d",
+                                 standingSupport.id, memory.id,
+                                 llmapper::capability::playerFloorZ(), memory.z);
+                        event("nav_sprite_support_takeoff", detail);
+                    }
+                    return steerTo(memory.x, memory.y, false, false, memory.id,
+                                   activationSector, kTraversalJumpable);
+                }
+            }
             if (currentObjective.requiredSupportSector >= 0)
             {
                 const int pose = reachableSupportPose(
@@ -5719,7 +6440,83 @@ struct LLMapperBot::Impl
             }
             return input;
         }
-        if (std::abs(turn) < 96 && std::abs(lookDelta) < 96 && clearShot)
+        // Verify the canonical, unspread ray with the engine before spending
+        // ammunition.  Yaw/look are input requests; gMe->aim is the
+        // interpolated/auto-aimed vector the weapon will actually consume.
+        // The authoritative post-shot callback remains the success test
+        // because the weapon adds its own dispersion after this point.
+        const HITINFO savedHit = gHitInfo;
+        vec3_t adjustedOrigin = {};
+        const int predictedHit = !VanillaMode()
+            ? VectorScanROR(gMe->pSprite, 0, shotZ - gMe->pSprite->z,
+                            gMe->aim.dx, gMe->aim.dy, gMe->aim.dz,
+                            gVectorData[vectorType].maxDist, 1, &adjustedOrigin)
+            : VectorScan(gMe->pSprite, 0, shotZ - gMe->pSprite->z,
+                         gMe->aim.dx, gMe->aim.dy, gMe->aim.dz,
+                         gVectorData[vectorType].maxDist, 1);
+        const int predictedWall = gHitInfo.hitwall;
+        const int predictedSprite = gHitInfo.hitsprite;
+        const int predictedSector = gHitInfo.hitsect;
+        gHitInfo = savedHit;
+        const bool predictedTarget = (memory.kind == kInteractionSprite
+                                      && predictedHit == 3
+                                      && predictedSprite == memory.id)
+            || (memory.kind == kInteractionWall
+                && (predictedHit == 0 || predictedHit == 4)
+                && (predictedWall == memory.id
+                    || predictedWall == memory.target.wall));
+        const int actualAimAngle = getangle(gMe->aim.dx, gMe->aim.dy);
+        const int aimYawError = angleDelta(aimAngle, actualAimAngle);
+        const int desiredDz = divscale10(aimZ - shotZ, horizontal);
+        const int aimSlopeError = desiredDz - gMe->aim.dz;
+        if (!memory.firingSolutionReported && predictedTarget)
+        {
+            memory.firingSolutionReported = true;
+            char solution[384];
+            snprintf(solution, sizeof(solution),
+                     "kind=%d instance=%d tx=%d origin=(%d,%d,%d,s%d) target=(%d,%d,%d,s%d) desired_yaw=%d desired_dz=%d actual_yaw=%d actual_dz=%d yaw_error=%d slope_error=%d predicted_hit=%d predicted_sector=%d predicted_wall=%d predicted_sprite=%d weapon=%d vector=%d",
+                     int(memory.kind), memory.id, memory.target.mechanismTx,
+                     observation.x, observation.y, shotZ, observation.sector,
+                     memory.x, memory.y, aimZ, shotTargetSector,
+                     aimAngle, desiredDz, actualAimAngle, gMe->aim.dz,
+                     aimYawError, aimSlopeError, predictedHit, predictedSector,
+                     predictedWall, predictedSprite, weapon, int(vectorType));
+            event("ranged_firing_solution", solution);
+        }
+        if (!memory.blockedFiringSolutionReported
+            && std::abs(turn) < 96 && std::abs(lookDelta) < 96
+            && clearShot && !predictedTarget)
+        {
+            memory.blockedFiringSolutionReported = true;
+            int predictedExtra = -1;
+            int predictedVector = 0;
+            int predictedTx = 0;
+            int predictedOwner = -1;
+            int predictedNext = -1;
+            if (inRange(predictedWall, 0, numwalls))
+            {
+                predictedExtra = wall[predictedWall].extra;
+                predictedOwner = wallOwnerSector(predictedWall);
+                predictedNext = wall[predictedWall].nextsector;
+                if (inRange(predictedExtra, 1, kMaxXWalls))
+                {
+                    predictedVector = xwall[predictedExtra].triggerVector;
+                    predictedTx = xwall[predictedExtra].txID;
+                }
+            }
+            char blocked[448];
+            snprintf(blocked, sizeof(blocked),
+                     "kind=%d instance=%d desired_wall=%d predicted_hit=%d predicted_sector=%d predicted_wall=%d predicted_sprite=%d predicted_extra=%d predicted_vector=%d predicted_tx=%d predicted_owner=%d predicted_next=%d desired_yaw=%d actual_yaw=%d yaw_error=%d desired_dz=%d actual_dz=%d slope_error=%d",
+                     int(memory.kind), memory.id, memory.target.wall,
+                     predictedHit, predictedSector, predictedWall,
+                     predictedSprite, predictedExtra, predictedVector,
+                     predictedTx, predictedOwner, predictedNext,
+                     aimAngle, actualAimAngle, aimYawError,
+                     desiredDz, gMe->aim.dz, aimSlopeError);
+            event("ranged_firing_solution_blocked", blocked);
+        }
+        if (std::abs(turn) < 96 && std::abs(lookDelta) < 96 && clearShot
+            && predictedTarget)
         {
             input.buttonFlags.shoot = 1;
             memory.attempted = true;
@@ -5791,18 +6588,21 @@ struct LLMapperBot::Impl
         const bool clearDelivery = cansee(observation.x, observation.y, eyeZ,
                                           observation.sector, memory.x, memory.y,
                                           aimZ, memory.targetSector);
+        const int blastRadius = interactionExplosionRadius(memory, weapon);
+        const int safeDistance = safeExplosionSeparation(blastRadius);
+        const int maxStandOff = safeDistance + kExplosiveThrowAllowance;
 
         // Establish a real delivery pose before consuming explosives.  Too
         // far makes a throw unreliable; too close turns a valid solution
         // into self-damage.  Facing the target while backpedalling keeps the
         // camera and retreat direction stable.
-        if (horizontal > kExplosiveMaxStandOff || !clearDelivery)
+        if (horizontal > maxStandOff || !clearDelivery)
             return navigateTo(memory.x, memory.y, memory.z, memory.fromSector,
                               memory.id, kTraversalUnknown);
         input.q16turn = fix16_from_int(turn);
         input.q16mlook = encodeLook(lookDelta);
         noteCameraOwner("EXPLOSIVE_EFFECT", memory.id, aimAngle, desiredLook);
-        if (horizontal < kExplosiveMinStandOff)
+        if (horizontal < safeDistance)
         {
             input.forward = -kFullThrottle;
             return input;
@@ -5815,11 +6615,11 @@ struct LLMapperBot::Impl
             if (memory.effectWeapon != weapon)
             {
                 memory.effectWeapon = weapon;
-                char detail[160];
+                char detail[240];
                 snprintf(detail, sizeof(detail),
-                         "kind=%d id=%d required_effects=%u producer_weapon=%d distance=%d",
+                         "kind=%d id=%d required_effects=%u producer_weapon=%d distance=%d blast_radius=%d safe_distance=%d source=engine_explosion_table",
                          int(memory.kind), memory.id, memory.requiredEffects, weapon,
-                         horizontal);
+                         horizontal, blastRadius, safeDistance);
                 event("effect_satisfier_selected", detail);
             }
             return input;
@@ -5838,11 +6638,16 @@ struct LLMapperBot::Impl
                 memory.beforePortals = observation.portals;
                 memory.effectStartedTick = observation.tick;
                 memory.effectAmmoBefore = gMe->ammoCount[weapon - 1];
+                memory.effectBlastRadius = blastRadius;
                 ++memory.activationCount;
                 event("effect_delivery_started", "delivery=explosive_projectile");
+                input.buttonFlags.shoot = 1;
+                memory.lastActivationTick = observation.tick;
+                return input;
             }
-            input.buttonFlags.shoot = 1;
-            memory.lastActivationTick = observation.tick;
+            if (horizontal < safeDistance + kExplosiveSafetyMargin
+                && observation.tick - memory.effectStartedTick < 3 * kTicsPerSec)
+                return retreatFromExplosion(memory.x, memory.y, memory.id);
             return input;
         }
 
@@ -5863,6 +6668,8 @@ struct LLMapperBot::Impl
             }
             memory.effectStartedTick = observation.tick;
             memory.effectAmmoBefore = gMe->ammoCount[weapon - 1];
+            memory.effectProjectile = -1;
+            memory.effectBlastRadius = blastRadius;
             memory.effectPhase = 1;
             ++memory.activationCount;
             input.buttonFlags.shoot = 1;
@@ -5889,13 +6696,40 @@ struct LLMapperBot::Impl
         }
         if (memory.effectPhase >= 2)
         {
-            if (horizontal < kExplosiveMaxStandOff + 768
-                && observation.tick - memory.effectStartedTick < 2 * kTicsPerSec)
-                input.forward = -kFullThrottle;
+            if (memory.effectProjectile < 0)
+            {
+                memory.effectProjectile = findDeliveredExplosive(memory);
+                if (memory.effectProjectile >= 0)
+                {
+                    char detail[176];
+                    snprintf(detail, sizeof(detail),
+                             "sprite=%d type=%d radius=%d safe_distance=%d",
+                             memory.effectProjectile,
+                             int(sprite[memory.effectProjectile].type),
+                             memory.effectBlastRadius,
+                             safeExplosionSeparation(memory.effectBlastRadius));
+                    event("explosive_projectile_tracked", detail);
+                }
+            }
+            int hazardX = memory.x;
+            int hazardY = memory.y;
+            if (inRange(memory.effectProjectile, 0, kMaxSprites)
+                && sprite[memory.effectProjectile].statnum < kMaxStatus)
+            {
+                hazardX = sprite[memory.effectProjectile].x;
+                hazardY = sprite[memory.effectProjectile].y;
+            }
+            const int actualDistance = int(std::sqrt(double(distance2(
+                observation.x, observation.y, hazardX, hazardY))));
+            const int required = safeExplosionSeparation(memory.effectBlastRadius);
+            if (actualDistance < required
+                && observation.tick - memory.effectStartedTick < 4 * kTicsPerSec)
+                return retreatFromExplosion(hazardX, hazardY, memory.id);
             if (observation.tick - memory.effectStartedTick > kExplosiveOutcomeTicks)
             {
                 memory.effectPhase = 0;
                 memory.effectStartedTick = -1;
+                memory.effectProjectile = -1;
                 event("effect_delivery_retry", "reason=no_world_delta_yet");
             }
         }
@@ -5928,6 +6762,54 @@ struct LLMapperBot::Impl
                     approachZ = cell.z;
                 }
             }
+            // A support-constrained activation or an objective that began as a
+            // local physical approach needs the detailed graph first: it
+            // carries exact moving-support and sprite-layer state that a sector
+            // route deliberately omits.  A remembered remote interaction return
+            // instead prefers the broader directed sector graph, which retains
+            // valid gap/elevator transport even when the detailed mesh is split
+            // into disconnected vertical components.
+            const bool needsExactSupport =
+                currentObjective.requiredSupportSector >= 0
+                || currentObjective.interactionRouteMode == 1;
+            Portal route;
+            if (!needsExactSupport
+                && findKnownRoute(requiredApproachSector, route))
+                return steerPortal(route);
+
+            const int approachSignature = navigationSignature(
+                approachX, approachY, approachZ, requiredApproachSector,
+                memory.id);
+            ensureNavTopology();
+            const bool detailedRoute = (!navRoute.empty()
+                    && navRouteSignature == approachSignature
+                    && navRouteTopologyRevision == navTopologyRevision)
+                || (navRouteRejectedSignature != approachSignature
+                    && buildNavRoute(approachX, approachY, approachZ,
+                                     requiredApproachSector,
+                                     approachSignature));
+            if (detailedRoute)
+            {
+                const GINPUT approach = navigateTo(
+                    approachX, approachY, approachZ, requiredApproachSector,
+                    memory.id, kTraversalUnknown);
+                // A deliberate route state can emit a neutral transition
+                // frame.  It still owns steering until it clears itself.
+                if ((!navRoute.empty()
+                     && navRouteSignature == approachSignature)
+                    || approach.forward || approach.strafe || approach.q16turn
+                    || approach.q16mlook || approach.buttonFlags.jump
+                    || approach.buttonFlags.crouch)
+                    return approach;
+            }
+
+            // When the detailed mesh cannot connect vertical/gap components,
+            // execute the first currently valid directed sector transition.
+            // Point navigation toward a remote switch can see a straight XY
+            // line through a pit, while steerPortal retains the required
+            // run-up/jump, raised-support, elevator, or walk transaction.
+            if (findKnownRoute(requiredApproachSector, route))
+                return steerPortal(route);
             const GINPUT approach = navigateTo(approachX, approachY, approachZ,
                                                requiredApproachSector, memory.id,
                                                kTraversalUnknown);
@@ -5935,11 +6817,8 @@ struct LLMapperBot::Impl
                 || approach.q16mlook || approach.buttonFlags.jump
                 || approach.buttonFlags.crouch)
                 return approach;
-            // The navigator produced nothing at all: fall back to the single
-            // known crossing toward that sector before giving up on it.
-            Portal route;
-            if (findKnownRoute(requiredApproachSector, route))
-                return steerPortal(route);
+            // Neither the known directed transport graph nor the local mesh
+            // currently reaches the required approach layer.
             memory.unavailableFromSector = observation.sector;
             return GINPUT{};
         }
@@ -5995,6 +6874,41 @@ struct LLMapperBot::Impl
                  memory.activationCount);
         event("interaction_probe", detail);
 
+        const bool stillAtActionPose = expectedDistance
+                <= kActionScanRange * kActionScanRange
+            && std::abs(angleDelta(expectedAngle, observation.angle)) < 96
+            && std::abs(lookDelta) < 64;
+        if (memory.state == 1 && memory.engineAccepted && !valid
+            && stillAtActionPose && memory.lastActivationTick >= 0
+            && observation.tick - memory.lastActivationTick >= kTicsPerSec / 4)
+        {
+            // ActionScan itself is an observable part of world state.  When a
+            // target accepted Use and then disappears while the bot has held
+            // the same valid pose, a moving/rotating mechanism answered even
+            // if its mapper state bits do not encode the wall motion.  A
+            // sound-only surface remains targetable and therefore does not
+            // satisfy this evidence rule.
+            memory.state = 2;
+            memory.activated = true;
+            memory.observedLocalEffect = true;
+            memory.observedKnownWorldDelta = true;
+            memory.consecutiveNoEffectAttempts = 0;
+            memory.afterState = interactionStateSignature(memory);
+            shareLearnedWallEffect(memory);
+            rearmAroundMechanism(memory);
+            lastSemanticProgressTick = observation.tick;
+            event("interaction_world_delta",
+                  "reason=accepted_action_target_disappeared_at_stable_pose");
+            if (memory.causalWall >= 0 && memory.causalFrom >= 0
+                && memory.causalTo >= 0)
+            {
+                openedRouteWall = memory.causalWall;
+                openedRouteFrom = memory.causalFrom;
+                openedRouteTo = memory.causalTo;
+                openedRouteTick = observation.tick;
+            }
+        }
+
         // Do not interrupt a mechanism the bot itself just set in motion.
         // Some Blood mechanisms animate continuously, though, and treating
         // "busy" as untouchable made those permanently unusable: the bot
@@ -6030,9 +6944,16 @@ struct LLMapperBot::Impl
         }
         const bool cooldownElapsed = memory.lastActivationTick < 0
             || observation.tick - memory.lastActivationTick >= kReactivationCooldownTicks;
-        const bool budgetLeft = memory.activationCount < kMaxActivationAttempts;
+        // Incidental feedback (for example a voice line) is not a useful
+        // world-state transition.  Bound consecutive no-effect attempts even
+        // when geometry still labels the affordance reversible.  A real
+        // world delta resets this counter, preserving reusable elevators and
+        // doors after the bot returns to them.
+        const bool budgetLeft = memory.consecutiveNoEffectAttempts
+            < kMaxActivationAttempts;
         if (valid && !missingKey && !mechanismMoving && cooldownElapsed
             && !wouldMoveOwnSector
+            && budgetLeft
             && (!memory.attempted || recoveryActivation || reactivation || budgetLeft))
         {
             if (reactivation)
@@ -6065,11 +6986,13 @@ struct LLMapperBot::Impl
                 memory.state = 2;
                 memory.activated = true;
                 memory.afterState = interactionStateSignature(memory);
+                ++memory.consecutiveNoEffectAttempts;
                 event("interaction_settled", "engine_accepted=1 observed_local_effect=0 observed_known_world_delta=0");
             }
             else
             {
                 memory.state = 3;
+                ++memory.consecutiveNoEffectAttempts;
                 event("interaction_failed", "reason=INTERACTION_VALID_BUT_NO_RESPONSE");
             }
         }
@@ -6206,6 +7129,13 @@ struct LLMapperBot::Impl
                 continue;
             for (const Portal &edge : graph->second)
             {
+                // This fallback is a transport route through known space, not
+                // raw map adjacency.  A solid or impossibly high boundary may
+                // connect two Build sectors topologically while being useless
+                // in this direction.  Including it made breadth-first search
+                // prefer short impossible climbs over longer stair/jump routes.
+                if (!edge.traversable && !edge.jumpable)
+                    continue;
                 if (edgeFailed(edge.wall * 65536 + edge.to))
                     continue;
                 if (reached.insert(edge.to).second)
@@ -6414,7 +7344,7 @@ struct LLMapperBot::Impl
         switch (objective.type)
         {
         case kObjectiveInteraction:
-            return 1000000 + objective.interactionKey;
+            return interactionOpportunityId(objective.interactionKey);
         case kObjectiveFrontier:
             return 3000000 + objective.wall * 8 + int(objective.type);
         case kObjectiveInvestigate:
@@ -6493,6 +7423,36 @@ struct LLMapperBot::Impl
             if (cell.sector == sectorId && cell.z == z
                 && cell.support == floorSupport && cell.walkArea == area)
                 return true;
+        return false;
+    }
+
+    // Vector-triggered objects require a hitscan producer.  A flare or
+    // explosive projectile is ranged combat capability, but it cannot
+    // satisfy XSPRITE::Vector and must not be selected for this action.
+    bool vectorWeaponAvailable(int &weapon, VECTOR_TYPE &vectorType) const
+    {
+        static const struct Candidate
+        {
+            int weapon;
+            VECTOR_TYPE vector;
+        } candidates[] = {
+            { kWeaponTommy, kVectorTommyregular },
+            { kWeaponShotgun, kVectorShell },
+        };
+        for (const Candidate &candidate : candidates)
+        {
+            if (!gMe->hasWeapon[candidate.weapon])
+                continue;
+            const int ammo = candidate.weapon - 1;
+            if (gInfiniteAmmo || (ammo >= 0
+                && ammo < int(sizeof(gMe->ammoCount) / sizeof(gMe->ammoCount[0]))
+                && gMe->ammoCount[ammo] > 0))
+            {
+                weapon = candidate.weapon;
+                vectorType = candidate.vector;
+                return true;
+            }
+        }
         return false;
     }
 
@@ -6591,9 +7551,7 @@ struct LLMapperBot::Impl
             || suspendedObjectiveActive)
             return false;
         ensureNavTopology();
-        const int start = nearestNavCell(observation.sector, observation.x,
-                                         observation.y,
-                                         llmapper::capability::playerFloorZ());
+        const int start = currentNavStartCell();
         if (start < 0)
             return false;
         const int startArea = navCells[size_t(start)].walkArea;
@@ -6820,6 +7778,13 @@ struct LLMapperBot::Impl
     {
         if (!currentObjective.active)
             return false;
+        // A validated gap traversal is its own bounded physical transaction.
+        // The high-level objective may be moving away from its remote XY
+        // anchor while establishing the run-up, and expiring it on the launch
+        // frame hands steering to a different mission in mid-air.  Resume the
+        // parent budget after the crossing reports landed/short/timed_out.
+        if (gapRunning || gapJumpActive)
+            return false;
         int anchorX = 0;
         int anchorY = 0;
         const bool hasAnchor = objectiveAnchor(anchorX, anchorY);
@@ -6925,6 +7890,16 @@ struct LLMapperBot::Impl
         currentObjective = objective;
         currentObjective.active = true;
         currentObjective.startedTick = observation.tick;
+        if (currentObjective.type == kObjectiveInteraction
+            && currentObjective.interactionRouteMode == 0)
+        {
+            // A locally acquired physical target starts with exact pose/support
+            // navigation.  A remembered remote target starts with the directed
+            // transport graph.  Preserve that decision while travelling so
+            // overlapping/layered sectors cannot make routing oscillate.
+            currentObjective.interactionRouteMode =
+                observation.sector == currentObjective.sector ? 1 : 2;
+        }
         objectiveProgressTick = -1;
         objectiveBestDistance2 = INT32_MAX;
         objectiveProgressSector = observation.sector;
@@ -6951,9 +7926,10 @@ struct LLMapperBot::Impl
             }
         }
         char detail[192];
-        snprintf(detail, sizeof(detail), "type=%d id=%d sector=%d target_sector=%d wall=%d current=%d",
+        snprintf(detail, sizeof(detail), "type=%d id=%d sector=%d target_sector=%d wall=%d current=%d route_mode=%d",
                  int(objective.type), objective.id, objective.sector,
-                 objective.targetSector, objective.wall, observation.sector);
+                 objective.targetSector, objective.wall, observation.sector,
+                 currentObjective.interactionRouteMode);
         event("objective_selected", detail);
     }
 
@@ -7306,6 +8282,33 @@ struct LLMapperBot::Impl
         return found;
     }
 
+    void rememberInvestigatedBoundary(const Portal &crossing, int hit,
+                                      const char *reason)
+    {
+        // Collision resolution can arrive on the frame after the deliberate
+        // inspection has completed.  Retain only a tiny causal window: enough
+        // to associate that contact with the route being probed, but not long
+        // enough for an unrelated later interaction to inherit stale intent.
+        recentInvestigatedWall = crossing.wall;
+        recentInvestigatedFrom = crossing.from;
+        recentInvestigatedTo = crossing.to;
+        recentInvestigatedTick = observation.tick;
+        const int signature = portalIdentitySignature(crossing);
+        if (llmapper::investigatedNow(investigatedBoundaries, crossing.wall,
+                                      crossing.from, crossing.to, signature))
+            return;
+        InvestigateRecord record;
+        record.wall = crossing.wall;
+        record.from = crossing.from;
+        record.to = crossing.to;
+        record.geometrySignature = signature;
+        investigatedBoundaries.push_back(record);
+        char detail[160];
+        snprintf(detail, sizeof(detail), "wall=%d dest=%d hit=%d reason=%s",
+                 crossing.wall, currentObjective.targetSector, hit, reason);
+        event("blocked_frontier_investigated", detail);
+    }
+
     GINPUT finishBlockedInvestigation(const Portal &crossing, const char *reason)
     {
         const int targetAngle = wallFacingAngle(crossing);
@@ -7333,33 +8336,28 @@ struct LLMapperBot::Impl
             event("blocked_frontier_action_found", detail);
             const bool discovered = rememberCollisionInteraction(
                 target >= 0 ? target : crossing.wall);
-            if (!discovered)
-            {
-                // Already known and already tried.  Re-investigating it is
-                // not new knowledge, so let the boundary rest rather than
-                // rediscovering the same mechanism every tick.
-                suppressObjective(4000000 + currentObjective.targetSector,
-                                  "mechanism_already_known");
-            }
+            (void)discovered;
+            // The concrete interaction now represents this possible route.
+            // Retire the weaker geometry probe whether the interaction was
+            // learned just now or was already in memory.
+            rememberInvestigatedBoundary(crossing, hit,
+                                          "actionable_mechanism_found");
+            suppressObjective(4000000 + currentObjective.targetSector,
+                              "actionable_mechanism_found");
             completeObjective("investigation_found_interaction");
             return input;
         }
         if (nearby || selectNewInteraction(false))
         {
             event("blocked_frontier_action_found", "source=nearby_trigger_push");
+            rememberInvestigatedBoundary(crossing, hit,
+                                          "nearby_action_opportunity_found");
+            suppressObjective(4000000 + currentObjective.targetSector,
+                              "nearby_action_opportunity_found");
             completeObjective("investigation_found_interaction");
             return input;
         }
-        InvestigateRecord record;
-        record.wall = crossing.wall;
-        record.from = crossing.from;
-        record.to = crossing.to;
-        record.geometrySignature = portalIdentitySignature(crossing);
-        investigatedBoundaries.push_back(record);
-        char investigated[160];
-        snprintf(investigated, sizeof(investigated), "wall=%d dest=%d hit=%d reason=%s",
-                 crossing.wall, currentObjective.targetSector, hit, reason);
-        event("blocked_frontier_investigated", investigated);
+        rememberInvestigatedBoundary(crossing, hit, reason);
         suppressObjective(4000000 + currentObjective.targetSector, "investigated_no_action");
         completeObjective("investigation_no_action");
         return input;
@@ -7390,6 +8388,19 @@ struct LLMapperBot::Impl
                 return GINPUT{};
             }
             InteractionMemory &interaction = memory->second;
+            if (interaction.key > 0 && !hasKey(interaction.key))
+            {
+                char detail[160];
+                snprintf(detail, sizeof(detail),
+                         "kind=%d id=%d required_key=%d reason=key_not_held",
+                         int(interaction.kind), interaction.id, interaction.key);
+                event("action_prerequisite_unavailable", detail);
+                event("opportunity_deferred", detail);
+                // The opportunity itself remains live in memory.  It is not
+                // dormant: acquiring the key should reconsider it immediately.
+                invalidateObjective("missing_key_prerequisite", false);
+                return GINPUT{};
+            }
             const unsigned missingEffects = interaction.requiredEffects
                 & ~availableEffectCapabilities();
             if (missingEffects)
@@ -7636,6 +8647,42 @@ struct LLMapperBot::Impl
             if (onNearSide && passable
                 && currentObjective.type == kObjectiveFrontier)
                 return steerPortal(*crossing);
+            if (!onNearSide && currentObjective.type == kObjectiveFrontier)
+            {
+                // A frontier several rooms away is a high-level sector goal,
+                // not a straight-line point in the remote room.  Follow the
+                // first known portal toward its source and let the local mesh
+                // solve only that room-sized step.  This is also the robust
+                // fallback when decorative collision fragments the detailed
+                // mesh: already traversed doors remain reusable transport
+                // instead of every remaining TODO failing at the same remote
+                // coordinate.
+                // Prefer the detailed, support-aware route whenever it can
+                // represent the whole trip.  The coarse graph is only a
+                // fallback after that exact destination has failed once;
+                // taking it eagerly loses valid vertical/jump paths whose
+                // intermediate sector transitions are not ordinary portal
+                // walks (AGTST3/8 exercise both cases).
+                const int detailedSignature = navigationSignature(
+                    crossing->x, crossing->y, crossing->z,
+                    crossing->from, crossing->wall);
+                Portal route;
+                if (navigationFailureSignature == detailedSignature
+                    && navigationFailureCount > 0
+                    && findKnownRoute(crossing->from, route))
+                {
+                    char detail[192];
+                    snprintf(detail, sizeof(detail),
+                             "frontier_wall=%d destination_source=%d route_wall=%d from=%d to=%d",
+                             crossing->wall, crossing->from, route.wall,
+                             route.from, route.to);
+                    event("frontier_coarse_route_step", detail);
+                    currentObjective.routeStepWall = route.wall;
+                    currentObjective.routeStepFrom = route.from;
+                    currentObjective.routeStepTo = route.to;
+                    return steerPortal(route);
+                }
+            }
             return navigateTo(crossing->x, crossing->y, crossing->z, crossing->from,
                               crossing->wall, crossing->capability);
         }
@@ -7700,10 +8747,20 @@ struct LLMapperBot::Impl
                 selectedObject = remembered->second.object;
                 object = &selectedObject;
             }
-            if (object->sector != observation.sector)
+            // A pickup is collected by occupying its physical support, not by
+            // aiming at its sprite origin.  Preserve the exact collision-
+            // derived support under it; the more permissive same-area stance
+            // used for switches can otherwise substitute the pit floor under
+            // a bridge and make the bot orbit beside the item forever.
+            ensureNavTopology();
+            const int stance = navCellInSector(object->sector, object->x, object->y,
+                                                object->z);
+            if (stance >= 0)
             {
+                const SupportRef requiredSupport = navCells[size_t(stance)].support;
                 return navigateTo(object->x, object->y, object->z, object->sector,
-                                  object->sprite, kTraversalUnknown);
+                                  object->sprite, kTraversalUnknown, false,
+                                  &requiredSupport);
             }
             return navigateTo(object->x, object->y, object->z, object->sector,
                               object->sprite, kTraversalUnknown);
@@ -7765,6 +8822,7 @@ struct LLMapperBot::Impl
         // round, so being anywhere else counted as having got somewhere --
         // which reset the jump budget after every failed hop.
         const bool sectorProgress = movementTargetSector >= 0
+            && movementTargetSector != movementTargetFrom
             && observation.sector == movementTargetSector;
         // Walking is not the same as closing, and the two answer different
         // questions.  The stuck detector asks whether the bot is going
@@ -7867,11 +8925,31 @@ struct LLMapperBot::Impl
             || (a <= 0 && b <= 0 && c <= 0);
     }
 
+    std::set<int> knownNavSectors() const
+    {
+        std::set<int> sectors = observedSectors;
+        sectors.insert(visitedSectors.begin(), visitedSectors.end());
+        if (inRange(observation.sector, 0, numsectors))
+            sectors.insert(observation.sector);
+        for (const Portal &portal : observation.portals)
+            if (inRange(portal.to, 0, numsectors))
+                sectors.insert(portal.to);
+        for (const auto &entry : knownGraph)
+        {
+            if (!visitedSectors.count(entry.first)
+                && !observedSectors.count(entry.first))
+                continue;
+            for (const Portal &portal : entry.second)
+                if (inRange(portal.to, 0, numsectors))
+                    sectors.insert(portal.to);
+        }
+        return sectors;
+    }
+
     int navTopologyIdentity() const
     {
         int signature = 17;
-        std::set<int> sectors = observedSectors;
-        sectors.insert(visitedSectors.begin(), visitedSectors.end());
+        const std::set<int> sectors = knownNavSectors();
         for (int sectorId : sectors)
         {
             if (!inRange(sectorId, 0, numsectors))
@@ -7896,8 +8974,7 @@ struct LLMapperBot::Impl
     int navPoseSignature() const
     {
         int signature = 19;
-        std::set<int> sectors = observedSectors;
-        sectors.insert(visitedSectors.begin(), visitedSectors.end());
+        const std::set<int> sectors = knownNavSectors();
         for (int sectorId : sectors)
         {
             if (!inRange(sectorId, 0, numsectors))
@@ -7917,6 +8994,8 @@ struct LLMapperBot::Impl
             for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
                  nSprite = nextspritesect[nSprite])
             {
+                if (gMe && gMe->pSprite && nSprite == gMe->pSprite->index)
+                    continue;
                 if (!(sprite[nSprite].cstat & CSTAT_SPRITE_BLOCK)
                     || sprite[nSprite].statnum == kStatDude)
                     continue;
@@ -7937,9 +9016,7 @@ struct LLMapperBot::Impl
     int navDynamicSignature() const
     {
         int signature = 23;
-        std::set<int> sectors = observedSectors;
-        if (inRange(observation.sector, 0, numsectors))
-            sectors.insert(observation.sector);
+        const std::set<int> sectors = knownNavSectors();
         for (int sectorId : sectors)
         {
             if (!inRange(sectorId, 0, numsectors))
@@ -8241,6 +9318,49 @@ struct LLMapperBot::Impl
         return best;
     }
 
+    // Horizontal distance a standing jump can cover by the time the feet
+    // descend through a destination support height.  This uses the same
+    // per-frame player-motion routine as the live jump predictor, starting
+    // from rest, so isolated sprite tops are linked by actual Caleb physics
+    // rather than a guessed platform distance.  Collision is checked
+    // separately when the candidate graph edge is built.
+    int standingJumpReachForDelta(int destinationFloorDelta) const
+    {
+        if (!gMe)
+            return 0;
+        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+        const int foot = llmapper::capability::playerFootOffset();
+        llmapper::capability::MotionState state;
+        state.z = -foot;
+        state.zvel = llmapper::capability::playerJumpImpulse();
+        // The first movement frame still starts on the take-off floor.  Using
+        // the eventual landing plane for that frame makes a lower landing
+        // look as though Caleb begins high in the air; using an artificial
+        // floor far below does the same for every jump.  ProcessInput then
+        // suppresses all horizontal acceleration (height >=
+        // kDudeAirborneHeight), so a perfectly valid standing jump is
+        // measured as having zero range.  Advance once against the real
+        // take-off floor, then expose a lower destination so the arc is not
+        // snapped back to the ledge on descent.
+        bool reachedDestinationHeight = destinationFloorDelta >= 0;
+        for (int frame = 1; frame <= 240; ++frame)
+        {
+            const bool falling = state.zvel > 0;
+            const int simulationFloor = frame == 1
+                ? 0 : std::max(0, destinationFloorDelta);
+            llmapper::capability::stepPlayerMotion(
+                state, kFullThrottle, 0, simulationFloor,
+                stand.frontAccel, foot,
+                llmapper::capability::playerAirDrag());
+            if (state.z + foot <= destinationFloorDelta)
+                reachedDestinationHeight = true;
+            if (falling && reachedDestinationHeight
+                && state.z + foot >= destinationFloorDelta)
+                return std::abs(state.x);
+        }
+        return 0;
+    }
+
     // Can the player physically occupy this sector at all?  Answered from
     // the same body envelope the grid is built with, so a slot narrower than
     // Caleb is simply not somewhere he can go.
@@ -8325,6 +9445,48 @@ struct LLMapperBot::Impl
             }
         }
         return best >= 0 ? best : fallback;
+    }
+
+    int currentNavStartCell()
+    {
+        const int exact = nearestNavCell(observation.sector, observation.x,
+                                         observation.y,
+                                         llmapper::capability::playerFloorZ());
+        if (exact < 0 || !navCells[size_t(exact)].links.empty())
+            return exact;
+
+        // A live off-grid anchor can be isolated while the ordinary floor
+        // mesh is one step away (notably while the initial body envelope is
+        // settling). Enter through the nearest floor cell the copied player
+        // body can really reach instead of making all supports another area.
+        int best = -1;
+        int64_t bestDistance = INT64_MAX;
+        for (const NavCell &cell : navCells)
+        {
+            if (cell.sector != observation.sector || cell.links.empty()
+                || std::abs(cell.z - llmapper::capability::playerFloorZ())
+                    > kMaxWalkableStep)
+                continue;
+            const int64_t distance = distance2(observation.x, observation.y,
+                                               cell.center.x, cell.center.y);
+            if (distance >= bestDistance)
+                continue;
+            const MovementProbe entry = probeMovement(
+                observation.x, observation.y, observation.z,
+                observation.sector, cell.center.x, cell.center.y,
+                cell.sector, std::max(256, playerClipRadius()));
+            if (!entry.reachable)
+                continue;
+            bestDistance = distance;
+            best = cell.id;
+        }
+        if (best >= 0 && !reportedNavStartReconnect)
+        {
+            event("nav_start_anchor_reconnected",
+                  "reason=isolated_live_pose reachable_floor_cell=1");
+            reportedNavStartReconnect = true;
+        }
+        return best >= 0 ? best : exact;
     }
 
     // Does any point in this sector leave the player's own radius clear of
@@ -8503,6 +9665,115 @@ struct LLMapperBot::Impl
             if (!grid.cells.empty() && margin > 0)
                 marginRespected = true;
         }
+
+        // Upright solid sprites are obstacle volumes at the sector floor,
+        // but Build exposes their top extents as real getzrange floors.  The
+        // ordinary floor pass intentionally rejects points occupied by those
+        // volumes, so seed their independently valid upper support layers in
+        // a bounded box around each sprite.  Every emitted cell is confirmed
+        // by the engine for the player's actual clip radius and headroom.
+        for (int spriteId = headspritesect[sectorId]; spriteId >= 0;
+             spriteId = nextspritesect[spriteId])
+        {
+            const spritetype &supportSprite = sprite[spriteId];
+            if (gMe && gMe->pSprite && spriteId == gMe->pSprite->index)
+                continue;
+            if (!(supportSprite.cstat & CSTAT_SPRITE_BLOCK))
+                continue;
+            const int alignment = supportSprite.cstat & CSTAT_SPRITE_ALIGNMENT_MASK;
+            // A wall-aligned sprite is a two-dimensional collision sheet.
+            // GetZRange can report its upper extent at the exact line, but it
+            // has no finite top footprint on which the player's clip circle
+            // can settle. Other upright solids have a collision volume, so
+            // their engine-confirmed top can be a support irrespective of
+            // tile, voxel, visual shape, or gameplay type.
+            if (alignment == CSTAT_SPRITE_ALIGNMENT_FLOOR
+                || alignment == CSTAT_SPRITE_ALIGNMENT_SLOPE
+                || alignment == CSTAT_SPRITE_ALIGNMENT_WALL)
+                continue;
+            int supportTop = supportSprite.z, supportBottom = supportSprite.z;
+            spriteCollisionExtents(spriteId, supportTop, supportBottom);
+            if (supportTop >= sectorRecord.floorz
+                || supportTop - getceilzofslope(sectorId,
+                                                supportSprite.x,
+                                                supportSprite.y) < clearance)
+                continue;
+
+            int supportMinX = supportSprite.x;
+            int supportMaxX = supportSprite.x;
+            int supportMinY = supportSprite.y;
+            int supportMaxY = supportSprite.y;
+            const int footprintMargin = radius + (supportSprite.clipdist << 2) + 64;
+            supportMinX -= footprintMargin;
+            supportMaxX += footprintMargin;
+            supportMinY -= footprintMargin;
+            supportMaxY += footprintMargin;
+            const SupportRef wanted(kSupportSpriteFloor, spriteId);
+            const size_t cellsBeforeSupport = grid.cells.size();
+            for (int gy = supportMinY >> kNavGridShift;
+                 gy <= (supportMaxY >> kNavGridShift); ++gy)
+            {
+                for (int gx = supportMinX >> kNavGridShift;
+                     gx <= (supportMaxX >> kNavGridShift); ++gx)
+                {
+                    const int baseX = (gx << kNavGridShift)
+                        + (1 << (kNavGridShift - 1));
+                    const int baseY = (gy << kNavGridShift)
+                        + (1 << (kNavGridShift - 1));
+                    bool placed = false;
+                    for (int ox = -1; ox <= 1 && !placed; ++ox)
+                    {
+                        for (int oy = -1; oy <= 1 && !placed; ++oy)
+                        {
+                            const int x = baseX + ox * step;
+                            const int y = baseY + oy * step;
+                            if (inside(x, y, sectorId) != 1)
+                                continue;
+                            const std::vector<StandableSurface> surfaces =
+                                standableSurfacesAt(sectorId, x, y, radius,
+                                                    clearance);
+                            for (const StandableSurface &surface : surfaces)
+                            {
+                                if (surface.support != wanted)
+                                    continue;
+                                appendCell(gx, gy, x, y, surface.z,
+                                           surface.support);
+                                placed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            const size_t supportCellCount = grid.cells.size() - cellsBeforeSupport;
+            if (supportCellCount > 0
+                && reportedSpriteSupports.insert(spriteId).second)
+            {
+                char detail[192];
+                snprintf(detail, sizeof(detail),
+                         "sprite=%d sector=%d alignment=%d top=%d cells=%u",
+                         spriteId, sectorId, alignment, supportTop,
+                         unsigned(supportCellCount));
+                event("nav_sprite_support_seeded", detail);
+            }
+            else if (supportCellCount == 0
+                      && reportedRejectedSpriteSupports.insert(spriteId).second)
+            {
+                int probeCeiling = 0, probeCeilingHit = 0;
+                int probeFloor = 0, probeFloorHit = 0;
+                GetZRangeAtXYZ(supportSprite.x, supportSprite.y, supportTop - 1,
+                               sectorId, &probeCeiling, &probeCeilingHit,
+                               &probeFloor, &probeFloorHit, radius, CLIPMASK0,
+                               PARALLAXCLIP_CEILING | PARALLAXCLIP_FLOOR);
+                char detail[256];
+                snprintf(detail, sizeof(detail),
+                         "sprite=%d sector=%d alignment=%d collision_top=%d collision_bottom=%d floor=%d floor_hit=0x%x ceiling=%d clearance=%d radius=%d",
+                         spriteId, sectorId, alignment,
+                         supportTop, supportBottom, probeFloor, probeFloorHit,
+                         probeCeiling, supportTop - probeCeiling, radius);
+                event("nav_sprite_support_rejected", detail);
+            }
+        }
         // A sector too thin to hold a standable square is still crossed --
         // a step, a ledge, a door track.  Give it a transit cell at each of
         // its doorways so routes can pass through, even though nothing will
@@ -8584,6 +9855,46 @@ struct LLMapperBot::Impl
             const walltype &end = wall[start.point2];
             const int64_t d1 = int64_t(bx - ax) * (start.y - ay) - int64_t(by - ay) * (start.x - ax);
             const int64_t d2 = int64_t(bx - ax) * (end.y - ay) - int64_t(by - ay) * (end.x - ax);
+            if ((d1 > 0 && d2 > 0) || (d1 < 0 && d2 < 0))
+                continue;
+            const int64_t d3 = int64_t(end.x - start.x) * (ay - start.y)
+                - int64_t(end.y - start.y) * (ax - start.x);
+            const int64_t d4 = int64_t(end.x - start.x) * (by - start.y)
+                - int64_t(end.y - start.y) * (bx - start.x);
+            if ((d3 > 0 && d4 > 0) || (d3 < 0 && d4 < 0))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    // A jump may legitimately pass through an open two-sided boundary while
+    // climbing onto a support beside/above a raised sector.  Such a boundary
+    // changes sector ownership during the arc, but is not a collision wall.
+    // Keep one-sided and explicitly blocking walls authoritative.
+    bool segmentCrossesBlockingWall(int sectorId, int ax, int ay,
+                                    int bx, int by) const
+    {
+        if (!inRange(sectorId, 0, numsectors))
+            return true;
+        const sectortype &record = sector[sectorId];
+        for (int i = 0; i < record.wallnum; ++i)
+        {
+            const int wallId = record.wallptr + i;
+            if (!inRange(wallId, 0, numwalls)
+                || !inRange(wall[wallId].point2, 0, numwalls))
+                continue;
+            const walltype &start = wall[wallId];
+            if (inRange(start.nextsector, 0, numsectors)
+                && !(start.cstat & CSTAT_WALL_BLOCK)
+                && (!inRange(start.nextwall, 0, numwalls)
+                    || !(wall[start.nextwall].cstat & CSTAT_WALL_BLOCK)))
+                continue;
+            const walltype &end = wall[start.point2];
+            const int64_t d1 = int64_t(bx - ax) * (start.y - ay)
+                - int64_t(by - ay) * (start.x - ax);
+            const int64_t d2 = int64_t(bx - ax) * (end.y - ay)
+                - int64_t(by - ay) * (end.x - ax);
             if ((d1 > 0 && d2 > 0) || (d1 < 0 && d2 < 0))
                 continue;
             const int64_t d3 = int64_t(end.x - start.x) * (ay - start.y)
@@ -8699,24 +10010,25 @@ struct LLMapperBot::Impl
                     navRoute.clear();
                     event("nav_mesh_in_motion", "reason=live_geometry_translating");
                 }
-                navPoseStableTicks = 0;
+                navPoseChangedTick = observation.tick;
                 navPoseSignatureValue = pose;
             }
             else if (navMeshInMotion)
             {
-                ++navPoseStableTicks;
-                // The second clause is deliberate and load-bearing.  While
-                // any watched sector is travelling the pose signature changes
-                // every tick, so the stable-tick count never accumulates and
-                // the mesh would stay frozen -- and unroutable -- for the
-                // whole door cycle.  The bot's own sector being idle is the
-                // statement that its immediate surroundings are usable now,
-                // which is what planning the next few steps needs; route
-                // validity against remote motion is handled by the dynamic
-                // link refresh below.  Dropping it strands the bot beside
-                // every moving door until the door closes on it.
-                if (navPoseStableTicks >= 8
-                    || !busyValueInMotion(observation.localSectorBusy))
+                // Stability is elapsed simulation time, not a count of calls
+                // to ensureNavTopology().  Several planning layers call this
+                // accessor in one frame; counting those calls made continuously
+                // moving retail geometry rebuild a 20k-cell mesh many times in
+                // the same simulated second.  An idle local sector still permits
+                // an interim rebuild while a remote door/support travels, but
+                // no more than once per second.  A genuinely settled pose gets
+                // its final graph after eight rendered frames.
+                const bool poseStable = observation.tick - navPoseChangedTick
+                    >= 8 * kTicsPerFrame;
+                const bool periodicLivePose =
+                    !busyValueInMotion(observation.localSectorBusy)
+                    && observation.tick - navPoseRebuildTick >= kTicsPerSec;
+                if (poseStable || periodicLivePose)
                 {
                     navMeshInMotion = false;
                     refreshDynamicNavLinks();
@@ -8725,7 +10037,10 @@ struct LLMapperBot::Impl
                     // which support layer occupies a grid square.  Rebuild
                     // the affected surface graph once the pose is stable.
                     navTopologySignature = 0;
-                    event("nav_mesh_settled", "reason=pose_stable");
+                    rearmFrontiersOnNextTopologyRebuild = true;
+                    event("nav_mesh_settled", poseStable
+                          ? "reason=pose_stable"
+                          : "reason=periodic_live_pose");
                 }
             }
             else if (dynamicSignature != navDynamicSignatureValue)
@@ -8740,13 +10055,16 @@ struct LLMapperBot::Impl
         navPoseSignatureValue = pose;
         navDynamicSignatureValue = dynamicSignature;
         navMeshInMotion = false;
-        navPoseStableTicks = 0;
+        navPoseChangedTick = observation.tick;
+        navPoseRebuildTick = observation.tick;
         navCells.clear();
         navCellIndex.clear();
-        std::set<int> navSectors = observedSectors;
-        navSectors.insert(visitedSectors.begin(), visitedSectors.end());
-        if (inRange(observation.sector, 0, numsectors))
-            navSectors.insert(observation.sector);
+        // The identity above and the cells below must describe the same
+        // topology.  In particular, a visible/remembered portal makes its
+        // far-side landing eligible before Caleb enters that sector; omitting
+        // it here left the cached signature up to date while rebuilding only
+        // the already-entered side.
+        const std::set<int> navSectors = knownNavSectors();
         for (int sectorId : navSectors)
         {
             if (!inRange(sectorId, 0, numsectors))
@@ -8805,7 +10123,14 @@ struct LLMapperBot::Impl
                 // the corner of a thin obstruction entirely.  Ask the engine
                 // whether the two squares can actually see each other; a
                 // one-sided wall between them blocks the ray.
-                    if (blockedBySolidSprite(cell.sector, midX, midY))
+                    const int midpointBlocker = solidSpriteAt(
+                        cell.sector, midX, midY, playerClipRadius());
+                    const bool blockerIsSupport = midpointBlocker >= 0
+                        && ((cell.support.kind == kSupportSpriteFloor
+                             && cell.support.id == midpointBlocker)
+                            || (other.support.kind == kSupportSpriteFloor
+                                && other.support.id == midpointBlocker));
+                    if (midpointBlocker >= 0 && !blockerIsSupport)
                         continue;
                 // Deliberately geometry, not cansee(): that is a sight test
                 // and is blocked by sprites, so a courtyard with scenery in
@@ -8814,18 +10139,183 @@ struct LLMapperBot::Impl
                                                  other.center.x, other.center.y))
                         continue;
                     const int floorDelta = other.z - cell.z;
-                    if (std::abs(floorDelta) > kMaxWalkableStep)
-                        continue;
-                    const NavEdgeMode mode = floorDelta == 0 ? kNavWalk : kNavStep;
                     const LocalWaypoint gateway(midX, midY);
-                    addNavLink(int(i), neighbour, mode, -1, gateway, true);
-                    addNavLink(neighbour, int(i), mode, -1, gateway, true);
+                    auto directedMode = [&](int delta) {
+                        if (std::abs(delta) <= kMaxWalkableStep)
+                            return delta == 0 ? kNavWalk : kNavStep;
+                        if (delta < 0 && -delta <= playerJumpRiseLimit())
+                            return kNavJump;
+                        if (delta > 0 && delta <= playerJumpRiseLimit())
+                            return kNavDrop;
+                        return kNavBlocked;
+                    };
+                    const NavEdgeMode forward = directedMode(floorDelta);
+                    const NavEdgeMode reverse = directedMode(-floorDelta);
+                    if (llmapper::traversableMode(forward))
+                        addNavLink(int(i), neighbour, forward, -1, gateway, true);
+                    if (llmapper::traversableMode(reverse))
+                        addNavLink(neighbour, int(i), reverse, -1, gateway, true);
                 }
             }
         }
 
+        // An isolated upright sprite (grave, post, fence) can be a real
+        // stepping stone even though its top does not touch the eight
+        // neighbouring floor cells.  The local grid above represents the
+        // surfaces correctly but cannot express a jump across the XY gap.
+        // Add only edges involving an engine-confirmed sprite support, bound
+        // their range with the player's simulated standing jump, and reject
+        // any segment crossing a sector wall or an unrelated solid sprite.
+        // Ordinary floor-to-floor gaps remain the explicit gap-crossing
+        // system's responsibility.
+        const int landingTolerance = playerClipRadius() + (1 << (kNavGridShift - 2));
+        // Every sprite-support candidate used to replay the same 240-frame
+        // standing-jump simulation.  A topology contains many cells but only
+        // a handful of distinct support-height deltas, so cache the engine-
+        // derived answer for this rebuild.  The cache is deliberately local:
+        // inventory/posture capability changes naturally receive fresh
+        // physics on the next topology construction.
+        std::map<int, int> standingReachByDelta;
+        auto cachedStandingReach = [&](int delta) {
+            auto found = standingReachByDelta.find(delta);
+            if (found != standingReachByDelta.end())
+                return found->second;
+            const int reach = standingJumpReachForDelta(delta);
+            standingReachByDelta.emplace(delta, reach);
+            return reach;
+        };
+        auto addSpriteJump = [&](size_t fromId, size_t toId) {
+            if (fromId == toId)
+                return;
+            const NavCell &from = navCells[fromId];
+            const NavCell &to = navCells[toId];
+            if (from.sector != to.sector || from.support == to.support)
+                return;
+            const int delta = to.z - from.z;
+            // MoveDude settles a player on a blocking sprite once the
+            // player's centre is above the sprite plane and the body bottom
+            // overlaps it.  Requiring the feet arc itself to clear the plane
+            // underestimates climbable solid objects by the measured foot
+            // offset.  Sector-floor transitions keep their stricter portal
+            // model; this adjustment is only for an engine-resolved sprite
+            // destination.
+            const int landingDelta = to.support.kind == kSupportSpriteFloor
+                ? delta + llmapper::capability::playerFootOffset() : delta;
+            const int reach = cachedStandingReach(landingDelta);
+            if (reach <= 0)
+                return;
+            const int64_t span = distance2(from.center.x, from.center.y,
+                                           to.center.x, to.center.y);
+            const int maxSpan = reach + landingTolerance;
+            if (span > int64_t(maxSpan) * maxSpan)
+                return;
+            if (segmentCrossesBlockingWall(from.sector,
+                                           from.center.x, from.center.y,
+                                           to.center.x, to.center.y))
+                return;
+            for (int sample = 1; sample < 4; ++sample)
+            {
+                const int x = from.center.x
+                    + int(int64_t(to.center.x - from.center.x) * sample / 4);
+                const int y = from.center.y
+                    + int(int64_t(to.center.y - from.center.y) * sample / 4);
+                const int blocker = solidSpriteAt(from.sector, x, y,
+                                                  playerClipRadius());
+                const bool isEndpointSupport = blocker >= 0
+                    && ((from.support.kind == kSupportSpriteFloor
+                         && from.support.id == blocker)
+                        || (to.support.kind == kSupportSpriteFloor
+                            && to.support.id == blocker));
+                if (blocker >= 0 && !isEndpointSupport)
+                    return;
+            }
+            addNavLink(int(fromId), int(toId), kNavJump, -1,
+                       LocalWaypoint(from.center.x, from.center.y), true);
+        };
+        std::vector<size_t> spriteSupportCells;
+        for (size_t i = 0; i < navCells.size(); ++i)
+            if (navCells[i].support.kind == kSupportSpriteFloor)
+                spriteSupportCells.push_back(i);
+        for (size_t supportCell : spriteSupportCells)
+        {
+            for (size_t j = 0; j < navCells.size(); ++j)
+            {
+                addSpriteJump(supportCell, j);
+                if (navCells[j].support.kind != kSupportSpriteFloor)
+                    addSpriteJump(j, supportCell);
+            }
+        }
+        // Keep the capability diagnosable as a graph fact, not merely as
+        // surface discovery.  A seeded top with no incoming jump edge is
+        // still an unreachable island and explains the visible behaviour of
+        // running into (or avoiding) the obstacle instead of climbing it.
+        std::set<int> linkedSpriteSupports;
+        for (size_t supportCell : spriteSupportCells)
+            linkedSpriteSupports.insert(navCells[supportCell].support.id);
+        for (int spriteId : linkedSpriteSupports)
+        {
+            // This is explanatory telemetry, not graph construction.  Once a
+            // support has been reported, avoid repeating the quadratic scan
+            // on every moving-geometry rebuild.
+            if (reportedSpriteSupportLinks.count(spriteId))
+                continue;
+            int cells = 0;
+            int incoming = 0;
+            int outgoing = 0;
+            int nearestSpan = INT32_MAX;
+            int nearestDelta = 0;
+            for (size_t i = 0; i < navCells.size(); ++i)
+            {
+                const NavCell &cell = navCells[i];
+                if (cell.support == SupportRef(kSupportSpriteFloor, spriteId))
+                {
+                    ++cells;
+                    for (const NavLink &link : cell.links)
+                        if (link.mode == kNavJump && link.target >= 0
+                            && link.target < int(navCells.size())
+                            && navCells[size_t(link.target)].support != cell.support)
+                            ++outgoing;
+                    for (const NavCell &other : navCells)
+                    {
+                        if (other.sector != cell.sector
+                            || other.support == cell.support)
+                            continue;
+                        const int span = int(std::sqrt(double(distance2(
+                            cell.center.x, cell.center.y,
+                            other.center.x, other.center.y))));
+                        if (span < nearestSpan)
+                        {
+                            nearestSpan = span;
+                            nearestDelta = cell.z - other.z;
+                        }
+                    }
+                }
+                for (const NavLink &link : cell.links)
+                    if (link.mode == kNavJump && link.target >= 0
+                        && link.target < int(navCells.size())
+                        && navCells[size_t(link.target)].support
+                            == SupportRef(kSupportSpriteFloor, spriteId)
+                        && cell.support != navCells[size_t(link.target)].support)
+                        ++incoming;
+            }
+            reportedSpriteSupportLinks.insert(spriteId);
+            char supportDetail[192];
+            snprintf(supportDetail, sizeof(supportDetail),
+                     "sprite=%d cells=%d incoming=%d outgoing=%d nearest_span=%d nearest_delta=%d jump_reach=%d",
+                     spriteId, cells, incoming, outgoing,
+                     nearestSpan == INT32_MAX ? -1 : nearestSpan, nearestDelta,
+                     standingJumpReachForDelta(nearestDelta));
+            event("nav_sprite_support_links", supportDetail);
+        }
+
         refreshDynamicNavLinks();
         ++navTopologyRevision;
+        if (rearmFrontiersOnNextTopologyRebuild)
+        {
+            rearmFrontiersOnNextTopologyRebuild = false;
+            rearmFrontiersForNewTopology();
+        }
+        navPoseRebuildTick = observation.tick;
         int areas = 0;
         for (const NavCell &cell : navCells)
             if (cell.walkArea + 1 > areas)
@@ -8969,12 +10459,10 @@ struct LLMapperBot::Impl
     }
 
     bool buildNavRoute(int targetX, int targetY, int targetZ, int targetSector,
-                       int signature)
+                       int signature, const SupportRef *requiredSupport = nullptr)
     {
         ensureNavTopology();
-        const int start = nearestNavCell(observation.sector, observation.x,
-                                         observation.y,
-                                         llmapper::capability::playerFloorZ());
+        const int start = currentNavStartCell();
         if (start < 0)
             return false;
         const int startArea = navCells[size_t(start)].walkArea;
@@ -8982,8 +10470,10 @@ struct LLMapperBot::Impl
         // which the player must stand.  Prefer the target XY on the support
         // component reachable now; only use targetZ to disambiguate when the
         // destination is genuinely on another (conditional) component.
-        const int areaTarget = navCellInSectorArea(targetSector, targetX, targetY, startArea);
-        const int strictTarget = navCellInSector(targetSector, targetX, targetY, targetZ);
+        const int areaTarget = requiredSupport ? -1
+            : navCellInSectorArea(targetSector, targetX, targetY, startArea);
+        const int strictTarget = navCellInSector(targetSector, targetX, targetY,
+                                                 targetZ, requiredSupport);
         int target = areaTarget;
         if (areaTarget >= 0 && strictTarget >= 0)
         {
@@ -9314,43 +10804,109 @@ struct LLMapperBot::Impl
         const walltype &wallRecord = wall[wallIndex];
         if (!inRange(wallRecord.point2, 0, numwalls))
             return false;
-        if (!inRange(wallRecord.extra, 1, kMaxXWalls)
-            || !xwall[wallRecord.extra].triggerPush)
+        const bool wallPush = inRange(wallRecord.extra, 1, kMaxXWalls)
+            && xwall[wallRecord.extra].triggerPush;
+        int mechanismSector = -1;
+        const int ownerSector = wallOwnerSector(wallIndex);
+        if (inRange(ownerSector, 0, numsectors)
+            && inRange(sector[ownerSector].extra, 1, kMaxXSectors)
+            && xsector[sector[ownerSector].extra].Wallpush)
+            mechanismSector = ownerSector;
+        else if (inRange(wallRecord.nextsector, 0, numsectors)
+                 && inRange(sector[wallRecord.nextsector].extra, 1, kMaxXSectors)
+                 && xsector[sector[wallRecord.nextsector].extra].Wallpush)
+            mechanismSector = wallRecord.nextsector;
+        if (!wallPush && mechanismSector < 0)
             return false;
+
+        // Observation may already have represented this exact physical wall
+        // through its destination-sector mechanism.  A later collision is
+        // stronger evidence that the affordance is reachable, but it is not a
+        // second affordance.  Duplicating it lets the bot operate the same
+        // reversible door twice under two IDs and undo its own progress.
+        for (const auto &entry : interactions)
+        {
+            const InteractionMemory &memory = entry.second;
+            if (memory.observed && memory.kind == kInteractionWall
+                && memory.target.wall == wallIndex)
+                return true;
+        }
 
         const walltype &nextWall = wall[wallRecord.point2];
         InteractionCandidate candidate;
         candidate.kind = kInteractionWall;
         candidate.id = wallIndex;
         candidate.fromSector = observation.sector;
-        candidate.targetSector = -1;
+        candidate.targetSector = mechanismSector;
         candidate.x = (wallRecord.x + nextWall.x) / 2;
         candidate.y = (wallRecord.y + nextWall.y) / 2;
         candidate.z = observation.z;
-        candidate.key = xwall[wallRecord.extra].key;
-        candidate.locked = xwall[wallRecord.extra].locked != 0;
+        candidate.key = wallPush ? xwall[wallRecord.extra].key
+            : xsector[sector[mechanismSector].extra].Key;
+        candidate.locked = wallPush ? xwall[wallRecord.extra].locked != 0
+            : xsector[sector[mechanismSector].extra].locked != 0;
         candidate.reversible = true;
         candidate.target.wall = wallIndex;
         candidate.target.from = observation.sector;
-        candidate.target.to = -1;
+        candidate.target.to = mechanismSector;
         candidate.target.x = candidate.x;
         candidate.target.y = candidate.y;
-        candidate.target.wallPush = true;
+        candidate.target.wallPush = wallPush;
+        candidate.target.sectorPush = mechanismSector >= 0;
+        candidate.target.interactionAffordance = true;
+        candidate.target.mechanismTx = wallPush ? xwall[wallRecord.extra].txID
+            : xsector[sector[mechanismSector].extra].txID;
         candidate.target.x1 = wallRecord.x;
         candidate.target.y1 = wallRecord.y;
         candidate.target.x2 = nextWall.x;
         candidate.target.y2 = nextWall.y;
         setInteractionGeometry(candidate.target);
         candidate.z = candidate.target.z;
+        if (currentObjective.active
+            && (currentObjective.type == kObjectiveFrontier
+                || currentObjective.type == kObjectiveInvestigate)
+            && currentObjective.wall >= 0)
+        {
+            candidate.causalWall = currentObjective.wall;
+            candidate.causalFrom = currentObjective.sector;
+            candidate.causalTo = currentObjective.targetSector;
+        }
+        else if (recentInvestigatedWall >= 0
+                 && recentInvestigatedTick >= 0
+                 && observation.tick - recentInvestigatedTick <= 2 * kTicsPerSec
+                 && observation.sector == recentInvestigatedFrom)
+        {
+            candidate.causalWall = recentInvestigatedWall;
+            candidate.causalFrom = recentInvestigatedFrom;
+            candidate.causalTo = recentInvestigatedTo;
+        }
+        const int memoryKey = interactionKey(candidate);
+        const auto known = interactions.find(memoryKey);
+        const bool newlyDiscovered = known == interactions.end()
+            || !known->second.observed;
         rememberInteraction(candidate);
+        if (newlyDiscovered && candidate.causalWall >= 0
+            && currentObjective.active
+            && currentObjective.type == kObjectiveFrontier)
+        {
+            event("frontier_actionable_blocker_discovered",
+                  "reason=engine_collision_identified_world_affordance");
+            suppressObjective(objectiveKey(currentObjective),
+                              "actionable_blocker_discovered");
+            invalidateObjective("actionable_blocker_discovered", false);
+        }
         return true;
     }
 
     GINPUT navigateTo(int x, int y, int z, int targetSector, int targetId = -1,
-                      TraversalCapability capability = kTraversalUnknown, bool shoot = false)
+                      TraversalCapability capability = kTraversalUnknown, bool shoot = false,
+                      const SupportRef *requiredSupport = nullptr)
     {
         navigationActionableBlocker = -1;
-        const int signature = navigationSignature(x, y, z, targetSector, targetId);
+        int signature = navigationSignature(x, y, z, targetSector, targetId);
+        if (requiredSupport)
+            signature = llmapper::mixHash(signature,
+                int(requiredSupport->kind) * 65536 + requiredSupport->id);
         if (!navigationActive || navigationOriginalSignature != signature)
         {
             // steerPortal may have prepared a route before entering this
@@ -9372,6 +10928,16 @@ struct LLMapperBot::Impl
         const int tolerance = std::max(256, radius);
         MovementProbe direct = probeMovement(observation.x, observation.y, observation.z,
                                              observation.sector, x, y, targetSector, tolerance);
+        if (requiredSupport && currentPlayerSupport() != *requiredSupport)
+        {
+            ensureNavTopology();
+            const bool ownsRequiredRoute = !navRoute.empty()
+                && navRouteSignature == signature
+                && navRouteTopologyRevision == navTopologyRevision;
+            if (!ownsRequiredRoute && navRouteRejectedSignature != signature)
+                buildNavRoute(x, y, z, targetSector, signature, requiredSupport);
+            direct.reachable = false;
+        }
         bool supportCenterlineActive = currentPlayerSupport().kind == kSupportSpriteFloor;
         if (!supportCenterlineActive && !navRoute.empty()
             && navRouteSignature == signature
@@ -9398,12 +10964,18 @@ struct LLMapperBot::Impl
             && !directLineKeepsSupport(direct.x, direct.y))
         {
             ensureNavTopology();
-            if (navRouteRejectedSignature != signature
-                && buildNavRoute(x, y, z, targetSector, signature))
+            const bool ownsSupportRoute = !navRoute.empty()
+                && navRouteSignature == signature
+                && navRouteTopologyRevision == navTopologyRevision;
+            if (ownsSupportRoute
+                || (navRouteRejectedSignature != signature
+                    && buildNavRoute(x, y, z, targetSector, signature,
+                                     requiredSupport)))
             {
                 direct.reachable = false;
-                event("navigation_support_route_required",
-                      "reason=distant_collision_probe_has_no_floor_guarantee");
+                if (!ownsSupportRoute)
+                    event("navigation_support_route_required",
+                          "reason=distant_collision_probe_has_no_floor_guarantee");
             }
             else
             {
@@ -9431,9 +11003,44 @@ struct LLMapperBot::Impl
             const LocalWaypoint waypoint = navStepWaypoint(step);
             const int waypointX = waypoint.x;
             const int waypointY = waypoint.y;
-            if (distance2(observation.x, observation.y, waypointX, waypointY)
-                <= tolerance * tolerance)
+            const bool withinWaypoint =
+                distance2(observation.x, observation.y, waypointX, waypointY)
+                    <= tolerance * tolerance;
+            // Reaching the XY centre while sailing over a narrow obstacle is
+            // not the same as landing on it.  If the jump step is meant to
+            // establish sprite support, keep steering to the centre until the
+            // engine reports that exact support under a grounded player.
+            // Otherwise the route advances in mid-air and the next objective
+            // immediately pulls Caleb off the far edge.
+            const bool requiresSpriteLanding = step.mode == kNavJump
+                && step.targetSupport.kind == kSupportSpriteFloor;
+            const bool touchingTargetSupport = requiresSpriteLanding
+                && currentPlayerSupport() == step.targetSupport;
+            const bool landedOnTargetSupport = !requiresSpriteLanding
+                || (touchingTargetSupport && observation.playerZVelocity == 0
+                    && gMe && gMe->pXSprite && gMe->pXSprite->height == 0
+                    && coastDistance() <= playerClipRadius());
+            const bool finalSupportPending = requiredSupport
+                && navRouteIndex + 1 == navRoute.size()
+                && currentPlayerSupport() != *requiredSupport;
+            // A rising player can be snapped to a solid top for one frame
+            // while retaining upward velocity.  Do not turn that transient
+            // contact into the next route leg; neutral input lets the same
+            // named support catch the descending body.
+            if (requiresSpriteLanding && touchingTargetSupport
+                && !landedOnTargetSupport)
+                return brakeAfterLanding();
+            const bool waypointReached = (requiresSpriteLanding
+                ? landedOnTargetSupport : withinWaypoint) && !finalSupportPending;
+            if (waypointReached)
             {
+                if (requiresSpriteLanding)
+                {
+                    char landed[96];
+                    snprintf(landed, sizeof(landed), "sprite=%d sector=%d",
+                             step.targetSupport.id, observation.sector);
+                    event("nav_sprite_support_landed", landed);
+                }
                 ++navRouteIndex;
                 if (navRouteIndex >= navRoute.size())
                     navRoute.clear();
@@ -9484,7 +11091,10 @@ struct LLMapperBot::Impl
                     observation.tick - navWaypointProgressTick >= kWaypointStallTicks;
                 if (!waypointStalled)
                 {
-                    TraversalCapability cap = capability;
+                    // The route's current physical edge owns locomotion.  A
+                    // jump required at the final portal must not leak backward
+                    // into ordinary WALK waypoints leading to its takeoff.
+                    TraversalCapability cap = kTraversalUnknown;
                     if (traversal == kTraverseJump || next.mode == kNavJump)
                         cap = kTraversalJumpable;
                     else if (next.mode == kNavCrouch)
@@ -9492,6 +11102,19 @@ struct LLMapperBot::Impl
                     return steerTo(nextX, nextY, false, shoot, targetId,
                                    next.targetSector >= 0 ? next.targetSector : observation.sector,
                                    cap);
+                }
+                if (finalSupportPending)
+                {
+                    // The graph endpoint claimed a support which the engine
+                    // never established at that pose.  Do not rebuild the
+                    // same nominal one-step route forever: reject this exact
+                    // target/support hypothesis and let the opportunity
+                    // budget preserve other exploration choices.
+                    navRouteRejectedSignature = signature;
+                    navRoute.clear();
+                    event("nav_target_support_unreached",
+                          "reason=engine_support_disagrees_with_route_endpoint");
+                    return GINPUT{};
                 }
                 // Genuinely stuck against this step after really trying it.
                 //
@@ -9525,7 +11148,7 @@ struct LLMapperBot::Impl
                 }
                 navRoute.clear();
                 lastNavWaypointX = INT32_MIN;
-                if (buildNavRoute(x, y, z, targetSector, signature))
+                if (buildNavRoute(x, y, z, targetSector, signature, requiredSupport))
                 {
                     const NavRouteStep &retry = navRoute.front();
                     const LocalWaypoint retryWaypoint = navStepWaypoint(retry);
@@ -9632,7 +11255,7 @@ struct LLMapperBot::Impl
                 event("navigation_interaction_opportunity", "source=clipmove_collision_hit");
             ensureNavTopology();
             if (navRouteRejectedSignature != signature
-                && buildNavRoute(x, y, z, targetSector, signature))
+                && buildNavRoute(x, y, z, targetSector, signature, requiredSupport))
             {
                 const NavRouteStep &waypoint = navRoute.front();
                 const LocalWaypoint selectedWaypoint = navStepWaypoint(waypoint);
@@ -9656,7 +11279,7 @@ struct LLMapperBot::Impl
             // first frontier unreachable without ever planning a route.
             ensureNavTopology();
             if (navRouteRejectedSignature != signature
-                && buildNavRoute(x, y, z, targetSector, signature))
+                && buildNavRoute(x, y, z, targetSector, signature, requiredSupport))
             {
                 const NavRouteStep &waypoint = navRoute.front();
                 const LocalWaypoint selectedWaypoint = navStepWaypoint(waypoint);
@@ -10053,6 +11676,73 @@ struct LLMapperBot::Impl
                           landingFloorZ, forwardInput, angle, 0, outX, outY, frames);
     }
 
+    // Predict a support-to-support jump without pretending the destination
+    // plane covers the entire map.  A sprite top only becomes the player's
+    // floor once the horizontal footprint reaches it; applying that floor at
+    // takeoff snaps the simulated body upward immediately.  Keep the source
+    // floor for the first movement frame (and for a higher destination), then
+    // report the descending point at which the body can settle on the target.
+    bool predictSupportArc(int startZVelocity, int sourceZ, int targetZ,
+                           int forwardInput, int angle, int &outX, int &outY,
+                           int &outFrames) const
+    {
+        if (!gMe || !gMe->pSprite)
+            return false;
+        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+        const int foot = llmapper::capability::playerFootOffset();
+        const llmapper::capability::AirDrag air = llmapper::capability::playerAirDrag();
+        llmapper::capability::MotionState state = currentMotion();
+        state.zvel = startZVelocity;
+        bool centreClearedTarget = state.z < targetZ;
+        for (int frame = 1; frame <= 240; ++frame)
+        {
+            const bool falling = state.zvel > 0;
+            const int simulationFloor = frame == 1 ? sourceZ
+                                                    : std::max(sourceZ, targetZ);
+            llmapper::capability::stepPlayerMotion(
+                state, forwardInput, angle, simulationFloor,
+                stand.frontAccel, foot, air);
+            if (state.z < targetZ)
+                centreClearedTarget = true;
+            if (falling && centreClearedTarget && state.z + foot >= targetZ)
+            {
+                outX = state.x;
+                outY = state.y;
+                outFrames = frame;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool solveSupportArc(int startZVelocity, const NavRouteStep &step,
+                         int targetX, int targetY, int angle,
+                         int &outInput) const
+    {
+        const int samples = 16;
+        bool found = false;
+        int64_t bestMiss = INT64_MAX;
+        for (int sample = 0; sample <= samples; ++sample)
+        {
+            // Reverse input is useful while trimming an already fast arc and
+            // harmless to consider at launch; the solver will choose it only
+            // when the predicted landing is closer.
+            const int forward = -kFullThrottle
+                + (2 * kFullThrottle * sample) / samples;
+            int landX = 0, landY = 0, frames = 0;
+            if (!predictSupportArc(startZVelocity, step.sourceZ, step.targetZ,
+                                   forward, angle, landX, landY, frames))
+                continue;
+            const int64_t miss = distance2(landX, landY, targetX, targetY);
+            if (miss >= bestMiss)
+                continue;
+            found = true;
+            bestMiss = miss;
+            outInput = forward;
+        }
+        return found;
+    }
+
     // Which forward input, held for the rest of the flight, puts the bot on
     // the far ledge?
     //
@@ -10206,6 +11896,13 @@ struct LLMapperBot::Impl
         noteCameraOwner("JUMP_THE_GAP", portal.wall, toLanding, 0);
         if (!gapRunning)
         {
+            // Arriving at the run-up mark from an arbitrary previous route can
+            // leave substantial lateral velocity.  Facing the gap does not
+            // remove that drift, and a launch predictor/executor pair cannot
+            // make a repeatable crossing while the approach starts sideways.
+            // Let engine drag settle first, then build a fresh straight run.
+            if (coastDistance() > radius)
+                return input;
             // Line up first: a jump taken off-heading is wasted, and there
             // is no correcting it once the ground has gone.
             if (std::abs(heading) >= 48)
@@ -10349,8 +12046,185 @@ struct LLMapperBot::Impl
         return input;
     }
 
-    GINPUT steerPortal(const Portal &portal)
+    // A portal's floor delta is measured from the sector floor.  That is not
+    // necessarily Caleb's take-off support: a chain of solid objects and
+    // sprite bridges can establish a much higher, reversible approach.  Find
+    // a reachable support near the boundary whose final transition is within
+    // the ordinary jump envelope.  The support graph supplies the route; no
+    // sprite type or map identity participates in the decision.
+    int raisedPortalSupportPose(const Portal &portal)
     {
+        if (portal.floorDelta >= -kMaxWalkableStep
+            || !inRange(portal.from, 0, numsectors)
+            || !inRange(portal.to, 0, numsectors))
+            return -1;
+        ensureNavTopology();
+        const int start = currentNavStartCell();
+        if (start < 0)
+            return -1;
+        std::vector<char> reachable(navCells.size(), 0);
+        std::deque<int> reachQueue;
+        reachable[size_t(start)] = 1;
+        reachQueue.push_back(start);
+        while (!reachQueue.empty())
+        {
+            const int current = reachQueue.front();
+            reachQueue.pop_front();
+            for (const NavLink &link : navCells[size_t(current)].links)
+            {
+                if (!llmapper::traversableMode(link.mode)
+                    || !inRange(link.target, 0, int(navCells.size()))
+                    || reachable[size_t(link.target)])
+                    continue;
+                reachable[size_t(link.target)] = 1;
+                reachQueue.push_back(link.target);
+            }
+        }
+        const int tolerance = playerClipRadius() + (1 << (kNavGridShift - 1));
+        std::map<int, int> nearestBySupport;
+        for (const NavCell &cell : navCells)
+        {
+            if (cell.sector != portal.from
+                || cell.support.kind != kSupportSpriteFloor
+                // standingFloorZ() has already resolved the portal's actual
+                // take-off layer.  Match that layer instead of comparing it
+                // with the enclosing sector floor; on a bridge doorway the
+                // former is the sprite top by definition.
+                || std::abs(cell.z - portal.fromFloorZ) > kMaxWalkableStep)
+                continue;
+            const int64_t boundaryDistance = dist2ToSegment(
+                cell.center.x, cell.center.y, portal.x1, portal.y1,
+                portal.x2, portal.y2);
+            auto known = nearestBySupport.find(cell.support.id);
+            if (known == nearestBySupport.end()
+                || boundaryDistance < dist2ToSegment(
+                    navCells[size_t(known->second)].center.x,
+                    navCells[size_t(known->second)].center.y,
+                    portal.x1, portal.y1, portal.x2, portal.y2))
+                nearestBySupport[cell.support.id] = cell.id;
+        }
+
+        const bool report = reportedRaisedPortalAudits.insert(portal.wall).second;
+        if (report)
+        {
+            char summary[192];
+            snprintf(summary, sizeof(summary),
+                     "wall=%d from=%d to=%d floor_delta=%d from_floor=%d to_floor=%d start=%d sprite_supports=%u",
+                     portal.wall, portal.from, portal.to, portal.floorDelta,
+                     portal.fromFloorZ, portal.toFloorZ, start,
+                     unsigned(nearestBySupport.size()));
+            event("raised_portal_support_audit", summary);
+        }
+        int best = -1;
+        int64_t bestScore = INT64_MAX;
+        for (const auto &entry : nearestBySupport)
+        {
+            const NavCell &cell = navCells[size_t(entry.second)];
+            const int landingDelta = portal.toFloorZ - cell.z;
+            const bool reversible = std::abs(landingDelta) <= playerReversibleDrop();
+            const int reach = standingJumpReachForDelta(landingDelta);
+            const int64_t boundaryDistance = dist2ToSegment(
+                cell.center.x, cell.center.y, portal.x1, portal.y1,
+                portal.x2, portal.y2);
+            std::vector<NavRouteStep> route;
+            const bool routeFound = llmapper::planNavRoute(navCells, start, cell.id,
+                                        cell.center.x, cell.center.y,
+                                        cell.sector, -1, navEdgeFailures, 0,
+                                        route);
+            if (report)
+            {
+                int incoming = 0;
+                int reachableIncoming = 0;
+                for (const NavCell &source : navCells)
+                    for (const NavLink &link : source.links)
+                        if (link.target == cell.id
+                            && llmapper::traversableMode(link.mode))
+                        {
+                            ++incoming;
+                            if (reachable[size_t(source.id)])
+                                ++reachableIncoming;
+                        }
+                char detail[256];
+                snprintf(detail, sizeof(detail),
+                         "wall=%d support=%d cell=%d area=%d z=%d landing_delta=%d reversible=%d boundary_distance=%d reach=%d route=%d steps=%u incoming=%d reachable_incoming=%d start_area=%d",
+                         portal.wall, cell.support.id, cell.id, cell.walkArea,
+                         cell.z,
+                         landingDelta, reversible ? 1 : 0,
+                         int(std::sqrt(double(boundaryDistance))), reach,
+                         routeFound ? 1 : 0, unsigned(route.size()), incoming,
+                         reachableIncoming, navCells[size_t(start)].walkArea);
+                event("raised_portal_support_candidate", detail);
+            }
+            if (!reversible || reach <= 0
+                || boundaryDistance > int64_t(reach + tolerance)
+                                       * (reach + tolerance)
+                || !routeFound)
+                continue;
+            const int64_t score = int64_t(std::abs(landingDelta)) * 4096
+                + boundaryDistance + int64_t(route.size()) * 1024;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = cell.id;
+            }
+        }
+        return best;
+    }
+
+    GINPUT steerPortal(const Portal &knownPortal)
+    {
+        Portal portal = knownPortal;
+        const int supportPose = raisedPortalSupportPose(portal);
+        if (supportPose >= 0)
+        {
+            const NavCell &pose = navCells[size_t(supportPose)];
+            const SupportRef standing = currentPlayerSupport();
+            if (standing != pose.support
+                || std::abs(llmapper::capability::playerFloorZ() - pose.z)
+                    > kMaxWalkableStep)
+            {
+                const int signature = navigationSignature(
+                    pose.center.x, pose.center.y, pose.z, pose.sector,
+                    6000000 + portal.wall);
+                if (navRouteSignature != signature || navRoute.empty()
+                    || navRouteTopologyRevision != navTopologyRevision)
+                    buildNavRoute(pose.center.x, pose.center.y, pose.z,
+                                  pose.sector, signature, &pose.support);
+                if (!navRoute.empty())
+                {
+                    const int64_t routeKey = (int64_t(portal.wall) << 32)
+                        ^ uint32_t(pose.support.id);
+                    if (reportedRaisedPortalRoutes.insert(routeKey).second)
+                    {
+                        char detail[224];
+                        snprintf(detail, sizeof(detail),
+                                 "wall=%d from=%d to=%d support_kind=%d support=%d support_z=%d sector_floor_z=%d landing_z=%d",
+                                 portal.wall, portal.from, portal.to,
+                                 int(pose.support.kind), pose.support.id,
+                                 pose.z, portal.fromFloorZ, portal.toFloorZ);
+                        event("raised_portal_support_route", detail);
+                    }
+                    return navigateTo(pose.center.x, pose.center.y, pose.z,
+                                      pose.sector, 6000000 + portal.wall,
+                                      kTraversalUnknown);
+                }
+            }
+            else
+            {
+                // Reclassify only from the support actually under Caleb.
+                // The original sector-floor geometry remains unchanged and
+                // will be reconsidered if he falls off.
+                portal.fromFloorZ = pose.z;
+                portal.floorDelta = portal.toFloorZ - pose.z;
+                portal.jumpable = portal.floorDelta < -kMaxWalkableStep;
+                portal.dropSafe = portal.floorDelta > kMaxWalkableStep;
+                portal.walkable = std::abs(portal.floorDelta) <= kMaxWalkableStep;
+                portal.traversable = true;
+                portal.capability = portal.jumpable ? kTraversalJumpable
+                    : portal.dropSafe ? kTraversalDropSafe
+                                      : kTraversalWalkable;
+            }
+        }
         if (portal.gapJump)
             return steerGapJump(portal);
         const int bodyRadius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
@@ -10381,7 +12255,16 @@ struct LLMapperBot::Impl
                     GINPUT routeInput = navigateTo(portal.x, portal.y, portal.z,
                                                    observation.sector, portal.wall,
                                                    portal.capability);
-                    if (routeInput.forward || routeInput.strafe || routeInput.q16turn
+                    // A route owns steering until it explicitly invalidates
+                    // itself. Its jump state machine deliberately emits a
+                    // neutral frame when ALIGN becomes TAKEOFF; interpreting
+                    // that as rejection lets the portal fallback choose a
+                    // different target in the same tick, producing a stable
+                    // left/right camera oscillation with no movement.
+                    if ((!navRoute.empty()
+                         && navRouteSignature == routeSignature)
+                        || routeInput.forward || routeInput.strafe
+                        || routeInput.q16turn
                         || routeInput.q16mlook || routeInput.buttonFlags.jump
                         || routeInput.buttonFlags.crouch)
                         return routeInput;
@@ -10676,6 +12559,16 @@ struct LLMapperBot::Impl
             return;
         }
 
+        const NavRouteStep *supportStep = nullptr;
+        if (!navRoute.empty() && navRouteIndex < navRoute.size())
+        {
+            const NavRouteStep &candidate = navRoute[navRouteIndex];
+            const LocalWaypoint waypoint = navStepWaypoint(candidate);
+            if (candidate.mode == kNavJump
+                && candidate.targetSupport.kind == kSupportSpriteFloor
+                && waypoint.x == x && waypoint.y == y)
+                supportStep = &candidate;
+        }
         switch (jumpState)
         {
         case kJumpApproachTakeoff:
@@ -10704,10 +12597,19 @@ struct LLMapperBot::Impl
             }
             break;
         case kJumpTakeoff:
-            input.forward = kFullThrottle;
+            input.forward = 0;
             if (std::abs(angleError) < 96 && !gMe->cantJump
+                && observation.playerZVelocity == 0
                 && (!gMe->pXSprite || gMe->pXSprite->height == 0))
             {
+                input.forward = kFullThrottle;
+                if (supportStep)
+                {
+                    int hold = input.forward;
+                    if (solveSupportArc(llmapper::capability::playerJumpImpulse(),
+                                        *supportStep, x, y, targetAngle, hold))
+                        input.forward = int16_t(hold);
+                }
                 input.buttonFlags.jump = 1;
                 ++jumpAttempts;
                 if (targetId == -2)
@@ -10716,14 +12618,22 @@ struct LLMapperBot::Impl
                 jumpStateTick = observation.tick;
                 char detail[320];
                 snprintf(detail, sizeof(detail),
-                         "phase=TAKEOFF jump_requested=1 jump_input_emitted=1 target=%d target_sector=%d player_z=%d zvel_before=%d posture=%d cant_jump=%d attempts=%d yaw=%d",
+                         "phase=TAKEOFF jump_requested=1 jump_input_emitted=1 target=%d target_sector=%d player_z=%d zvel_before=%d posture=%d cant_jump=%d attempts=%d yaw=%d forward=%d",
                          targetId, targetSector, observation.z, observation.playerZVelocity,
-                         gMe->posture, gMe->cantJump, jumpAttempts, targetAngle);
+                         gMe->posture, gMe->cantJump, jumpAttempts, targetAngle,
+                         int(input.forward));
                 event("jump_input_emitted", detail);
             }
             break;
         case kJumpAirborne:
             input.forward = kFullThrottle;
+            if (supportStep)
+            {
+                int hold = input.forward;
+                if (solveSupportArc(observation.playerZVelocity, *supportStep,
+                                    x, y, targetAngle, hold))
+                    input.forward = int16_t(hold);
+            }
             if (std::abs(observation.playerZVelocity) >= 64 || gMe->cantJump)
             {
                 char detail[192];
@@ -10734,6 +12644,10 @@ struct LLMapperBot::Impl
             }
             if (observation.tick - jumpStateTick > kJumpActionTimeoutTicks)
             {
+                const bool settled = observation.playerZVelocity == 0
+                    && (!gMe->pXSprite || gMe->pXSprite->height == 0);
+                if (!settled)
+                    break;
                 if (jumpAttempts < kMaxJumpAttemptsPerTarget && !gMe->cantJump)
                 {
                     jumpState = kJumpTakeoff;
@@ -10830,7 +12744,11 @@ struct LLMapperBot::Impl
         // Only jump when the ground actually demands it.  A stale jumpable
         // capability on an ordinary crossing had the bot hopping up every
         // step of a staircase, which is both slow and conspicuous.
-        bool needsLift = capability == kTraversalJumpable;
+        // A local recovery probe first tests ordinary supported walking.  It
+        // may add one bounded jump only after the movement-progress detector
+        // proves the walk is blocked; treating its label as an immediate jump
+        // edge caused the AGTST10 wall-hopping loop.
+        bool needsLift = capability == kTraversalJumpable && targetId != -2;
         // Only second-guess a crossing into another sector.  A deliberate
         // same-sector jump is a probe or an escape and must be left alone.
         if (needsLift && targetSector != observation.sector
@@ -11297,6 +13215,7 @@ struct LLMapperBot::Impl
             const Portal *away = out >= 0 ? portalByWall(out, observation.sector, -1) : nullptr;
             if (away)
             {
+                hazardEscapeUnavailableEmitted = false;
                 if (currentGoal != "LEAVE_HAZARD")
                 {
                     char detail[160];
@@ -11307,7 +13226,22 @@ struct LLMapperBot::Impl
                 setGoal("LEAVE_HAZARD", away->wall);
                 return composeInput(intentFromInput(steerPortal(*away)), combat, use);
             }
+            // Hazard avoidance is an exclusive state.  If the safe exit is
+            // temporarily unavailable, executing the suspended exploration
+            // objective in alternating frames sends the bot directly back
+            // toward the hazard and continually resets both routes.  Hold
+            // the current layer until an exit reopens or the evidence ages
+            // out; the objective itself remains intact.
+            if (!hazardEscapeUnavailableEmitted)
+            {
+                hazardEscapeUnavailableEmitted = true;
+                event("hazard_escape_waiting",
+                      "reason=no_currently_traversable_safe_exit");
+            }
+            setGoal("WAIT_FOR_SAFE_HAZARD_EXIT", observation.sector);
+            return composeInput(move, combat, use);
         }
+        hazardEscapeUnavailableEmitted = false;
 
         const DoorTiming standingIn = doorTiming(observation.sector);
         const SupportRef standingSupport = currentPlayerSupport();
@@ -11558,7 +13492,8 @@ struct LLMapperBot::Impl
         // affordances have been tried.  This is a deterministic local probe,
         // not random roaming: it preserves the previously demonstrated
         // start-area jump without encoding any sector or wall identity.
-        if (!localDynamicJumpAttempted && localJumpProbeCount < 4)
+        if ((searchProbeActive || !localDynamicJumpAttempted)
+            && localJumpProbeCount < 4)
         {
             setGoal("SEARCH_CURRENT_AREA", -2);
             if (searchAngle < 0)
@@ -11570,6 +13505,8 @@ struct LLMapperBot::Impl
             // shuttles between rooms it has already seen.
             if (!searchProbeActive)
             {
+                if (localJumpProbeCount == 0)
+                    dumpLedger("before_local_recovery_probe");
                 searchProbeActive = true;
                 searchProbeX = observation.x + mulscale30(Cos(searchAngle), 8192);
                 searchProbeY = observation.y + mulscale30(Sin(searchAngle), 8192);
@@ -11599,6 +13536,7 @@ struct LLMapperBot::Impl
                 searchProbeActive = false;
                 movementTargetActive = false;
                 ++localJumpProbeCount;
+                localDynamicJumpAttempted = false;
                 searchAngle = wrapAngle(searchAngle + 512);
                 char detail[128];
                 snprintf(detail, sizeof(detail), "next_heading=%d probe=%d reason=probe_finished",
@@ -11736,9 +13674,9 @@ struct LLMapperBot::Impl
                      motionAuditAgreed, motionAuditDiverged, motionAuditClipped,
                      motionAuditPushed, motionAuditReshaped, motionAuditBuoyant);
             event("motion_model_audit", audit);
-            fprintf(telemetry, "{\"type\":\"summary\",\"result\":\"%s\",\"failure_reason\":\"%s\",\"game_time\":%d,\"visited_sectors\":%u,\"observed_sectors\":%u}\n",
+            fprintf(telemetry, "{\"type\":\"summary\",\"result\":\"%s\",\"failure_reason\":\"%s\",\"game_time\":%d,\"total_sectors\":%d,\"visited_sectors\":%u,\"observed_sectors\":%u}\n",
                     result.c_str(), failureReason.c_str(), (gFrame * kTicsPerFrame) / kTicsPerSec,
-                    unsigned(visitedSectors.size()), unsigned(observedSectors.size()));
+                    numsectors, unsigned(visitedSectors.size()), unsigned(observedSectors.size()));
             fclose(telemetry);
             telemetry = nullptr;
         }
@@ -11886,8 +13824,16 @@ void LLMapperBot::OnBotDamaged(int source, int damageType, int amount)
     m_impl->lastAttacker = source;
     m_impl->lastAttackerDamageType = damageType;
     m_impl->lastDamageTick = m_impl->observation.tick;
-    char detail[128];
-    snprintf(detail, sizeof(detail), "source=%d type=%d amount=%d", source, damageType, amount);
+    char detail[192];
+    if (inRange(source, 0, MAXSPRITES) && sprite[source].statnum != MAXSTATUS)
+        snprintf(detail, sizeof(detail),
+                 "source=%d source_type=%d source_stat=%d type=%d amount=%d",
+                 source, int(sprite[source].type), int(sprite[source].statnum),
+                 damageType, amount);
+    else
+        snprintf(detail, sizeof(detail),
+                 "source=%d source_type=-1 source_stat=-1 type=%d amount=%d",
+                 source, damageType, amount);
     m_impl->event("bot_damaged", detail);
 }
 
@@ -11896,6 +13842,7 @@ void LLMapperBot::OnVectorResolved(int hit, int sector, int wall, int spriteId,
 {
     if (!m_enabled || !m_impl || m_impl->currentGoal != "VECTOR_ACTIVATE")
         return;
+    m_impl->vectorResolved(hit, sector, wall, spriteId, x, y, z);
     char detail[192];
     snprintf(detail, sizeof(detail),
              "hit=%d sector=%d wall=%d sprite=%d at=(%d,%d,%d) objective=%d",

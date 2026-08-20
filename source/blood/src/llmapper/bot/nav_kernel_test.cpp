@@ -174,6 +174,23 @@ static void testNavGraph()
            "nav_failed_edge_reappears_on_geometry_change");
 
     cells.clear();
+    cells.push_back(makeCell(0, 1, 0, 0, 0));
+    cells.push_back(makeCell(1, 1, 100, 0, -6144));
+    cells.push_back(makeCell(2, 1, 200, 0, -12288));
+    // When collision geometry offers intermediate standable tops, climbing
+    // through them is safer than making one maximum-rise leap to the same
+    // destination.  Support identity is deliberately irrelevant here.
+    addLink(cells[0], 2, kNavJump);
+    addLink(cells[0], 1, kNavJump);
+    addLink(cells[1], 2, kNavJump);
+    expect(planNavRoute(cells, 0, 2, 200, 0, 1, -1,
+                        std::vector<NavEdgeFailure>(), 1, route)
+               && route.size() == 2
+               && route[0].toCell == 1
+               && route[1].toCell == 2,
+           "nav_prefers_staged_collision_support_climb");
+
+    cells.clear();
     for (int i = 0; i < 6; ++i)
         cells.push_back(makeCell(i, i == 5 ? 2 : 1, i * 100, 0));
     // One risky shortcut and a five-cell supported walk reach the same goal.
@@ -526,6 +543,38 @@ static void testDeferredEffectPrerequisites()
            "gained_effect_rearms_deferred_opportunity");
 }
 
+static void testOneWayOpportunityPreference()
+{
+    Opportunity trap;
+    trap.id = 301;
+    trap.kind = kOpportunityFrontier;
+    trap.sector = 1;
+    trap.target = 2;
+    trap.hops = 0;
+    trap.local = true;
+    trap.oneWayRisk = 1;
+
+    Opportunity remoteTrigger;
+    remoteTrigger.id = 302;
+    remoteTrigger.kind = kOpportunityInteraction;
+    remoteTrigger.sector = 1;
+    remoteTrigger.hops = 0;
+    remoteTrigger.local = true;
+
+    std::vector<Opportunity> ledger;
+    ledger.push_back(trap);
+    ledger.push_back(remoteTrigger);
+    Mission mission = selectMission(ledger, 0, 0, -1);
+    expect(mission.opportunity == remoteTrigger.id
+               && mission.kind == kMissionSolveBlocker,
+           "reversible_remote_action_precedes_one_way_frontier");
+
+    ledger.erase(ledger.begin() + 1);
+    mission = selectMission(ledger, 0, 0, -1);
+    expect(mission.opportunity == trap.id && mission.kind == kMissionContinue,
+           "one_way_frontier_remains_last_resort");
+}
+
 static void testCombat()
 {
     CombatSituation situation;
@@ -604,6 +653,7 @@ int main()
     testDynamicSupports();
     testFrontiers();
     testDeferredEffectPrerequisites();
+    testOneWayOpportunityPreference();
     testCombat();
     if (gFailures)
     {
