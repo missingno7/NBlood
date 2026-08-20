@@ -37,6 +37,10 @@ public:
     void OnActionResolved(int hit, int target, int extra, bool accepted, int key);
     // Called from the authoritative player damage path with the engine source.
     void OnBotDamaged(int source, int damageType, int amount);
+    // Called after the weapon's authoritative VectorScan so ranged
+    // activation failures can report the object actually hit.
+    void OnVectorResolved(int hit, int sector, int wall, int sprite,
+                          int x, int y, int z);
     // Called by the normal level-exit event path.
     void OnLevelExit(int exitType);
     // Called during shutdown/restart to flush telemetry and the demo.

@@ -61,6 +61,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "globals.h"
 #include "levels.h"
 #include "loadsave.h"
+#include "llmapper/bot/bot.h"
 #include "player.h"
 #include "seq.h"
 #include "sfx.h"
@@ -6429,6 +6430,14 @@ void actFireVector(spritetype *pShooter, int a2, int a3, int a4, int a5, int a6,
     {
         hit = VectorScan(pShooter, a2, a3, a4, a5, a6, nRange, 1);
         shooterPos = pShooter->xyz;
+    }
+    if (gLLMapperBot.Enabled() && IsPlayerSprite(pShooter)
+        && gMe && pShooter == gMe->pSprite)
+    {
+        gLLMapperBot.OnVectorResolved(hit, gHitInfo.hitsect,
+                                      gHitInfo.hitwall, gHitInfo.hitsprite,
+                                      gHitInfo.hitx, gHitInfo.hity,
+                                      gHitInfo.hitz);
     }
     if (hit == 3)
     {

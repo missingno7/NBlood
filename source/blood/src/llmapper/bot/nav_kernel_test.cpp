@@ -24,12 +24,15 @@ static void expect(bool condition, const char *name)
         std::printf("ok   %s\n", name);
 }
 
-static NavCell makeCell(int id, int sector, int x, int y)
+static NavCell makeCell(int id, int sector, int x, int y, int z = 0,
+                        SupportRef support = SupportRef())
 {
     NavCell cell;
     cell.id = id;
     cell.sector = sector;
     cell.center = NavWaypoint(x, y);
+    cell.z = z;
+    cell.support = support.id >= 0 ? support : SupportRef(kSupportSectorFloor, sector);
     return cell;
 }
 
@@ -43,6 +46,23 @@ static void addLink(NavCell &from, int to, NavEdgeMode mode, int wall = -1,
     link.gateway = gateway;
     link.hasGateway = wall >= 0 || (gateway.x != 0 || gateway.y != 0);
     from.links.push_back(link);
+}
+
+static bool planHas(const std::vector<PlanOperation> &plan, PlanOperationKind kind)
+{
+    for (size_t i = 0; i < plan.size(); ++i)
+        if (plan[i].kind == kind)
+            return true;
+    return false;
+}
+
+static bool planActivatesWith(const std::vector<PlanOperation> &plan,
+                              ActivationMode mode)
+{
+    for (size_t i = 0; i < plan.size(); ++i)
+        if (plan[i].kind == kPlanActivate && plan[i].activation == mode)
+            return true;
+    return false;
 }
 
 static void testTraversalProbe()
@@ -154,6 +174,22 @@ static void testNavGraph()
            "nav_failed_edge_reappears_on_geometry_change");
 
     cells.clear();
+    for (int i = 0; i < 6; ++i)
+        cells.push_back(makeCell(i, i == 5 ? 2 : 1, i * 100, 0));
+    // One risky shortcut and a five-cell supported walk reach the same goal.
+    // Route selection should preserve the jump for maps that need it, but
+    // prefer the bridge when both are currently available.
+    addLink(cells[0], 5, kNavJump, 30, NavWaypoint(250, -100));
+    for (int i = 0; i < 5; ++i)
+        addLink(cells[i], i + 1, kNavWalk);
+    expect(planNavRoute(cells, 0, 5, 500, 0, 2, -1,
+                        std::vector<NavEdgeFailure>(), 1, route)
+               && route.size() == 5
+               && route[0].mode == kNavWalk
+               && route[4].targetSector == 2,
+           "nav_prefers_supported_walk_over_risky_jump_shortcut");
+
+    cells.clear();
     cells.push_back(makeCell(0, 1, 0, 0));
     cells.push_back(makeCell(1, 2, 100, 0));
     cells.push_back(makeCell(2, 2, 100, 100));
@@ -171,6 +207,212 @@ static void testNavGraph()
                && route.size() == 1
                && route[0].wall == 2,
            "nav_failed_edge_reroutes_to_alternative");
+}
+
+static void testSupportAwareNavigation()
+{
+    NavCell floor = makeCell(0, 4, 100, 200, 12000,
+                             SupportRef(kSupportSectorFloor, 4));
+    NavCell bridge = makeCell(1, 4, 100, 200, 4000,
+                              SupportRef(kSupportSpriteFloor, 31));
+    expect(floor.sector == bridge.sector
+               && floor.center.x == bridge.center.x
+               && floor.center.y == bridge.center.y
+               && floor.z != bridge.z && floor.support != bridge.support,
+           "support_same_sector_xy_different_layer_distinct");
+
+    NavCell bridgeAbove = makeCell(2, 4, 100, 200, -4000,
+                                   SupportRef(kSupportSpriteFloor, 32));
+    expect(bridge.support != bridgeAbove.support && bridge.z != bridgeAbove.z,
+           "support_stacked_perpendicular_bridges_do_not_collapse");
+}
+
+static void testCrouchAndConditionalGate()
+{
+    expect(classifyTraversalForPostures(0, 3000, 4096, 2048, 8192, 4096,
+                                        true, false, false, true)
+               == kTraverseCrouch,
+           "traverse_narrow_opening_requires_crouch");
+
+    std::vector<NavCell> cells;
+    cells.push_back(makeCell(0, 1, 0, 0));
+    cells.push_back(makeCell(1, 2, 100, 0));
+    cells[0].links.push_back(makeConditionalTraversal(1, kNavCrouch, 9, 1));
+    expect(cells[0].links[0].mode == kNavCrouch
+               && cells[0].links[0].condition.enabled
+               && cells[0].links[0].condition.mechanism == 9
+               && cells[0].links[0].condition.state == 1,
+           "dynamic_gate_blocked_to_conditional_crouch");
+}
+
+static CausalGraph oneActuatorGraph(int actuatorId, int location,
+                                    ActivationMode mode, int mechanism,
+                                    int state)
+{
+    CausalGraph graph;
+    Actuator actuator;
+    actuator.id = actuatorId;
+    actuator.locationCell = location;
+    actuator.modes.push_back(mode);
+    graph.actuators.push_back(actuator);
+    LearnedEffect effect;
+    effect.actuator = actuatorId;
+    effect.mode = mode;
+    effect.mechanism = mechanism;
+    effect.state = state;
+    graph.effects.push_back(effect);
+    return graph;
+}
+
+static void testDynamicPlanningAndCausality()
+{
+    std::vector<NavCell> cells;
+    cells.push_back(makeCell(0, 1, 0, 0));
+    cells.push_back(makeCell(1, 1, 100, 0));
+    cells.push_back(makeCell(2, 2, 200, 0));
+    addLink(cells[0], 1, kNavWalk);
+    addLink(cells[1], 0, kNavWalk);
+    cells[1].links.push_back(makeConditionalTraversal(2, kNavCrouch, 7, 1));
+    cells[2].links.push_back(makeConditionalTraversal(1, kNavCrouch, 7, 1));
+
+    CausalGraph graph = oneActuatorGraph(42, 1, kActivateUse, 7, 1);
+    std::map<int, int> states;
+    states[7] = 0;
+    std::vector<PlanOperation> plan;
+    DynamicPlanStats stats;
+    expect(planDynamicRoute(cells, 0, 2, states, graph, plan, &stats)
+               && planHas(plan, kPlanActivate)
+               && planHas(plan, kPlanWaitForTransition)
+               && planActivatesWith(plan, kActivateUse),
+           "remote_actuator_establishes_traversal_condition");
+
+    // Closing changes availability, not remembered topology.  From the far
+    // side another reachable actuator can re-establish the same condition.
+    CausalGraph reverseGraph = oneActuatorGraph(43, 2, kActivateUse, 7, 1);
+    plan.clear();
+    expect(cells[2].links[0].condition.enabled
+               && planDynamicRoute(cells, 2, 1, states, reverseGraph, plan)
+               && planHas(plan, kPlanActivate),
+           "auto_closing_gate_retains_conditional_reverse_connection");
+
+    Actuator vectorActuator;
+    vectorActuator.id = 44;
+    vectorActuator.locationCell = 1;
+    vectorActuator.modes.push_back(kActivateVector);
+    vectorActuator.destructible = false;
+    graph.actuators.push_back(vectorActuator);
+    LearnedEffect vectorEffect;
+    vectorEffect.actuator = 44;
+    vectorEffect.mode = kActivateVector;
+    vectorEffect.mechanism = 8;
+    vectorEffect.state = 1;
+    graph.effects.push_back(vectorEffect);
+    expect(graph.actuators[0].modes[0] == kActivateUse
+               && graph.actuators[1].modes[0] == kActivateVector,
+           "use_and_vector_share_causal_model_with_distinct_modes");
+    expect(!graph.actuators[1].destructible,
+           "vector_activation_does_not_imply_destructible");
+
+    CausalReceiver sectorReceiver;
+    sectorReceiver.channel = 100;
+    sectorReceiver.object = WorldObjectRef(kWorldSector, 3);
+    CausalReceiver wallReceiver;
+    wallReceiver.channel = 100;
+    wallReceiver.object = WorldObjectRef(kWorldWall, 17);
+    CausalReceiver spriteReceiver;
+    spriteReceiver.channel = 100;
+    spriteReceiver.object = WorldObjectRef(kWorldSprite, 25);
+    graph.receivers.push_back(sectorReceiver);
+    graph.receivers.push_back(wallReceiver);
+    graph.receivers.push_back(spriteReceiver);
+    const std::vector<CausalReceiver> receivers = graph.receiversFor(100);
+    expect(receivers.size() == 3
+               && receivers[0].object.kind == kWorldSector
+               && receivers[1].object.kind == kWorldWall
+               && receivers[2].object.kind == kWorldSprite,
+           "tx_channel_preserves_all_receiver_types");
+
+    // Twenty unrelated mechanism states do not multiply route search.  Only
+    // the condition on the candidate route is resolved.
+    for (int i = 100; i < 120; ++i)
+        states[i] = i & 1;
+    plan.clear();
+    stats = DynamicPlanStats();
+    expect(planDynamicRoute(cells, 0, 2, states, oneActuatorGraph(
+                                45, 1, kActivateUse, 7, 1), plan, &stats)
+               && stats.mechanismsConsidered.size() == 1
+               && stats.mechanismsConsidered.count(7) == 1,
+           "dynamic_planner_avoids_unrelated_state_cartesian_product");
+}
+
+static StablePose pose(int state, int z, int clearance, bool occupiable,
+                       int connection)
+{
+    StablePose result;
+    result.state = state;
+    result.supportZ = z;
+    result.clearance = clearance;
+    result.occupiable = occupiable;
+    if (connection >= 0)
+        result.connectedSurfaces.push_back(connection);
+    return result;
+}
+
+static void testDynamicSupports()
+{
+    DynamicMechanism gate;
+    gate.id = 1;
+    gate.poses.push_back(pose(0, 12000, 1000, false, -1));
+    gate.poses.push_back(pose(1, 4000, 3000, true, 2));
+    gate.sweepClearances.push_back(1000);
+    const int gateAffordances = deriveDynamicAffordances(gate, 2048);
+
+    DynamicMechanism carrier;
+    carrier.id = 2;
+    carrier.support = SupportRef(kSupportSectorFloor, 8);
+    carrier.carriesSupport = true;
+    carrier.poses.push_back(pose(0, 12000, 8192, true, 10));
+    carrier.poses.push_back(pose(1, 4000, 8192, true, 11));
+    carrier.sweepClearances.push_back(8192);
+    const int carrierAffordances = deriveDynamicAffordances(carrier, 4096);
+    expect((gateAffordances & kAffordanceEnablePassage)
+               && (gateAffordances & kAffordanceUnsafeSweptOccupancy)
+               && !(gateAffordances & kAffordanceTransportSupportedPlayer)
+               && (carrierAffordances & kAffordanceTransportSupportedPlayer)
+               && !(carrierAffordances & kAffordanceUnsafeSweptOccupancy),
+           "similar_vertical_motion_gate_and_carrier_classify_differently");
+    expect((carrierAffordances & kAffordanceUnsafeSweptOccupancy) == 0,
+           "moving_geometry_not_universally_hazardous");
+    expect((gateAffordances & kAffordanceTransportSupportedPlayer) == 0,
+           "unsafe_swept_occupancy_has_no_ride_affordance");
+
+    std::vector<NavCell> cells;
+    cells.push_back(makeCell(0, 1, 0, 0, 12000));
+    cells.push_back(makeCell(1, 8, 100, 0, 12000, carrier.support));
+    cells.push_back(makeCell(2, 8, 100, 0, 4000, carrier.support));
+    cells.push_back(makeCell(3, 9, 200, 0, 4000));
+    cells[0].links.push_back(makeConditionalTraversal(1, kNavWalk, 2, 0));
+    cells[1].links.push_back(makeConditionalTraversal(2, kNavRide, 2, 1, 2));
+    cells[2].links.push_back(makeConditionalTraversal(3, kNavWalk, 2, 1));
+    std::map<int, int> states;
+    states[2] = 0;
+    std::vector<PlanOperation> plan;
+    expect(planDynamicRoute(cells, 0, 3, states,
+                            oneActuatorGraph(50, 1, kActivateUse, 2, 1), plan)
+               && planHas(plan, kPlanRemainSupported),
+           "safe_moving_support_connects_two_stable_landings");
+
+    DynamicMechanism spriteCarrier = carrier;
+    spriteCarrier.id = 3;
+    spriteCarrier.object = WorldObjectRef(kWorldSprite, 71);
+    spriteCarrier.support = SupportRef(kSupportSpriteFloor, 71);
+    NavCell spriteLow = makeCell(4, 12, 0, 0, 12000, spriteCarrier.support);
+    NavCell spriteHigh = makeCell(5, 13, 300, 0, 4000, spriteCarrier.support);
+    expect((deriveDynamicAffordances(spriteCarrier, 4096)
+                & kAffordanceTransportSupportedPlayer)
+               && spriteLow.sector != spriteHigh.sector
+               && spriteLow.support == spriteHigh.support,
+           "moving_sprite_support_transports_across_build_sectors");
 }
 
 static void testFrontiers()
@@ -249,6 +491,41 @@ static void testFrontiers()
            "frontier_geometry_change_restores_failed_candidate");
 }
 
+static void testDeferredEffectPrerequisites()
+{
+    Opportunity crack;
+    crack.id = 101;
+    crack.kind = kOpportunityInteraction;
+    crack.sector = 1;
+    crack.hops = 0;
+    crack.local = true;
+    crack.requiredEffects = kEffectExplosive;
+
+    Opportunity exploration;
+    exploration.id = 202;
+    exploration.kind = kOpportunityFrontier;
+    exploration.sector = 2;
+    exploration.target = 3;
+    exploration.hops = 1;
+    exploration.local = false;
+
+    std::vector<Opportunity> ledger;
+    ledger.push_back(crack);
+    ledger.push_back(exploration);
+    Mission mission = selectMission(ledger, 0, 0, -1, kEffectNone);
+    expect(mission.opportunity == exploration.id
+               && mission.kind == kMissionReturnToBranch,
+           "missing_effect_defers_useful_opportunity_without_forgetting_it");
+
+    // The opportunity names the effect, not its producer.  Any later world
+    // or inventory change exposing that effect makes the same ledger entry
+    // actionable without rewriting it to a particular item type.
+    mission = selectMission(ledger, 1, 0, -1, kEffectExplosive);
+    expect(mission.opportunity == crack.id
+               && mission.kind == kMissionSolveBlocker,
+           "gained_effect_rearms_deferred_opportunity");
+}
+
 static void testCombat()
 {
     CombatSituation situation;
@@ -321,7 +598,12 @@ int main()
 {
     testTraversalProbe();
     testNavGraph();
+    testSupportAwareNavigation();
+    testCrouchAndConditionalGate();
+    testDynamicPlanningAndCausality();
+    testDynamicSupports();
     testFrontiers();
+    testDeferredEffectPrerequisites();
     testCombat();
     if (gFailures)
     {

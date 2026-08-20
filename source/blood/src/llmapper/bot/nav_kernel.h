@@ -6,8 +6,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <set>
 #include <vector>
 
 namespace llmapper
@@ -20,8 +23,83 @@ enum NavEdgeMode
     kNavJump,
     kNavCrouch,
     kNavDrop,
+    kNavRide,
     kNavInteraction, // prerequisite/affordance, never a route edge
     kNavBlocked,
+};
+
+// A Build sector is a topological container, not a height layer.  SupportRef
+// names the physical thing under the player so two floors at the same XY do
+// not become the same navigation state.
+enum SupportKind
+{
+    kSupportSectorFloor,
+    kSupportSpriteFloor,
+};
+
+struct SupportRef
+{
+    SupportKind kind;
+    int id;
+    SupportRef() : kind(kSupportSectorFloor), id(-1) {}
+    SupportRef(SupportKind aKind, int anId) : kind(aKind), id(anId) {}
+    bool operator==(const SupportRef &other) const
+    {
+        return kind == other.kind && id == other.id;
+    }
+    bool operator!=(const SupportRef &other) const { return !(*this == other); }
+};
+
+struct NavCondition
+{
+    int mechanism;
+    int state;
+    bool enabled;
+    NavCondition() : mechanism(-1), state(-1), enabled(false) {}
+    NavCondition(int aMechanism, int aState)
+        : mechanism(aMechanism), state(aState), enabled(true) {}
+};
+
+enum ActivationMode
+{
+    kActivateUse,
+    kActivateVector,
+    kActivateImpact,
+    kActivateTouch,
+    kActivateEnter,
+    kActivateExit,
+    kActivatePickup,
+    kActivateSight,
+    kActivateProximity,
+    // Damage-driven interactions are not Use/Vector triggers.  The planner
+    // records the effect the world object accepts and lets inventory or
+    // nearby-world satisfiers provide that effect later.
+    kActivateDamage,
+};
+
+enum EffectCapability
+{
+    kEffectNone = 0,
+    kEffectExplosive = 1u << 0,
+};
+
+enum WorldObjectKind
+{
+    kWorldSector,
+    kWorldWall,
+    kWorldSprite,
+};
+
+struct WorldObjectRef
+{
+    WorldObjectKind kind;
+    int id;
+    WorldObjectRef() : kind(kWorldSector), id(-1) {}
+    WorldObjectRef(WorldObjectKind aKind, int anId) : kind(aKind), id(anId) {}
+    bool operator==(const WorldObjectRef &other) const
+    {
+        return kind == other.kind && id == other.id;
+    }
 };
 
 enum TraversalResult
@@ -29,6 +107,7 @@ enum TraversalResult
     kTraverseDirect,
     kTraverseStep,
     kTraverseJump,
+    kTraverseCrouch,
     kTraverseDropSafe,
     kTraverseUseableBlocker,
     kTraverseSolidBlocker,
@@ -66,8 +145,11 @@ struct NavLink
     int wall;
     NavWaypoint gateway;
     bool hasGateway;
+    NavCondition condition;
+    int transition;
     NavLink()
-        : target(-1), mode(kNavWalk), wall(-1), gateway(), hasGateway(false)
+        : target(-1), mode(kNavWalk), wall(-1), gateway(), hasGateway(false),
+          condition(), transition(-1)
     {
     }
 };
@@ -84,12 +166,15 @@ struct NavCell
     int sector;
     int gx;
     int gy;
+    int z;
+    SupportRef support;
     NavWaypoint center;
     int walkArea;
     bool inMotion;
     std::vector<NavLink> links;
     NavCell()
-        : id(-1), sector(-1), gx(0), gy(0), center(), walkArea(-1), inMotion(false)
+        : id(-1), sector(-1), gx(0), gy(0), z(0), support(), center(),
+          walkArea(-1), inMotion(false)
     {
     }
 };
@@ -105,11 +190,134 @@ struct NavRouteStep
     int wall;
     int sourceSector;
     int targetSector;
+    int sourceZ;
+    int targetZ;
+    SupportRef sourceSupport;
+    SupportRef targetSupport;
+    NavCondition condition;
+    int transition;
     NavRouteStep()
         : fromCell(-1), toCell(-1), gateway(), hasGateway(false), destination(),
-          mode(kNavWalk), wall(-1), sourceSector(-1), targetSector(-1)
+          mode(kNavWalk), wall(-1), sourceSector(-1), targetSector(-1),
+          sourceZ(0), targetZ(0), sourceSupport(), targetSupport(), condition(),
+          transition(-1)
     {
     }
+};
+
+// Stable poses and their physical consequences.  The flags are derived from
+// occupancy/clearance/connectivity; they are not mapper object classes.
+struct StablePose
+{
+    int state;
+    int supportZ;
+    int clearance;
+    bool occupiable;
+    std::vector<int> connectedSurfaces;
+    StablePose() : state(0), supportZ(0), clearance(0), occupiable(false) {}
+};
+
+enum DynamicAffordance
+{
+    kAffordanceNone = 0,
+    kAffordanceEnablePassage = 1 << 0,
+    kAffordanceTransportSupportedPlayer = 1 << 1,
+    kAffordanceUnsafeSweptOccupancy = 1 << 2,
+};
+
+struct DynamicMechanism
+{
+    int id;
+    WorldObjectRef object;
+    SupportRef support;
+    std::vector<StablePose> poses;
+    std::vector<int> sweepClearances;
+    bool crush;
+    bool carriesSupport;
+    DynamicMechanism()
+        : id(-1), object(), support(), poses(), sweepClearances(), crush(false),
+          carriesSupport(false)
+    {
+    }
+};
+
+struct Actuator
+{
+    int id;
+    WorldObjectRef object;
+    int locationCell;
+    int tx;
+    int command;
+    bool destructible;
+    std::vector<ActivationMode> modes;
+    Actuator()
+        : id(-1), object(), locationCell(-1), tx(0), command(0),
+          destructible(false), modes()
+    {
+    }
+};
+
+struct CausalReceiver
+{
+    int channel;
+    WorldObjectRef object;
+    int mechanism;
+    CausalReceiver() : channel(0), object(), mechanism(-1) {}
+};
+
+struct LearnedEffect
+{
+    int actuator;
+    ActivationMode mode;
+    int mechanism;
+    int state;
+    LearnedEffect()
+        : actuator(-1), mode(kActivateUse), mechanism(-1), state(-1) {}
+};
+
+struct CausalGraph
+{
+    std::vector<Actuator> actuators;
+    std::vector<CausalReceiver> receivers;
+    std::vector<LearnedEffect> effects;
+
+    std::vector<CausalReceiver> receiversFor(int channel) const;
+    const Actuator *actuatorById(int id) const;
+    std::vector<LearnedEffect> effectsEstablishing(int mechanism, int state) const;
+};
+
+enum PlanOperationKind
+{
+    kPlanNavigate,
+    kPlanTraverse,
+    kPlanActivate,
+    kPlanWaitForTransition,
+    kPlanRemainSupported,
+};
+
+struct PlanOperation
+{
+    PlanOperationKind kind;
+    int fromCell;
+    int toCell;
+    NavEdgeMode traversal;
+    int actuator;
+    ActivationMode activation;
+    int mechanism;
+    int state;
+    PlanOperation()
+        : kind(kPlanNavigate), fromCell(-1), toCell(-1), traversal(kNavWalk),
+          actuator(-1), activation(kActivateUse), mechanism(-1), state(-1)
+    {
+    }
+};
+
+struct DynamicPlanStats
+{
+    int routeSearches;
+    int prerequisiteExpansions;
+    std::set<int> mechanismsConsidered;
+    DynamicPlanStats() : routeSearches(0), prerequisiteExpansions(0) {}
 };
 
 struct NavEdgeFailure
@@ -232,6 +440,7 @@ struct Opportunity
     int target;        // sector it leads to, -1 when not a crossing
     int wall;
     int requiredKey;   // 0 when no key is involved
+    unsigned requiredEffects; // abstract effects, independent of their satisfier
     int depth;         // exploration-tree depth of the discovering node
     int hops;          // route distance from the bot right now, -1 unreachable
     int dormantUntil;  // tick before which this stays out of the way
@@ -239,7 +448,7 @@ struct Opportunity
     bool local;        // discovered from, and actionable in, the current sector
     Opportunity()
         : id(-1), kind(kOpportunityFrontier), sector(-1), target(-1), wall(-1),
-          requiredKey(0), depth(0), hops(-1), dormantUntil(0), descent(0),
+          requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1), dormantUntil(0), descent(0),
           local(false)
     {
     }
@@ -261,7 +470,8 @@ struct Mission
 // gives forward momentum, and popping to the next-deepest gives a natural
 // backtrack instead of a random hop across the map.
 Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
-                      unsigned heldKeys, int committedOpportunity);
+                      unsigned heldKeys, int committedOpportunity,
+                      unsigned availableEffects = ~0u);
 
 const char *missionReason(MissionKind kind);
 
@@ -273,7 +483,7 @@ inline int mixHash(int hash, int value)
 inline bool traversableMode(NavEdgeMode mode)
 {
     return mode == kNavWalk || mode == kNavStep || mode == kNavJump
-        || mode == kNavCrouch || mode == kNavDrop;
+        || mode == kNavCrouch || mode == kNavDrop || mode == kNavRide;
 }
 
 inline bool walkMode(NavEdgeMode mode)
@@ -363,12 +573,36 @@ inline TraversalResult classifyTraversal(int floorDelta, int clearance,
     return kTraverseDirect;
 }
 
+inline TraversalResult classifyTraversalForPostures(
+    int floorDelta, int clearance, int standingClearance, int crouchClearance,
+    int jumpRise, int maxWalkStep, bool clipReachable, bool hitSolid,
+    bool useableBlocker, bool clipFits)
+{
+    if (clearance < standingClearance)
+    {
+        if (clearance < crouchClearance || std::abs(floorDelta) > maxWalkStep
+            || !clipFits)
+            return kTraverseNoFit;
+        if (clipReachable)
+            return kTraverseCrouch;
+        if (useableBlocker)
+            return kTraverseUseableBlocker;
+        if (hitSolid)
+            return kTraverseSolidBlocker;
+        return kTraverseNoFit;
+    }
+    return classifyTraversal(floorDelta, clearance, standingClearance, jumpRise,
+                             maxWalkStep, clipReachable, hitSolid, useableBlocker,
+                             clipFits);
+}
+
 inline NavEdgeMode modeFromTraversal(TraversalResult result)
 {
     switch (result)
     {
     case kTraverseStep: return kNavStep;
     case kTraverseJump: return kNavJump;
+    case kTraverseCrouch: return kNavCrouch;
     case kTraverseDropSafe: return kNavDrop;
     case kTraverseUseableBlocker: return kNavInteraction;
     case kTraverseSolidBlocker:
@@ -377,6 +611,18 @@ inline NavEdgeMode modeFromTraversal(TraversalResult result)
     default: return kNavWalk;
     }
 }
+
+int deriveDynamicAffordances(const DynamicMechanism &mechanism,
+                             int requiredClearance);
+
+NavLink makeConditionalTraversal(int target, NavEdgeMode mode, int mechanism,
+                                 int state, int transition = -1);
+
+bool planDynamicRoute(const std::vector<NavCell> &cells, int startCell,
+                      int targetCell, const std::map<int, int> &mechanismStates,
+                      const CausalGraph &causality,
+                      std::vector<PlanOperation> &outPlan,
+                      DynamicPlanStats *stats = nullptr);
 
 void assignWalkAreas(std::vector<NavCell> &cells);
 

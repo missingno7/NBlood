@@ -17,6 +17,7 @@ const char *navEdgeModeName(NavEdgeMode mode)
     case kNavJump: return "JUMP";
     case kNavCrouch: return "CROUCH";
     case kNavDrop: return "DROP_SAFE";
+    case kNavRide: return "REMAIN_SUPPORTED";
     case kNavInteraction: return "INTERACTION";
     case kNavBlocked: return "BLOCKED";
     default: return "WALK";
@@ -29,6 +30,7 @@ const char *traversalResultName(TraversalResult result)
     {
     case kTraverseStep: return "STEP";
     case kTraverseJump: return "JUMP";
+    case kTraverseCrouch: return "CROUCH";
     case kTraverseDropSafe: return "DROP_SAFE";
     case kTraverseUseableBlocker: return "USEABLE_BLOCKER";
     case kTraverseSolidBlocker: return "SOLID_BLOCKER";
@@ -68,7 +70,7 @@ void assignWalkAreas(std::vector<NavCell> &cells)
             const std::vector<NavLink> &links = cells[size_t(current)].links;
             for (size_t l = 0; l < links.size(); ++l)
             {
-                if (!walkMode(links[l].mode))
+                if (!walkMode(links[l].mode) || links[l].condition.enabled)
                     continue;
                 if (links[l].target < 0 || links[l].target >= int(cells.size()))
                     continue;
@@ -95,6 +97,15 @@ static const NavLink *findLink(const NavCell &cell, int target, int wall)
         return &link;
     }
     return nullptr;
+}
+
+static bool conditionSatisfied(const NavCondition &condition,
+                               const std::map<int, int> &states)
+{
+    if (!condition.enabled)
+        return true;
+    std::map<int, int>::const_iterator found = states.find(condition.mechanism);
+    return found != states.end() && found->second == condition.state;
 }
 
 bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCell,
@@ -142,38 +153,69 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
         return true;
     }
 
-    std::deque<int> queue;
+    // Prefer physically conservative routes.  A jump or irreversible drop
+    // is not equivalent to one ordinary grid step merely because both are
+    // represented by one graph link.  The old breadth-first search chose a
+    // long leap across a pit over the adjacent sprite bridge because it had
+    // fewer links.  Dijkstra costs keep those capabilities available while
+    // preferring a modest walk around whenever one is known.
+    auto traversalCost = [](NavEdgeMode mode) {
+        switch (mode)
+        {
+        case kNavStep: return 2;
+        case kNavCrouch: return 3;
+        case kNavRide: return 4;
+        case kNavDrop: return 16;
+        case kNavJump: return 32;
+        default: return 1;
+        }
+    };
+    std::set<std::pair<int, int> > queue;
     std::vector<int> parent(cells.size(), -1);
     std::vector<int> viaWall(cells.size(), -1);
     std::vector<NavEdgeMode> viaMode(cells.size(), kNavWalk);
-    std::vector<char> reached(cells.size(), 0);
-    queue.push_back(startCell);
-    reached[size_t(startCell)] = 1;
-    while (!queue.empty() && !reached[size_t(goal)])
+    std::vector<int> bestCost(cells.size(), 0x3fffffff);
+    bestCost[size_t(startCell)] = 0;
+    queue.insert(std::make_pair(0, startCell));
+    while (!queue.empty())
     {
-        const int current = queue.front();
-        queue.pop_front();
+        const std::pair<int, int> next = *queue.begin();
+        queue.erase(queue.begin());
+        const int current = next.second;
+        if (next.first != bestCost[size_t(current)])
+            continue;
+        if (current == goal)
+            break;
         const NavCell &cell = cells[size_t(current)];
         for (size_t i = 0; i < cell.links.size(); ++i)
         {
             const NavLink &link = cell.links[i];
             if (!traversableMode(link.mode))
                 continue;
+            // This legacy entry point plans current geometry only.  A
+            // conditional connection stays in the graph, but requires the
+            // interaction-aware planner below to establish its condition.
+            if (link.condition.enabled)
+                continue;
             if (link.target < 0 || link.target >= int(cells.size()))
                 continue;
             if (edgeFailedAny(failures, current, link.target, link.wall, link.mode,
                               geometrySignature))
                 continue;
-            if (reached[size_t(link.target)])
+            const int candidateCost = bestCost[size_t(current)]
+                + traversalCost(link.mode);
+            if (candidateCost >= bestCost[size_t(link.target)])
                 continue;
-            reached[size_t(link.target)] = 1;
+            if (bestCost[size_t(link.target)] < 0x3fffffff)
+                queue.erase(std::make_pair(bestCost[size_t(link.target)], link.target));
+            bestCost[size_t(link.target)] = candidateCost;
             parent[size_t(link.target)] = current;
             viaWall[size_t(link.target)] = link.wall;
             viaMode[size_t(link.target)] = link.mode;
-            queue.push_back(link.target);
+            queue.insert(std::make_pair(candidateCost, link.target));
         }
     }
-    if (!reached[size_t(goal)])
+    if (bestCost[size_t(goal)] == 0x3fffffff)
         return false;
 
     std::vector<int> cellsPath;
@@ -197,6 +239,10 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
         step.wall = viaWall[size_t(to)];
         step.sourceSector = cells[size_t(from)].sector;
         step.targetSector = cells[size_t(to)].sector;
+        step.sourceZ = cells[size_t(from)].z;
+        step.targetZ = cells[size_t(to)].z;
+        step.sourceSupport = cells[size_t(from)].support;
+        step.targetSupport = cells[size_t(to)].support;
         const NavLink *link = findLink(cells[size_t(from)], to, step.wall);
         if (link && link->hasGateway)
         {
@@ -206,6 +252,11 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
         }
         else
             step.destination = cells[size_t(to)].center;
+        if (link)
+        {
+            step.condition = link->condition;
+            step.transition = link->transition;
+        }
         outRoute.push_back(step);
     }
     if (!outRoute.empty())
@@ -218,6 +269,285 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
             last.targetSector = targetSector;
     }
     return !outRoute.empty();
+}
+
+std::vector<CausalReceiver> CausalGraph::receiversFor(int channel) const
+{
+    std::vector<CausalReceiver> result;
+    for (size_t i = 0; i < receivers.size(); ++i)
+        if (receivers[i].channel == channel)
+            result.push_back(receivers[i]);
+    return result;
+}
+
+const Actuator *CausalGraph::actuatorById(int id) const
+{
+    for (size_t i = 0; i < actuators.size(); ++i)
+        if (actuators[i].id == id)
+            return &actuators[i];
+    return nullptr;
+}
+
+std::vector<LearnedEffect> CausalGraph::effectsEstablishing(int mechanism,
+                                                            int state) const
+{
+    std::vector<LearnedEffect> result;
+    for (size_t i = 0; i < effects.size(); ++i)
+        if (effects[i].mechanism == mechanism && effects[i].state == state)
+            result.push_back(effects[i]);
+    return result;
+}
+
+int deriveDynamicAffordances(const DynamicMechanism &mechanism,
+                             int requiredClearance)
+{
+    int result = kAffordanceNone;
+    bool anyPassable = false;
+    bool anyBlocked = false;
+    bool endpointsSafe = mechanism.poses.size() >= 2;
+    std::set<int> firstConnections;
+    bool differentConnections = false;
+    for (size_t i = 0; i < mechanism.poses.size(); ++i)
+    {
+        const StablePose &pose = mechanism.poses[i];
+        const bool passable = pose.occupiable && pose.clearance >= requiredClearance;
+        anyPassable = anyPassable || passable;
+        anyBlocked = anyBlocked || !passable;
+        endpointsSafe = endpointsSafe && passable;
+        const std::set<int> connections(pose.connectedSurfaces.begin(),
+                                        pose.connectedSurfaces.end());
+        if (i == 0)
+            firstConnections = connections;
+        else if (connections != firstConnections)
+            differentConnections = true;
+    }
+    if (anyPassable && anyBlocked)
+        result |= kAffordanceEnablePassage;
+
+    bool sweepSafe = endpointsSafe;
+    for (size_t i = 0; i < mechanism.sweepClearances.size(); ++i)
+        if (mechanism.sweepClearances[i] < requiredClearance)
+            sweepSafe = false;
+    if (mechanism.crush && mechanism.sweepClearances.empty())
+        sweepSafe = false;
+
+    if (mechanism.carriesSupport && sweepSafe && differentConnections)
+        result |= kAffordanceTransportSupportedPlayer;
+    if (!sweepSafe)
+        result |= kAffordanceUnsafeSweptOccupancy;
+    return result;
+}
+
+NavLink makeConditionalTraversal(int target, NavEdgeMode mode, int mechanism,
+                                 int state, int transition)
+{
+    NavLink link;
+    link.target = target;
+    link.mode = mode;
+    link.condition = NavCondition(mechanism, state);
+    link.transition = transition;
+    return link;
+}
+
+struct AvailableRoute
+{
+    std::vector<int> cells;
+    std::vector<int> links;
+};
+
+static bool findAvailableRoute(const std::vector<NavCell> &cells, int start,
+                               int goal, const std::map<int, int> &states,
+                               AvailableRoute &route,
+                               std::vector<char> *reachable = nullptr)
+{
+    route.cells.clear();
+    route.links.clear();
+    if (start < 0 || goal < 0 || start >= int(cells.size())
+        || goal >= int(cells.size()))
+        return false;
+    std::deque<int> queue;
+    std::vector<int> parent(cells.size(), -1);
+    std::vector<int> via(cells.size(), -1);
+    std::vector<char> seen(cells.size(), 0);
+    queue.push_back(start);
+    seen[size_t(start)] = 1;
+    while (!queue.empty())
+    {
+        const int current = queue.front();
+        queue.pop_front();
+        const NavCell &cell = cells[size_t(current)];
+        for (size_t i = 0; i < cell.links.size(); ++i)
+        {
+            const NavLink &link = cell.links[i];
+            if (!traversableMode(link.mode)
+                || !conditionSatisfied(link.condition, states)
+                || link.target < 0 || link.target >= int(cells.size())
+                || seen[size_t(link.target)])
+                continue;
+            seen[size_t(link.target)] = 1;
+            parent[size_t(link.target)] = current;
+            via[size_t(link.target)] = int(i);
+            queue.push_back(link.target);
+        }
+    }
+    if (reachable)
+        *reachable = seen;
+    if (!seen[size_t(goal)])
+        return false;
+    for (int cursor = goal; cursor >= 0; cursor = parent[size_t(cursor)])
+    {
+        route.cells.push_back(cursor);
+        if (cursor == start)
+            break;
+        route.links.push_back(via[size_t(cursor)]);
+    }
+    if (route.cells.empty() || route.cells.back() != start)
+        return false;
+    std::reverse(route.cells.begin(), route.cells.end());
+    std::reverse(route.links.begin(), route.links.end());
+    return true;
+}
+
+static void appendAvailableRoute(const std::vector<NavCell> &cells,
+                                 const AvailableRoute &route,
+                                 std::vector<PlanOperation> &plan)
+{
+    for (size_t i = 1; i < route.cells.size(); ++i)
+    {
+        const int from = route.cells[i - 1];
+        const int to = route.cells[i];
+        const NavLink &link = cells[size_t(from)].links[size_t(route.links[i - 1])];
+        if (link.mode == kNavRide)
+        {
+            PlanOperation remain;
+            remain.kind = kPlanRemainSupported;
+            remain.fromCell = from;
+            remain.toCell = to;
+            remain.mechanism = link.condition.mechanism;
+            remain.state = link.condition.state;
+            plan.push_back(remain);
+        }
+        PlanOperation operation;
+        operation.kind = kPlanTraverse;
+        operation.fromCell = from;
+        operation.toCell = to;
+        operation.traversal = link.mode;
+        operation.mechanism = link.condition.mechanism;
+        operation.state = link.condition.state;
+        plan.push_back(operation);
+    }
+}
+
+static bool planDynamicRouteRecursive(
+    const std::vector<NavCell> &cells, int start, int goal,
+    std::map<int, int> &states, const CausalGraph &causality,
+    std::set<int64_t> &resolving, std::vector<PlanOperation> &plan,
+    DynamicPlanStats &stats, int depth)
+{
+    ++stats.routeSearches;
+    if (depth > int(cells.size()) + int(causality.effects.size()) + 4)
+        return false;
+
+    AvailableRoute direct;
+    std::vector<char> reachable;
+    if (findAvailableRoute(cells, start, goal, states, direct, &reachable))
+    {
+        appendAvailableRoute(cells, direct, plan);
+        return true;
+    }
+
+    // Only conditions on the boundary of space reachable right now matter.
+    // Unrelated mechanisms are never assigned or enumerated.
+    for (size_t c = 0; c < cells.size(); ++c)
+    {
+        if (!reachable[c])
+            continue;
+        const NavCell &cell = cells[c];
+        for (size_t l = 0; l < cell.links.size(); ++l)
+        {
+            const NavLink &link = cell.links[l];
+            if (!traversableMode(link.mode) || !link.condition.enabled
+                || conditionSatisfied(link.condition, states))
+                continue;
+            const int64_t key = (int64_t(link.condition.mechanism) << 32)
+                ^ uint32_t(link.condition.state);
+            if (resolving.count(key))
+                continue;
+            const std::vector<LearnedEffect> effects = causality.effectsEstablishing(
+                link.condition.mechanism, link.condition.state);
+            for (size_t e = 0; e < effects.size(); ++e)
+            {
+                const LearnedEffect &effect = effects[e];
+                const Actuator *actuator = causality.actuatorById(effect.actuator);
+                if (!actuator || actuator->locationCell < 0
+                    || actuator->locationCell >= int(cells.size()))
+                    continue;
+                resolving.insert(key);
+                std::map<int, int> candidateStates = states;
+                std::vector<PlanOperation> candidatePlan = plan;
+                if (!planDynamicRouteRecursive(cells, start, actuator->locationCell,
+                                               candidateStates, causality, resolving,
+                                               candidatePlan, stats, depth + 1))
+                {
+                    resolving.erase(key);
+                    continue;
+                }
+
+                PlanOperation activate;
+                activate.kind = kPlanActivate;
+                activate.fromCell = actuator->locationCell;
+                activate.toCell = actuator->locationCell;
+                activate.actuator = actuator->id;
+                activate.activation = effect.mode;
+                activate.mechanism = effect.mechanism;
+                activate.state = effect.state;
+                candidatePlan.push_back(activate);
+
+                PlanOperation wait;
+                wait.kind = kPlanWaitForTransition;
+                wait.fromCell = actuator->locationCell;
+                wait.toCell = actuator->locationCell;
+                wait.mechanism = effect.mechanism;
+                wait.state = effect.state;
+                candidatePlan.push_back(wait);
+
+                candidateStates[effect.mechanism] = effect.state;
+                ++stats.prerequisiteExpansions;
+                stats.mechanismsConsidered.insert(effect.mechanism);
+                if (planDynamicRouteRecursive(cells, actuator->locationCell, goal,
+                                              candidateStates, causality, resolving,
+                                              candidatePlan, stats, depth + 1))
+                {
+                    states.swap(candidateStates);
+                    plan.swap(candidatePlan);
+                    resolving.erase(key);
+                    return true;
+                }
+                resolving.erase(key);
+            }
+        }
+    }
+    return false;
+}
+
+bool planDynamicRoute(const std::vector<NavCell> &cells, int startCell,
+                      int targetCell, const std::map<int, int> &mechanismStates,
+                      const CausalGraph &causality,
+                      std::vector<PlanOperation> &outPlan,
+                      DynamicPlanStats *stats)
+{
+    outPlan.clear();
+    DynamicPlanStats localStats;
+    std::map<int, int> states = mechanismStates;
+    std::set<int64_t> resolving;
+    const bool result = planDynamicRouteRecursive(cells, startCell, targetCell,
+                                                   states, causality, resolving,
+                                                   outPlan, localStats, 0);
+    if (!result)
+        outPlan.clear();
+    if (stats)
+        *stats = localStats;
+    return result;
 }
 
 static bool crossingFailed(const std::vector<NavEdgeFailure> &failures, int wall,
@@ -354,7 +684,8 @@ const char *missionReason(MissionKind kind)
     }
 }
 
-static bool availableNow(const Opportunity &opportunity, int tick, unsigned heldKeys)
+static bool availableNow(const Opportunity &opportunity, int tick, unsigned heldKeys,
+                         unsigned availableEffects)
 {
     if (opportunity.hops < 0)
         return false;
@@ -362,6 +693,9 @@ static bool availableNow(const Opportunity &opportunity, int tick, unsigned held
         return false;
     if (opportunity.requiredKey > 0
         && !(heldKeys & (1u << unsigned(opportunity.requiredKey & 31))))
+        return false;
+    if ((opportunity.requiredEffects & availableEffects)
+        != opportunity.requiredEffects)
         return false;
     return true;
 }
@@ -383,7 +717,8 @@ static bool deeperThan(const Opportunity &candidate, const Opportunity &best)
 }
 
 Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
-                      unsigned heldKeys, int committedOpportunity)
+                      unsigned heldKeys, int committedOpportunity,
+                      unsigned availableEffects)
 {
     Mission mission;
     const Opportunity *keyDoor = 0;
@@ -400,7 +735,7 @@ Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
         const Opportunity &candidate = ledger[i];
         if (candidate.id == committedOpportunity && candidate.hops >= 0)
             committed = &candidate;
-        if (!availableNow(candidate, tick, heldKeys))
+        if (!availableNow(candidate, tick, heldKeys, availableEffects))
             continue;
         switch (candidate.kind)
         {
