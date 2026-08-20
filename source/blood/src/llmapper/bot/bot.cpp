@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "build.h"
+#include "../../actor.h"
 #include "../../common_game.h"
 #include "../../config.h"
 #include "../../db.h"
@@ -258,6 +259,12 @@ struct Portal
     bool locked = false;
     bool interactionAffordance = false;
     bool blockedBySprite = false;
+    // A crossing made through the air over a gap rather than through a
+    // doorway.  The two sectors do not touch; the takeoff is on this side of
+    // the drop and the landing is the far lip.
+    bool gapJump = false;
+    int takeoffX = 0;
+    int takeoffY = 0;
     bool currentlyAvailable = false;
     TraversalCapability capability = kTraversalUnknown;
     int unavailableReason = 0;
@@ -569,6 +576,370 @@ static int solidSpriteAt(int sectorId, int x, int y, int radius)
             return nSprite;
     }
     return -1;
+}
+
+// How far the player travels through the air, given how much height the
+// landing gains or loses.  Blood adds `normalJumpZ` as the initial vertical
+// velocity and 58254 per tick of gravity, so the flight time is exact; the
+// horizontal reach is that time at a deliberately modest running speed, well
+// under what the bot actually manages, because a jump planned too long ends
+// in the pit.
+// Which way a wall faces, away from the sector that owns it.  Derived by
+// asking the engine which side of the wall is inside, so no assumption about
+// Build's winding order is baked in.
+static bool wallOutwardNormal(int x1, int y1, int x2, int y2, int ownerSector,
+                              double &nx, double &ny)
+{
+    const double dx = double(x2 - x1);
+    const double dy = double(y2 - y1);
+    const double length = std::sqrt(dx * dx + dy * dy);
+    if (length < 1.0)
+        return false;
+    nx = dy / length;
+    ny = -dx / length;
+    const int midX = (x1 + x2) / 2;
+    const int midY = (y1 + y2) / 2;
+    if (inside(midX + int(nx * 64), midY + int(ny * 64), ownerSector) == 1)
+    {
+        nx = -nx;
+        ny = -ny;
+    }
+    return true;
+}
+
+// Blood's player physics, stepped with the engine's own constants rather
+// than with anything fitted to a recording.
+//
+// Per tick ProcessInput turns `forward` into velocity through the posture's
+// frontAccel, MoveDude moves by xvel>>12, gravity adds 58254 to zvel, and
+// the dude drag step takes a proportion of the velocity back.  Both the
+// acceleration and the drag are scaled by how far off the floor the player
+// is -- `height`, which is (floorZ - bottom) >> 8 -- and both cut out only
+// above height 256, which is 65536 z units up.  A jump peaks around 15400,
+// so height barely reaches 60: there is roughly three quarters of the
+// ground authority available for the whole flight, and an arc can be
+// trimmed after it has begun.
+struct JumpStep
+{
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    int xvel = 0;
+    int yvel = 0;
+    int zvel = 0;
+};
+
+static int airAuthority(int heightAboveFloor)
+{
+    const int height = std::max(0, heightAboveFloor) >> 8;
+    if (height >= 256)
+        return 0;
+    return height > 0 ? 0x10000 - divscale16(height, 256) : 0x10000;
+}
+
+static int airDragAt(int heightAboveFloor)
+{
+    const int height = std::max(0, heightAboveFloor) >> 8;
+    if (height >= 0x100)
+        return 0;
+    return gDudeDrag - scale(gDudeDrag, height, 0x100);
+}
+
+// One tick of the player's motion, given the forward input being held and
+// the heading being faced.  `floorZ` is the surface underneath.
+static void stepPlayerPhysics(JumpStep &state, int forwardInput, int angle,
+                              int floorZ, int frontAccel)
+{
+    const int aboveFloor = floorZ - state.z;
+    const int authority = airAuthority(aboveFloor);
+    if (forwardInput && authority)
+    {
+        int forward = mulscale8(frontAccel, forwardInput);
+        if (authority != 0x10000)
+            forward = mulscale16(forward, authority);
+        state.xvel += mulscale30(forward, Cos(angle));
+        state.yvel += mulscale30(forward, Sin(angle));
+    }
+    state.x += state.xvel >> 12;
+    state.y += state.yvel >> 12;
+    state.z += state.zvel >> 8;
+    state.zvel += 58254;
+    state.z += ((58254 * 4) / 2) >> 8;
+    const int drag = airDragAt(floorZ - state.z);
+    if (drag)
+    {
+        state.xvel -= mulscale16r(state.xvel, drag);
+        state.yvel -= mulscale16r(state.yvel, drag);
+    }
+}
+
+static int bodyRadiusOf()
+{
+    return gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
+}
+
+static int jumpAirTicks(int rise)
+{
+    if (!gMe)
+        return 0;
+    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+    int z = 0;
+    int zvel = stand.normalJumpZ;
+    for (int tick = 1; tick <= 120; ++tick)
+    {
+        z += zvel >> 8;
+        zvel += 58254;
+        z += ((58254 * 4) / 2) >> 8;
+        if (tick > 2 && z >= rise && zvel > 0)
+            return tick;
+    }
+    return 0;
+}
+
+// Top running speed, in world units per tick, where acceleration and drag
+// balance.  Derived, not assumed.
+static int playerRunSpeed()
+{
+    if (!gMe)
+        return 0;
+    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+    const int accel = mulscale8(stand.frontAccel, 2047);
+    int velocity = 0;
+    for (int tick = 0; tick < 64; ++tick)
+    {
+        velocity += accel;
+        velocity -= mulscale16r(velocity, gDudeDrag);
+    }
+    return velocity >> 12;
+}
+
+// How much ground it takes to get there from a standing start.
+static int playerRunUpDistance()
+{
+    if (!gMe)
+        return 0;
+    const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+    const int accel = mulscale8(stand.frontAccel, 2047);
+    const int target = playerRunSpeed() - playerRunSpeed() / 16;
+    int velocity = 0;
+    int travelled = 0;
+    for (int tick = 0; tick < 64; ++tick)
+    {
+        velocity += accel;
+        velocity -= mulscale16r(velocity, gDudeDrag);
+        travelled += velocity >> 12;
+        if ((velocity >> 12) >= target)
+            break;
+    }
+    return travelled;
+}
+
+static int jumpReach(int rise)
+{
+    return jumpAirTicks(rise) * playerRunSpeed();
+}
+
+// How far apart two segments come, and where in the middle of that closest
+// stretch to cross.
+//
+// The nearest single pair of points sits on a corner whenever the two edges
+// run parallel, which is the usual case for a gap: aiming at a corner leaves
+// no ground behind the lip to run up on and no ground in front to land on.
+// Average the whole set of near-minimum pairs instead, which puts both ends
+// of the jump in the middle of the ledge.
+static int64_t closestApproach(int ax1, int ay1, int ax2, int ay2,
+                               int bx1, int by1, int bx2, int by2,
+                               int &outAx, int &outAy, int &outBx, int &outBy)
+{
+    const int steps = 16;
+    int64_t best = INT64_MAX;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        int64_t sumAx = 0, sumAy = 0, sumBx = 0, sumBy = 0;
+        int found = 0;
+        for (int i = 0; i <= steps; ++i)
+        {
+            const int px = ax1 + int(int64_t(ax2 - ax1) * i / steps);
+            const int py = ay1 + int(int64_t(ay2 - ay1) * i / steps);
+            for (int j = 0; j <= steps; ++j)
+            {
+                const int qx = bx1 + int(int64_t(bx2 - bx1) * j / steps);
+                const int qy = by1 + int(int64_t(by2 - by1) * j / steps);
+                const int64_t d = int64_t(px - qx) * (px - qx)
+                    + int64_t(py - qy) * (py - qy);
+                if (pass == 0)
+                {
+                    best = std::min(best, d);
+                    continue;
+                }
+                // A tenth over the minimum still counts as the closest
+                // stretch; that is wide enough to cover a parallel pair and
+                // narrow enough to exclude the rest of the wall.
+                if (d <= best + best / 10 + 1024)
+                {
+                    sumAx += px; sumAy += py;
+                    sumBx += qx; sumBy += qy;
+                    ++found;
+                }
+            }
+        }
+        if (pass == 1 && found > 0)
+        {
+            outAx = int(sumAx / found);
+            outAy = int(sumAy / found);
+            outBx = int(sumBx / found);
+            outBy = int(sumBy / found);
+        }
+    }
+    return best;
+}
+
+// A hole in the floor with something on the other side of it is a crossing,
+// even though the two sides do not touch.  Blood levels are full of them --
+// a chasm with pillars standing in it, a broken walkway -- and a bot that
+// only knows how to walk through doorways reads the far lip as unreachable
+// and gives up in front of it.
+//
+// The chasm is a sector the bot refuses to step into because the drop is
+// unsurvivable.  The landing is any sector on the far side of that chasm
+// whose floor stands clear of it, close enough to reach through the air.
+static void appendGapCrossings(Observation &result)
+{
+    const size_t doorways = result.portals.size();
+    const int bodyClearance = playerBodyClearance();
+    const int riseLimit = playerJumpRiseLimit();
+    for (size_t index = 0; index < doorways; ++index)
+    {
+        const Portal ledge = result.portals[index];
+        // Only a drop the bot will not simply take is a gap worth jumping.
+        if (ledge.to < 0 || ledge.walkable || ledge.crouchable || ledge.dropSafe)
+            continue;
+        if (ledge.floorDelta <= kMaxWalkableStep)
+            continue;
+        const int chasm = ledge.to;
+        if (!inRange(chasm, 0, numsectors))
+            continue;
+        const int chasmFloor = getflorzofslope(chasm, ledge.x, ledge.y);
+        const sectortype &pit = sector[chasm];
+        for (int i = 0; i < pit.wallnum; ++i)
+        {
+            const int wallId = pit.wallptr + i;
+            if (!inRange(wallId, 0, numwalls) || !inRange(wall[wallId].point2, 0, numwalls))
+                continue;
+            const int landingSector = wall[wallId].nextsector;
+            if (!inRange(landingSector, 0, numsectors) || landingSector == chasm
+                || landingSector == result.sector)
+                continue;
+            if (wall[wallId].cstat & 1)
+                continue;
+            const walltype &edge = wall[wallId];
+            const walltype &edgeEnd = wall[edge.point2];
+            int takeoffX = 0, takeoffY = 0, landingX = 0, landingY = 0;
+            const int64_t span2 = closestApproach(
+                ledge.x1, ledge.y1, ledge.x2, ledge.y2,
+                edge.x, edge.y, edgeEnd.x, edgeEnd.y,
+                takeoffX, takeoffY, landingX, landingY);
+            // Aim past the lip, not at it: landing on the very edge is how
+            // a jump that cleared the gap slides back off it.
+            {
+                const int64_t intoX = int64_t(landingX) - takeoffX;
+                const int64_t intoY = int64_t(landingY) - takeoffY;
+                const double run = std::sqrt(double(intoX * intoX + intoY * intoY));
+                const int step = bodyRadiusOf() + 128;
+                if (run > 1.0)
+                {
+                    const int px = landingX + int(intoX * step / run);
+                    const int py = landingY + int(intoY * step / run);
+                    if (inside(px, py, landingSector) == 1)
+                    {
+                        landingX = px;
+                        landingY = py;
+                    }
+                }
+            }
+            const int landingFloor = getflorzofslope(landingSector, landingX, landingY);
+            // The far side has to stand clear of the chasm, or this is the
+            // same low ground reached the long way round rather than a gap.
+            if (chasmFloor - landingFloor <= kMaxWalkableStep)
+                continue;
+            const int rise = landingFloor - ledge.fromFloorZ;
+            if (-rise > riseLimit)
+                continue;
+            const int reach = jumpReach(rise) - bodyRadiusOf();
+            if (reach <= 0 || span2 > int64_t(reach) * reach)
+                continue;
+            // A sliver of a ledge is not a landing.
+            const int landingWidth = int(std::sqrt(double(distance2(
+                edge.x, edge.y, edgeEnd.x, edgeEnd.y))));
+            if (landingWidth < playerPassageWidth())
+                continue;
+            // A jump leaves a ledge across it and arrives at the far one
+            // head on.  Without that, any two edges of the same pit look
+            // like a crossing -- including a leap off the side of a pillar
+            // aimed lengthways down the chasm, which flies over the very
+            // ledge it was supposed to land on.
+            const double flightX = double(landingX - takeoffX);
+            const double flightY = double(landingY - takeoffY);
+            const double flight = std::sqrt(flightX * flightX + flightY * flightY);
+            if (flight < 1.0)
+                continue;
+            double outX = 0.0, outY = 0.0;
+            if (!wallOutwardNormal(ledge.x1, ledge.y1, ledge.x2, ledge.y2,
+                                   result.sector, outX, outY))
+                continue;
+            if ((flightX * outX + flightY * outY) / flight < 0.5)
+                continue;
+            double faceX = 0.0, faceY = 0.0;
+            if (!wallOutwardNormal(edge.x, edge.y, edgeEnd.x, edgeEnd.y,
+                                   landingSector, faceX, faceY))
+                continue;
+            if ((flightX * faceX + flightY * faceY) / flight > -0.5)
+                continue;
+            // The line has to run over the hole rather than through the
+            // masonry beside it, with room overhead to travel it.
+            const int midX = (takeoffX + landingX) / 2;
+            const int midY = (takeoffY + landingY) / 2;
+            if (inside(midX, midY, chasm) != 1)
+                continue;
+            if (landingFloor - getceilzofslope(chasm, midX, midY) < bodyClearance)
+                continue;
+            if (landingFloor - getceilzofslope(landingSector, landingX, landingY) < bodyClearance)
+                continue;
+
+            Portal crossing;
+            crossing.wall = wallId;
+            crossing.from = result.sector;
+            crossing.to = landingSector;
+            crossing.x = landingX;
+            crossing.y = landingY;
+            crossing.z = landingFloor;
+            crossing.floorZ = landingFloor;
+            crossing.ceilingZ = getceilzofslope(landingSector, landingX, landingY);
+            crossing.fromFloorZ = ledge.fromFloorZ;
+            crossing.fromCeilingZ = ledge.fromCeilingZ;
+            crossing.toFloorZ = landingFloor;
+            crossing.toCeilingZ = crossing.ceilingZ;
+            crossing.x1 = edge.x;
+            crossing.y1 = edge.y;
+            crossing.x2 = edgeEnd.x;
+            crossing.y2 = edgeEnd.y;
+            crossing.openingWidth = landingWidth;
+            crossing.floorDelta = rise;
+            crossing.clearance = std::min(ledge.fromFloorZ - ledge.fromCeilingZ,
+                                          landingFloor - crossing.ceilingZ);
+            crossing.jumpRiseLimit = riseLimit;
+            crossing.visible = ledge.visible;
+            crossing.localGeometry = true;
+            crossing.jumpable = true;
+            crossing.traversable = true;
+            crossing.capability = kTraversalJumpable;
+            crossing.gapJump = true;
+            crossing.takeoffX = takeoffX;
+            crossing.takeoffY = takeoffY;
+            crossing.currentlyAvailable = true;
+            result.portals.push_back(crossing);
+        }
+    }
 }
 
 static void setInteractionGeometry(Portal &portal)
@@ -1022,6 +1393,8 @@ static Observation observeWorld()
             result.portals.push_back(portal);
         }
     }
+
+    appendGapCrossings(result);
 
     // The scan is over the engine's sprite list, but only objects passing the
     // authoritative cansee() test enter the bot's observation.
@@ -1522,6 +1895,17 @@ struct LLMapperBot::Impl
     int lastFrontierChoice = 0;
     int directCrossingWall = -1;
     int directCrossingBlockedTicks = 0;
+    bool gapJumpActive = false;
+    bool gapRunning = false;
+    int gapSettleUntilTick = -1;
+    int gapRunWall = -1;
+    int gapJumpWall = -1;
+    int gapJumpFrom = -1;
+    int gapJumpTo = -1;
+    int gapJumpX = 0;
+    int gapJumpY = 0;
+    int gapJumpFloorZ = 0;
+    int gapJumpTick = -1;
     int directCrossingBlockedUntil = -1;
     int lastSuppressedJumpTarget = -1;
     int lastAcceptedUseTick = -1;
@@ -5739,6 +6123,18 @@ struct LLMapperBot::Impl
 
     GINPUT executeObjective()
     {
+        if (gapJumpActive)
+            return continueGapJump();
+        if (observation.tick < gapSettleUntilTick)
+        {
+            // Momentum off a landing is an asset when the next jump goes the
+            // same way.  A run of pillars is meant to be taken at a run --
+            // stopping on each one wastes the speed and then has to find
+            // room to rebuild it on a block a thousand units across.
+            if (!momentumServesTheNextJump())
+                return brakeAfterLanding();
+            gapSettleUntilTick = -1;
+        }
         if (!currentObjective.active)
             return GINPUT{};
         if (currentObjective.type == kObjectiveInteraction)
@@ -6307,6 +6703,27 @@ struct LLMapperBot::Impl
                 if (!llmapper::traversableMode(mode))
                 {
                     ++rejected;
+                    continue;
+                }
+                // A gap crossing has no doorway: its two ends are a lip and
+                // a landing several thousand units apart, and feeding those
+                // to the doorway linker made a nav edge between whatever
+                // cells happened to lie near each -- a route straight over
+                // the hole that the bot then walked into.  Link the lip to
+                // the landing explicitly, one way, as a jump.
+                if (portal.gapJump)
+                {
+                    const int lip = navCellInSector(portal.from, portal.takeoffX,
+                                                    portal.takeoffY);
+                    const int landing = navCellInSector(portal.to, portal.x, portal.y);
+                    if (lip < 0 || landing < 0)
+                    {
+                        ++rejected;
+                        continue;
+                    }
+                    addNavLink(lip, landing, kNavJump, portal.wall,
+                               LocalWaypoint(portal.takeoffX, portal.takeoffY), true);
+                    ++linked;
                     continue;
                 }
                 const int from = nearestNavCell(portal.from, portal.x, portal.y);
@@ -7856,8 +8273,333 @@ struct LLMapperBot::Impl
         return portal.capability;
     }
 
+    // Cross a gap: stand at the lip, face the far side, run and jump.
+    //
+    // This cannot go through the ordinary jump traversal, which walks
+    // forward until it is within a fixed distance of its target before
+    // launching.  Across a hole that distance is over open air, so the bot
+    // walks off the edge and falls in.  The takeoff point is the near lip,
+    // wherever the landing happens to be.
+    // Horizontal speed the player is carrying right now.
+    int groundSpeed() const
+    {
+        if (!gMe || !gMe->pSprite)
+            return 0;
+        const int index = gMe->pSprite->index;
+        const int vx = xvel[index] >> 12;
+        const int vy = yvel[index] >> 12;
+        return int(std::sqrt(double(int64_t(vx) * vx + int64_t(vy) * vy)));
+    }
+
+    // A landing keeps the speed the jump was made at.  On a pillar a
+    // thousand units across that carries the bot over the far edge in three
+    // decisions -- it lands, coasts, and falls off the other side while
+    // lining up the next jump.  Coasting is not enough: put the ground to
+    // work by pushing back against the drift.
+    // Which way the player is actually travelling, and how fast.
+    bool driftHeading(int &outAngle, int &outSpeed) const
+    {
+        if (!gMe || !gMe->pSprite)
+            return false;
+        const int index = gMe->pSprite->index;
+        const int vx = xvel[index] >> 12;
+        const int vy = yvel[index] >> 12;
+        outSpeed = int(std::sqrt(double(int64_t(vx) * vx + int64_t(vy) * vy)));
+        if (outSpeed <= 0)
+            return false;
+        outAngle = getangle(vx, vy);
+        return true;
+    }
+
+    // Where a jump taken now would put the bot, given the input it intends
+    // to hold in the air.  Run with the engine's own arithmetic, so this is
+    // a prediction rather than an estimate: the only thing it leaves out is
+    // clipping, and a jump over a hole has nothing to clip against.
+    bool predictLanding(int landingFloorZ, int forwardInput, int angle,
+                        int &outX, int &outY, int &outTicks) const
+    {
+        if (!gMe || !gMe->pSprite)
+            return false;
+        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+        const int index = gMe->pSprite->index;
+        JumpStep state;
+        state.x = observation.x;
+        state.y = observation.y;
+        state.z = observation.z;
+        state.xvel = xvel[index];
+        state.yvel = yvel[index];
+        state.zvel = stand.normalJumpZ;
+        for (int tick = 1; tick <= 120; ++tick)
+        {
+            stepPlayerPhysics(state, forwardInput, angle, landingFloorZ,
+                              stand.frontAccel);
+            if (tick > 2 && state.z >= landingFloorZ && state.zvel > 0)
+            {
+                outX = state.x;
+                outY = state.y;
+                outTicks = tick;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Same question for a jump already under way: keep the current vertical
+    // velocity rather than starting a fresh one.
+    bool predictRemainingFlight(int landingFloorZ, int forwardInput, int angle,
+                                int &outX, int &outY) const
+    {
+        if (!gMe || !gMe->pSprite)
+            return false;
+        const POSTURE &stand = gMe->pPosture[gMe->lifeMode][kPostureStand];
+        const int index = gMe->pSprite->index;
+        JumpStep state;
+        state.x = observation.x;
+        state.y = observation.y;
+        state.z = observation.z;
+        state.xvel = xvel[index];
+        state.yvel = yvel[index];
+        state.zvel = zvel[index];
+        for (int tick = 1; tick <= 120; ++tick)
+        {
+            stepPlayerPhysics(state, forwardInput, angle, landingFloorZ,
+                              stand.frontAccel);
+            if (state.z >= landingFloorZ && state.zvel > 0)
+            {
+                outX = state.x;
+                outY = state.y;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Is the bot already travelling at the thing it is about to jump to?
+    bool momentumServesTheNextJump()
+    {
+        if (!currentObjective.active || currentObjective.type != kObjectiveFrontier)
+            return false;
+        const Portal *crossing = portalByWall(currentObjective.wall,
+                                              currentObjective.sector,
+                                              currentObjective.targetSector);
+        if (!crossing || !crossing->gapJump || crossing->from != observation.sector)
+            return false;
+        // Momentum off a landing is an asset exactly when it would carry
+        // the bot to the next ledge, and a liability otherwise.  That is the
+        // same question the launch asks, so there is no separate rule for
+        // chaining: if the arc reaches from here, take it.
+        const int wanted = getangle(crossing->x - observation.x,
+                                    crossing->y - observation.y);
+        int landX = 0;
+        int landY = 0;
+        int ticks = 0;
+        if (!predictLanding(crossing->floorZ, 2047, wanted, landX, landY, ticks))
+            return false;
+        if (inside(landX, landY, crossing->to) != 1)
+            return false;
+        gapRunning = true;
+        gapRunWall = crossing->wall;
+        char detail[208];
+        snprintf(detail, sizeof(detail),
+                 "wall=%d to=%d speed=%d predicted=(%d,%d) reason=arc_already_reaches",
+                 crossing->wall, crossing->to, groundSpeed(), landX, landY);
+        event("gap_jump_chained", detail);
+        return true;
+    }
+
+    // How much further the bot slides if it stops pushing now, under the
+    // engine's own drag.
+    int coastDistance() const
+    {
+        int velocity = groundSpeed() << 12;
+        int travelled = 0;
+        for (int tick = 0; tick < 64 && velocity >= 0x1000; ++tick)
+        {
+            velocity -= mulscale16r(velocity, gDudeDrag);
+            travelled += velocity >> 12;
+        }
+        return travelled;
+    }
+
+    GINPUT brakeAfterLanding()
+    {
+        GINPUT input = {};
+        if (coastDistance() <= playerClipRadius())
+        {
+            gapSettleUntilTick = -1;
+            return input;
+        }
+        setGoal("SHED_LANDING_SPEED", -1);
+        // Facing is still roughly along the flight, so reverse thrust on the
+        // forward axis takes the drift out.  Do not turn: a turn mid-slide
+        // just converts the drift into a different direction.
+        input.forward = -2047;
+        return input;
+    }
+
+    GINPUT steerGapJump(const Portal &portal)
+    {
+        setGoal("JUMP_THE_GAP", portal.wall);
+        const int radius = playerClipRadius();
+
+        // Back away from the lip along the line of the jump, far enough to
+        // be at running speed by the time the ground runs out.  A jump from
+        // a standing start carries almost no horizontal velocity, which is
+        // how the first attempts at this landed in the hole.
+        const int64_t backX = int64_t(portal.takeoffX) - portal.x;
+        const int64_t backY = int64_t(portal.takeoffY) - portal.y;
+        const double length = std::sqrt(double(backX * backX + backY * backY));
+        int markX = portal.takeoffX;
+        int markY = portal.takeoffY;
+        if (length > 1.0)
+        {
+            const int runUp = radius + playerRunUpDistance();
+            for (int back = runUp; back >= radius + 96; back -= 256)
+            {
+                const int px = portal.takeoffX + int(backX * back / length);
+                const int py = portal.takeoffY + int(backY * back / length);
+                if (inside(px, py, portal.from) == 1)
+                {
+                    markX = px;
+                    markY = py;
+                    break;
+                }
+            }
+        }
+
+        if (gapRunWall != portal.wall)
+        {
+            gapRunWall = portal.wall;
+            gapRunning = false;
+        }
+        const int toLanding = getangle(portal.x - observation.x, portal.y - observation.y);
+        const int heading = angleDelta(toLanding, observation.angle);
+        const int arrive = radius + 192;
+        if (!gapRunning
+            && distance2(observation.x, observation.y, markX, markY) > arrive * arrive)
+        {
+            noteCameraOwner("NAVIGATION", portal.wall, toLanding, 0);
+            return navigateTo(markX, markY, observation.z, portal.from,
+                              portal.wall, kTraversalWalkable);
+        }
+
+        GINPUT input = {};
+        input.syncFlags.run = 1;
+        input.q16turn = fix16_from_int(heading);
+        noteCameraOwner("JUMP_THE_GAP", portal.wall, toLanding, 0);
+        if (!gapRunning)
+        {
+            // Line up first: a jump taken off-heading is wasted, and there
+            // is no correcting it once the ground has gone.
+            if (std::abs(heading) >= 48)
+                return input;
+            gapRunning = true;
+            char detail[192];
+            snprintf(detail, sizeof(detail),
+                     "wall=%d from=%d to=%d run_up_from=(%d,%d) lip=(%d,%d)",
+                     portal.wall, portal.from, portal.to, markX, markY,
+                     portal.takeoffX, portal.takeoffY);
+            event("gap_jump_run_up", detail);
+        }
+        input.forward = 2047;
+        if (gMe->cantJump || (gMe->pXSprite && gMe->pXSprite->height != 0))
+            return input;
+        // Leave the ground when the simulated arc actually ends on the far
+        // ledge.  A decision covers four ticks and the bot crosses several
+        // hundred units in that time, so a launch line drawn at the lip is
+        // missed as often as it is hit -- and missing it means the ground
+        // has already run out.  Asking where the jump would land removes the
+        // guesswork from both the distance and the speed.
+        int landX = 0;
+        int landY = 0;
+        int ticks = 0;
+        const bool reaches = predictLanding(portal.floorZ, 2047, toLanding,
+                                            landX, landY, ticks)
+            && inside(landX, landY, portal.to) == 1;
+        const int lip = radius + 96;
+        const bool outOfGround =
+            distance2(observation.x, observation.y, portal.takeoffX, portal.takeoffY)
+                <= lip * lip;
+        if (!reaches)
+        {
+            if (!outOfGround)
+                return input;   // still ground to build speed over
+            // Out of run-up and the arc still misses.  Shed the speed and
+            // set the approach up again rather than stepping into the hole.
+            gapRunning = false;
+            gapSettleUntilTick = observation.tick + 2 * kTicsPerSec;
+            char detail[224];
+            snprintf(detail, sizeof(detail),
+                     "wall=%d to=%d predicted=(%d,%d) speed=%d reason=arc_misses_the_landing",
+                     portal.wall, portal.to, landX, landY, groundSpeed());
+            event("gap_jump_aborted", detail);
+            return GINPUT{};
+        }
+        input.buttonFlags.jump = 1;
+        gapRunning = false;
+        gapJumpActive = true;
+        gapJumpWall = portal.wall;
+        gapJumpFrom = portal.from;
+        gapJumpTo = portal.to;
+        gapJumpX = portal.x;
+        gapJumpY = portal.y;
+        gapJumpFloorZ = portal.floorZ;
+        gapJumpTick = observation.tick;
+        char detail[224];
+        snprintf(detail, sizeof(detail),
+                 "wall=%d from=%d to=%d takeoff=(%d,%d) aim=(%d,%d) predicted=(%d,%d) ticks=%d speed=%d",
+                 portal.wall, portal.from, portal.to, observation.x, observation.y,
+                 portal.x, portal.y, landX, landY, ticks, groundSpeed());
+        event("gap_jump_launched", detail);
+        return input;
+    }
+
+    // A launched jump is committed.  The bot is in the air over a sector it
+    // must not stop in, and re-deciding mid-flight is exactly how it ends up
+    // in the hole.
+    GINPUT continueGapJump()
+    {
+        GINPUT input = {};
+        input.syncFlags.run = 1;
+        const bool airborne = observation.playerZVelocity != 0;
+        const bool arrived = observation.sector == gapJumpTo;
+        const bool spent = gapJumpTick >= 0
+            && observation.tick - gapJumpTick > 4 * kTicsPerSec;
+        if (arrived || spent || (!airborne && observation.tick - gapJumpTick > kTicsPerSec / 2))
+        {
+            char detail[192];
+            snprintf(detail, sizeof(detail), "wall=%d to=%d landed_in=%d result=%s",
+                     gapJumpWall, gapJumpTo, observation.sector,
+                     arrived ? "landed" : spent ? "timed_out" : "short");
+            event("gap_jump_finished", detail);
+            gapJumpActive = false;
+            gapRunning = false;
+            gapRunWall = -1;
+            gapSettleUntilTick = observation.tick + 2 * kTicsPerSec;
+            return GINPUT{};
+        }
+        const int toLanding = getangle(gapJumpX - observation.x, gapJumpY - observation.y);
+        input.q16turn = fix16_from_int(angleDelta(toLanding, observation.angle));
+        noteCameraOwner("JUMP_THE_GAP", gapJumpWall, toLanding, 0);
+        // Trim the arc while it is still in the air.  There is authority up
+        // here -- about three quarters of the ground's, falling off with
+        // height -- so hold forward while the arc is short of the ledge and
+        // let go once it is already going to make it.  Coasting the last part
+        // of the flight is what stops the bot arriving with more speed than
+        // the ledge is long.
+        int landX = 0;
+        int landY = 0;
+        const bool coastReaches = predictRemainingFlight(gapJumpFloorZ, 0, toLanding,
+                                                         landX, landY)
+            && inside(landX, landY, gapJumpTo) == 1;
+        input.forward = coastReaches ? 0 : 2047;
+        return input;
+    }
+
     GINPUT steerPortal(const Portal &portal)
     {
+        if (portal.gapJump)
+            return steerGapJump(portal);
         const int bodyRadius = gMe && gMe->pSprite ? (gMe->pSprite->clipdist << 2) : 128;
         const int portalApproachTolerance = std::max(1024, bodyRadius + 1024);
         // Portal approach is now a specialization of the same local
