@@ -428,8 +428,11 @@ inline int playerRunUpDistance()
     {
         velocity += accel;
         velocity -= mulscale16(velocity, air.factor);
-        velocity -= mulscale16r(velocity, gDudeDrag);
+        // MoveDude advances XY before applying grounded dude drag.  Keep the
+        // distance clock in that exact order: jump planning uses the first
+        // frame whose movement crosses a concrete takeoff pose.
         travelled += velocity >> 12;
+        velocity -= mulscale16r(velocity, gDudeDrag);
         if ((velocity >> 12) >= target)
             break;
     }
@@ -452,8 +455,8 @@ inline int playerRunVelocityForDistance(int distance)
     {
         velocity += accel;
         velocity -= mulscale16(velocity, air.factor);
-        velocity -= mulscale16r(velocity, gDudeDrag);
         travelled += velocity >> 12;
+        velocity -= mulscale16r(velocity, gDudeDrag);
     }
     return velocity;
 }

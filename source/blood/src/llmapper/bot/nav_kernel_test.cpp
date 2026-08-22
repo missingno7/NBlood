@@ -7,11 +7,107 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace llmapper;
 
 static int gFailures = 0;
+
+static_assert(!std::is_same<SupportId, ObjectId>::value,
+              "support and object identity must not be interchangeable");
+static_assert(!std::is_same<PoseId, RegionId>::value,
+              "pose and region identity must not be interchangeable");
+static_assert(!std::is_convertible<ObjectId, SupportId>::value,
+              "engine objects must not leak into semantic support identity");
+
+static void expect(bool condition, const char *name);
+
+static void testSparseConvexSkeleton()
+{
+    const std::vector<NavWaypoint> rectangle = {
+        { 0, 0 }, { 1000, 0 }, { 1000, 400 }, { 0, 400 },
+    };
+    ConvexSkeleton skeleton = buildConvexSkeleton(rectangle);
+    expect(skeleton.cells.size() == 1 && skeleton.gateways.empty()
+               && skeleton.cells[0].center.x == 500
+               && skeleton.cells[0].center.y == 200,
+           "empty_rectangle_has_one_center_pose");
+
+    const std::vector<NavWaypoint> lShape = {
+        { 0, 0 }, { 1200, 0 }, { 1200, 400 },
+        { 400, 400 }, { 400, 1200 }, { 0, 1200 },
+    };
+    skeleton = buildConvexSkeleton(lShape);
+    expect(skeleton.cells.size() == 2 && skeleton.gateways.size() == 1,
+           "empty_l_shape_has_two_centers_and_one_bend_gateway");
+
+    std::vector<NavWaypoint> reversed = lShape;
+    std::reverse(reversed.begin(), reversed.end());
+    skeleton = buildConvexSkeleton(reversed);
+    expect(skeleton.cells.size() == 2 && skeleton.gateways.size() == 1,
+           "convex_skeleton_is_winding_independent");
+
+    // Arbitrary source tessellation must not change a homogeneous space.
+    // These extra collinear vertices model several engine partitions along
+    // the walls of one empty room.
+    const std::vector<NavWaypoint> partitionedRectangle = {
+        { 0, 0 }, { 250, 0 }, { 700, 0 }, { 1000, 0 },
+        { 1000, 200 }, { 1000, 400 }, { 400, 400 }, { 0, 400 },
+        { 0, 150 },
+    };
+    skeleton = buildConvexSkeleton(partitionedRectangle);
+    expect(skeleton.cells.size() == 1 && skeleton.gateways.empty(),
+           "empty_space_is_invariant_to_boundary_partitioning");
+
+    const std::vector<NavWaypoint> uShape = {
+        { 0, 0 }, { 1200, 0 }, { 1200, 1200 }, { 800, 1200 },
+        { 800, 400 }, { 400, 400 }, { 400, 1200 }, { 0, 1200 },
+    };
+    skeleton = buildConvexSkeleton(uShape);
+    expect(skeleton.cells.size() == 3 && skeleton.gateways.size() == 2,
+           "arbitrary_concave_space_uses_only_centers_and_gateways");
+
+    const std::vector<std::vector<NavWaypoint> > roomWithObstacle = {
+        { { -4000, -4000 }, { 4000, -4000 },
+          { 4000, 4000 }, { -4000, 4000 } },
+        { { -3000, -1000 }, { -3000, 1000 },
+          { 2000, 1000 }, { 2000, -1000 } },
+    };
+    skeleton = buildConvexSkeleton(roomWithObstacle);
+    bool centerInsideHole = false;
+    for (const SkeletonCell &cell : skeleton.cells)
+        centerInsideHole = centerInsideHole
+            || (cell.center.x > -3000 && cell.center.x < 2000
+                && cell.center.y > -1000 && cell.center.y < 1000);
+    expect(skeleton.cells.size() == 4 && skeleton.gateways.size() == 4
+               && !centerInsideHole,
+           "multiple_contours_form_sparse_connected_free_space");
+}
+
+static void testSemanticBoundary()
+{
+    NavCell pose;
+    pose.id = PoseId(4);
+    pose.region = RegionId(7);
+    pose.support = SupportId(2);
+
+    StatefulGeometry geometry;
+    geometry.stateVariable = StateVariableId(3);
+    geometry.object = ObjectId(11);
+    geometry.support = SupportId(2);
+
+    Affordance affordance;
+    affordance.id = AffordanceId(5);
+    affordance.target = ObjectId(11);
+    affordance.actionPose = PoseId(4);
+    affordance.actions.push_back(kActionUse);
+
+    expect(pose.support == geometry.support,
+           "semantic_boundary_support_identity");
+    expect(affordance.actionPose == pose.id,
+           "semantic_boundary_affordance_pose_identity");
+}
 
 static void expect(bool condition, const char *name)
 {
@@ -24,27 +120,27 @@ static void expect(bool condition, const char *name)
         std::printf("ok   %s\n", name);
 }
 
-static NavCell makeCell(int id, int sector, int x, int y, int z = 0,
-                        SupportRef support = SupportRef())
+static NavCell makeCell(int id, int region, int x, int y, int z = 0,
+                        SupportId support = SupportId())
 {
     NavCell cell;
     cell.id = id;
-    cell.sector = sector;
+    cell.region = region;
     cell.center = NavWaypoint(x, y);
     cell.z = z;
-    cell.support = support.id >= 0 ? support : SupportRef(kSupportSectorFloor, sector);
+    cell.support = support ? support : SupportId(region);
     return cell;
 }
 
-static void addLink(NavCell &from, int to, NavEdgeMode mode, int wall = -1,
+static void addLink(NavCell &from, int to, NavEdgeMode mode, int boundary = -1,
                     NavWaypoint gateway = NavWaypoint())
 {
     NavLink link;
     link.target = to;
     link.mode = mode;
-    link.wall = wall;
+    link.boundary = boundary;
     link.gateway = gateway;
-    link.hasGateway = wall >= 0 || (gateway.x != 0 || gateway.y != 0);
+    link.hasGateway = boundary >= 0 || (gateway.x != 0 || gateway.y != 0);
     from.links.push_back(link);
 }
 
@@ -57,10 +153,10 @@ static bool planHas(const std::vector<PlanOperation> &plan, PlanOperationKind ki
 }
 
 static bool planActivatesWith(const std::vector<PlanOperation> &plan,
-                              ActivationMode mode)
+                              ActionKind action)
 {
     for (size_t i = 0; i < plan.size(); ++i)
-        if (plan[i].kind == kPlanActivate && plan[i].activation == mode)
+        if (plan[i].kind == kPlanActivate && plan[i].action == action)
             return true;
     return false;
 }
@@ -173,10 +269,10 @@ static void testNavGraph()
     expect(planNavRoute(cells, 0, 2, std::vector<NavEdgeFailure>(), 1, route)
                && route.size() == 2
                && route[0].mode == kNavStep
-               && route[0].wall == 19
+               && route[0].boundary == 19
                && route[1].mode == kNavWalk
-               && route[0].sourceSector == 2
-               && route[1].targetSector == 7,
+               && route[0].sourceRegion == 2
+               && route[1].targetRegion == 7,
            "nav_multi_sector_walk_step_route");
 
     cells.clear();
@@ -210,7 +306,7 @@ static void testNavGraph()
     NavEdgeFailure failure;
     failure.fromCell = 0;
     failure.toCell = 1;
-    failure.wall = 8;
+    failure.boundary = 8;
     failure.mode = kNavJump;
     failure.geometrySignature = 1;
     std::vector<NavEdgeFailure> failures(1, failure);
@@ -264,7 +360,7 @@ static void testNavGraph()
     expect(planNavRoute(cells, 0, 5, std::vector<NavEdgeFailure>(), 1, route)
                && route.size() == 5
                && route[0].mode == kNavWalk
-               && route[4].targetSector == 2,
+               && route[4].targetRegion == 2,
            "nav_prefers_supported_walk_over_risky_jump_shortcut");
 
     cells.clear();
@@ -277,13 +373,13 @@ static void testNavGraph()
     addLink(cells[2], 0, kNavWalk, 2, NavWaypoint(50, 50));
     failure.fromCell = 0;
     failure.toCell = 1;
-    failure.wall = 1;
+    failure.boundary = 1;
     failure.mode = kNavWalk;
     failure.geometrySignature = 9;
     failures.assign(1, failure);
     expect(planNavRoute(cells, 0, 2, failures, 9, route)
                && route.size() == 1
-               && route[0].wall == 2,
+               && route[0].boundary == 2,
            "nav_failed_edge_reroutes_to_alternative");
 
     // A sector id is not a support component.  Stacked/ROR geometry can
@@ -310,7 +406,7 @@ static void testNavGraph()
     failure = NavEdgeFailure();
     failure.fromCell = 1;
     failure.toCell = 2;
-    failure.wall = 42;
+    failure.boundary = 42;
     failure.mode = kNavJump;
     failure.geometrySignature = 1;
     failures.assign(1, failure);
@@ -327,11 +423,12 @@ static void testNavGraph()
                           reachable);
     expect(reachable[1] && !reachable[0],
            "overlapping_layers_do_not_connect_by_xy_alone");
-    expect(linkTranslatedNavLayers(cells, 90, 65, 1024, 0, 512, -2) == 2
+    expect(linkTranslatedNavLayers(cells, 90, SupportId(90),
+                                   65, SupportId(65), 1024, 0, 512, -2) == 2
                && cells[1].links.size() == 1
                && cells[1].links[0].target == 0
                && cells[1].links[0].mode == kNavWalk
-               && cells[1].links[0].transition == 90,
+               && cells[1].links[0].transition == -2,
            "explicit_ror_transition_connects_sector_layers");
     markReachableNavCells(cells, 1, std::vector<NavEdgeFailure>(), 1,
                           reachable);
@@ -370,18 +467,17 @@ static void testContinuousWalkWaypointProgress()
 
 static void testSupportAwareNavigation()
 {
-    NavCell floor = makeCell(0, 4, 100, 200, 12000,
-                             SupportRef(kSupportSectorFloor, 4));
+    NavCell floor = makeCell(0, 4, 100, 200, 12000, SupportId(40));
     NavCell bridge = makeCell(1, 4, 100, 200, 4000,
-                              SupportRef(kSupportSpriteFloor, 31));
-    expect(floor.sector == bridge.sector
+                              SupportId(41));
+    expect(floor.region == bridge.region
                && floor.center.x == bridge.center.x
                && floor.center.y == bridge.center.y
                && floor.z != bridge.z && floor.support != bridge.support,
            "support_same_sector_xy_different_layer_distinct");
 
     NavCell bridgeAbove = makeCell(2, 4, 100, 200, -4000,
-                                   SupportRef(kSupportSpriteFloor, 32));
+                                   SupportId(42));
     expect(bridge.support != bridgeAbove.support && bridge.z != bridgeAbove.z,
            "support_stacked_perpendicular_bridges_do_not_collapse");
 }
@@ -399,25 +495,25 @@ static void testCrouchAndConditionalGate()
     cells[0].links.push_back(makeConditionalTraversal(1, kNavCrouch, 9, 1));
     expect(cells[0].links[0].mode == kNavCrouch
                && cells[0].links[0].condition.enabled
-               && cells[0].links[0].condition.mechanism == 9
+               && cells[0].links[0].condition.variable == 9
                && cells[0].links[0].condition.state == 1,
            "dynamic_gate_blocked_to_conditional_crouch");
 }
 
-static CausalGraph oneActuatorGraph(int actuatorId, int location,
-                                    ActivationMode mode, int mechanism,
+static CausalGraph oneAffordanceGraph(int affordanceId, int location,
+                                    ActionKind action, int variable,
                                     int state)
 {
     CausalGraph graph;
-    Actuator actuator;
-    actuator.id = actuatorId;
-    actuator.locationCell = location;
-    actuator.modes.push_back(mode);
-    graph.actuators.push_back(actuator);
+    Affordance affordance;
+    affordance.id = affordanceId;
+    affordance.actionPose = location;
+    affordance.actions.push_back(action);
+    graph.affordances.push_back(affordance);
     LearnedEffect effect;
-    effect.actuator = actuatorId;
-    effect.mode = mode;
-    effect.mechanism = mechanism;
+    effect.affordance = affordanceId;
+    effect.action = action;
+    effect.variable = variable;
     effect.state = state;
     graph.effects.push_back(effect);
     return graph;
@@ -434,140 +530,82 @@ static void testDynamicPlanningAndCausality()
     cells[1].links.push_back(makeConditionalTraversal(2, kNavCrouch, 7, 1));
     cells[2].links.push_back(makeConditionalTraversal(1, kNavCrouch, 7, 1));
 
-    CausalGraph graph = oneActuatorGraph(42, 1, kActivateUse, 7, 1);
-    std::map<int, int> states;
+    CausalGraph graph = oneAffordanceGraph(42, 1, kActionUse, 7, 1);
+    std::map<StateVariableId, int> states;
     states[7] = 0;
     std::vector<PlanOperation> plan;
     DynamicPlanStats stats;
     expect(planDynamicRoute(cells, 0, 2, states, graph, plan, &stats)
                && planHas(plan, kPlanActivate)
                && planHas(plan, kPlanWaitForTransition)
-               && planActivatesWith(plan, kActivateUse),
-           "remote_actuator_establishes_traversal_condition");
+               && planActivatesWith(plan, kActionUse),
+           "remote_affordance_establishes_traversal_condition");
 
     // Closing changes availability, not remembered topology.  From the far
-    // side another reachable actuator can re-establish the same condition.
-    CausalGraph reverseGraph = oneActuatorGraph(43, 2, kActivateUse, 7, 1);
+    // side another reachable affordance can re-establish the same condition.
+    CausalGraph reverseGraph = oneAffordanceGraph(43, 2, kActionUse, 7, 1);
     plan.clear();
     expect(cells[2].links[0].condition.enabled
                && planDynamicRoute(cells, 2, 1, states, reverseGraph, plan)
                && planHas(plan, kPlanActivate),
            "auto_closing_gate_retains_conditional_reverse_connection");
 
-    Actuator vectorActuator;
-    vectorActuator.id = 44;
-    vectorActuator.locationCell = 1;
-    vectorActuator.modes.push_back(kActivateVector);
-    vectorActuator.destructible = false;
-    graph.actuators.push_back(vectorActuator);
-    LearnedEffect vectorEffect;
-    vectorEffect.actuator = 44;
-    vectorEffect.mode = kActivateVector;
-    vectorEffect.mechanism = 8;
-    vectorEffect.state = 1;
-    graph.effects.push_back(vectorEffect);
-    expect(graph.actuators[0].modes[0] == kActivateUse
-               && graph.actuators[1].modes[0] == kActivateVector,
-           "use_and_vector_share_causal_model_with_distinct_modes");
-    expect(!graph.actuators[1].destructible,
-           "vector_activation_does_not_imply_destructible");
+    Affordance remoteEffect;
+    remoteEffect.id = 44;
+    remoteEffect.actionPose = 1;
+    remoteEffect.actions.push_back(kActionDeliverRemoteEffect);
+    remoteEffect.destructible = false;
+    graph.affordances.push_back(remoteEffect);
+    LearnedEffect remoteResult;
+    remoteResult.affordance = 44;
+    remoteResult.action = kActionDeliverRemoteEffect;
+    remoteResult.variable = 8;
+    remoteResult.state = 1;
+    graph.effects.push_back(remoteResult);
+    expect(graph.affordances[0].actions[0] == kActionUse
+               && graph.affordances[1].actions[0]
+                    == kActionDeliverRemoteEffect,
+           "use_and_effect_delivery_share_causal_model");
+    expect(!graph.affordances[1].destructible,
+           "effect_delivery_does_not_imply_destructible");
 
-    CausalReceiver sectorReceiver;
-    sectorReceiver.channel = 100;
-    sectorReceiver.object = WorldObjectRef(kWorldSector, 3);
-    CausalReceiver wallReceiver;
-    wallReceiver.channel = 100;
-    wallReceiver.object = WorldObjectRef(kWorldWall, 17);
-    CausalReceiver spriteReceiver;
-    spriteReceiver.channel = 100;
-    spriteReceiver.object = WorldObjectRef(kWorldSprite, 25);
-    graph.receivers.push_back(sectorReceiver);
-    graph.receivers.push_back(wallReceiver);
-    graph.receivers.push_back(spriteReceiver);
-    const std::vector<CausalReceiver> receivers = graph.receiversFor(100);
-    expect(receivers.size() == 3
-               && receivers[0].object.kind == kWorldSector
-               && receivers[1].object.kind == kWorldWall
-               && receivers[2].object.kind == kWorldSprite,
-           "tx_channel_preserves_all_receiver_types");
+    // Authored routing is translated by the adapter. The semantic graph
+    // contains only an affordance-to-state relationship and no channel.
+    const std::vector<LearnedEffect> effects = graph.effectsEstablishing(8, 1);
+    expect(effects.size() == 1 && effects[0].affordance == 44
+               && effects[0].variable == 8,
+           "causal_routing_becomes_semantic_state_relationship");
 
-    Actuator siblingA;
+    Affordance siblingA;
     siblingA.id = 61;
-    siblingA.tx = 100;
-    siblingA.locationCell = 0;
-    Actuator siblingB;
+    siblingA.actionPose = 0;
+    Affordance siblingB;
     siblingB.id = 62;
-    siblingB.tx = 100;
-    siblingB.locationCell = 1;
-    graph.actuators.push_back(siblingA);
-    graph.actuators.push_back(siblingB);
-    expect(graph.actuatorById(61) != nullptr
-               && graph.actuatorById(62) != nullptr
-               && graph.actuatorById(61)->locationCell == 0
-               && graph.actuatorById(62)->locationCell == 1,
-           "shared_receiver_actuators_keep_distinct_attempt_identity");
+    siblingB.actionPose = 1;
+    graph.affordances.push_back(siblingA);
+    graph.affordances.push_back(siblingB);
+    expect(graph.affordanceById(61) != nullptr
+               && graph.affordanceById(62) != nullptr
+               && graph.affordanceById(61)->actionPose == 0
+               && graph.affordanceById(62)->actionPose == 1,
+           "shared_effect_affordances_keep_typed_identity");
 
-    const int receiver = 50;
-    const int firstDoor = wallInteractionAttemptKey(
-        418, 55, 50, true, true, false, receiver);
-    const int siblingFace = wallInteractionAttemptKey(
-        419, 55, 50, false, true, false, receiver);
-    const int secondDoor = wallInteractionAttemptKey(
-        412, 55, 51, true, true, false, receiver);
-    expect(firstDoor == siblingFace && firstDoor != secondDoor,
-           "physical_wall_actuators_do_not_alias_shared_causal_receiver");
-    const int previewSector = wallInteractionActuatorSector(-1, receiver);
-    const int storedSector = wallInteractionActuatorSector(receiver, receiver);
-    expect(wallInteractionAttemptKey(419, 65, previewSector,
-                                     true, false, false, receiver)
-               == wallInteractionAttemptKey(419, 65, storedSector,
-                                            true, false, false, receiver),
-           "one_sided_wall_identity_stable_after_receiver_resolution");
     expect(!shouldReselectInteractionSurface(true, true, true)
                && shouldReselectInteractionSurface(false, true, true)
                && preserveActiveInteractionSurface(true, true)
                && !preserveActiveInteractionSurface(true, false),
            "active_interaction_surface_retry_is_not_overwritten_by_observation");
 
-    CausalGraph chain;
-    CausalReceiver intermediate;
-    intermediate.channel = 105;
-    intermediate.object = WorldObjectRef(kWorldSprite, 542);
-    intermediate.outgoingChannel = 106;
-    intermediate.command = 5;
-    chain.receivers.push_back(intermediate);
-    CausalReceiver finalDoor;
-    finalDoor.channel = 106;
-    finalDoor.object = WorldObjectRef(kWorldSector, 51);
-    chain.receivers.push_back(finalDoor);
-    const std::vector<CausalReceiver> allChain =
-        chain.receiversReachableFrom(105, 8, false);
-    const std::vector<CausalReceiver> finalChain =
-        chain.receiversReachableFrom(105, 8, true);
-    expect(allChain.size() == 2 && finalChain.size() == 1
-               && finalChain[0].object == WorldObjectRef(kWorldSector, 51),
-           "causal_chain_follows_intermediate_rx_to_final_world_effect");
-
-    CausalReceiver cycleBack;
-    cycleBack.channel = 106;
-    cycleBack.object = WorldObjectRef(kWorldSprite, 543);
-    cycleBack.outgoingChannel = 105;
-    chain.receivers.clear();
-    chain.receivers.push_back(intermediate);
-    chain.receivers.push_back(cycleBack);
-    expect(chain.receiversReachableFrom(105, 8, true).empty(),
-           "causal_chain_cycle_is_bounded_without_fake_terminal_effect");
-
-    // Twenty unrelated mechanism states do not multiply route search.  Only
+    // Twenty unrelated state variables do not multiply route search. Only
     // the condition on the candidate route is resolved.
     for (int i = 100; i < 120; ++i)
         states[i] = i & 1;
     plan.clear();
     stats = DynamicPlanStats();
-    expect(planDynamicRoute(cells, 0, 2, states, oneActuatorGraph(
-                                45, 1, kActivateUse, 7, 1), plan, &stats)
-               && stats.mechanismsConsidered.size() == 1
-               && stats.mechanismsConsidered.count(7) == 1,
+    expect(planDynamicRoute(cells, 0, 2, states, oneAffordanceGraph(
+                                45, 1, kActionUse, 7, 1), plan, &stats)
+               && stats.variablesConsidered.size() == 1
+               && stats.variablesConsidered.count(7) == 1,
            "dynamic_planner_avoids_unrelated_state_cartesian_product");
 }
 
@@ -586,16 +624,16 @@ static StablePose pose(int state, int z, int clearance, bool occupiable,
 
 static void testDynamicSupports()
 {
-    DynamicMechanism gate;
-    gate.id = 1;
+    StatefulGeometry gate;
+    gate.stateVariable = 1;
     gate.poses.push_back(pose(0, 12000, 1000, false, -1));
     gate.poses.push_back(pose(1, 4000, 3000, true, 2));
     gate.sweepClearances.push_back(1000);
     const int gateAffordances = deriveDynamicAffordances(gate, 2048);
 
-    DynamicMechanism carrier;
-    carrier.id = 2;
-    carrier.support = SupportRef(kSupportSectorFloor, 8);
+    StatefulGeometry carrier;
+    carrier.stateVariable = 2;
+    carrier.support = SupportId(80);
     carrier.carriesSupport = true;
     carrier.poses.push_back(pose(0, 12000, 8192, true, 10));
     carrier.poses.push_back(pose(1, 4000, 8192, true, 11));
@@ -620,35 +658,35 @@ static void testDynamicSupports()
     cells[0].links.push_back(makeConditionalTraversal(1, kNavWalk, 2, 0));
     cells[1].links.push_back(makeConditionalTraversal(2, kNavRide, 2, 1, 2));
     cells[2].links.push_back(makeConditionalTraversal(3, kNavWalk, 2, 1));
-    std::map<int, int> states;
+    std::map<StateVariableId, int> states;
     states[2] = 0;
     std::vector<PlanOperation> plan;
     expect(planDynamicRoute(cells, 0, 3, states,
-                            oneActuatorGraph(50, 1, kActivateUse, 2, 1), plan)
+                            oneAffordanceGraph(50, 1, kActionUse, 2, 1), plan)
                && planHas(plan, kPlanRemainSupported),
            "safe_moving_support_connects_two_stable_landings");
 
-    DynamicMechanism spriteCarrier = carrier;
-    spriteCarrier.id = 3;
-    spriteCarrier.object = WorldObjectRef(kWorldSprite, 71);
-    spriteCarrier.support = SupportRef(kSupportSpriteFloor, 71);
-    NavCell spriteLow = makeCell(4, 12, 0, 0, 12000, spriteCarrier.support);
-    NavCell spriteHigh = makeCell(5, 13, 300, 0, 4000, spriteCarrier.support);
-    expect((deriveDynamicAffordances(spriteCarrier, 4096)
+    StatefulGeometry independentCarrier = carrier;
+    independentCarrier.stateVariable = 3;
+    independentCarrier.object = ObjectId(71);
+    independentCarrier.support = SupportId(71);
+    NavCell supportLow = makeCell(4, 12, 0, 0, 12000, independentCarrier.support);
+    NavCell supportHigh = makeCell(5, 13, 300, 0, 4000, independentCarrier.support);
+    expect((deriveDynamicAffordances(independentCarrier, 4096)
                 & kAffordanceTransportSupportedPlayer)
-               && spriteLow.sector != spriteHigh.sector
-               && spriteLow.support == spriteHigh.support,
-           "moving_sprite_support_transports_across_build_sectors");
+               && supportLow.region != supportHigh.region
+               && supportLow.support == supportHigh.support,
+           "moving_support_transports_across_adapter_regions");
 }
 
 static void testFrontiers()
 {
-    std::vector<int> visited;
+    std::vector<RegionId> visited;
     visited.push_back(1);
     std::vector<Boundary> boundaries;
-    Boundary a; a.wall = 10; a.from = 1; a.to = 2; a.traversable = true; a.geometrySignature = 1;
-    Boundary b; b.wall = 11; b.from = 1; b.to = 2; b.traversable = true; b.geometrySignature = 1;
-    Boundary c; c.wall = 12; c.from = 1; c.to = 2; c.traversable = true; c.geometrySignature = 1;
+    Boundary a; a.id = 10; a.source = 1; a.destination = 2; a.traversable = true; a.geometrySignature = 1;
+    Boundary b; b.id = 11; b.source = 1; b.destination = 2; b.traversable = true; b.geometrySignature = 1;
+    Boundary c; c.id = 12; c.source = 1; c.destination = 2; c.traversable = true; c.geometrySignature = 1;
     boundaries.push_back(a);
     boundaries.push_back(b);
     boundaries.push_back(c);
@@ -664,14 +702,14 @@ static void testFrontiers()
                                 std::vector<NavEdgeFailure>());
     expect(frontiers.empty(), "frontier_disappears_after_enter");
 
-    Boundary reverse; reverse.wall = 20; reverse.from = 2; reverse.to = 1;
+    Boundary reverse; reverse.id = 20; reverse.source = 2; reverse.destination = 1;
     reverse.traversable = true; reverse.geometrySignature = 1;
     boundaries.push_back(reverse);
     frontiers = deriveFrontiers(visited, boundaries, std::vector<InvestigateRecord>(),
                                 std::vector<NavEdgeFailure>());
     expect(frontiers.empty(), "frontier_reverse_is_transport_only");
 
-    Boundary blocked; blocked.wall = 30; blocked.from = 1; blocked.to = 9;
+    Boundary blocked; blocked.id = 30; blocked.source = 1; blocked.destination = 9;
     blocked.traversable = false; blocked.jumpable = false; blocked.geometrySignature = 4;
     boundaries.push_back(blocked);
     visited.assign(1, 1);
@@ -684,9 +722,9 @@ static void testFrontiers()
     expect(foundBlocked, "frontier_blocked_unknown_boundary");
 
     InvestigateRecord investigated;
-    investigated.wall = 30;
-    investigated.from = 1;
-    investigated.to = 9;
+    investigated.boundary = 30;
+    investigated.source = 1;
+    investigated.destination = 9;
     investigated.geometrySignature = 4;
     frontiers = deriveFrontiers(visited, boundaries, std::vector<InvestigateRecord>(1, investigated),
                                 std::vector<NavEdgeFailure>());
@@ -697,7 +735,7 @@ static void testFrontiers()
     expect(!foundBlocked, "frontier_blocked_disappears_after_investigation");
 
     NavEdgeFailure failure;
-    failure.wall = 10;
+    failure.boundary = 10;
     failure.geometrySignature = 1;
     std::vector<NavEdgeFailure> failed(1, failure);
     boundaries.assign(1, a);
@@ -717,19 +755,19 @@ static void testFrontiers()
            "frontier_geometry_change_restores_failed_candidate");
 
     Boundary probeA;
-    probeA.wall = 50;
-    probeA.from = 1;
-    probeA.to = 10;
+    probeA.id = 50;
+    probeA.source = 1;
+    probeA.destination = 10;
     probeA.geometrySignature = 5;
     Boundary probeB = probeA;
-    probeB.wall = 51;
+    probeB.id = 51;
     std::vector<Boundary> parallel;
     parallel.push_back(probeA);
     parallel.push_back(probeB);
     InvestigateRecord inspectedA;
-    inspectedA.wall = 50;
-    inspectedA.from = 1;
-    inspectedA.to = 10;
+    inspectedA.boundary = 50;
+    inspectedA.source = 1;
+    inspectedA.destination = 10;
     inspectedA.geometrySignature = 5;
     visited.assign(1, 1);
     frontiers = deriveFrontiers(visited, parallel,
@@ -737,7 +775,7 @@ static void testFrontiers()
                                 std::vector<NavEdgeFailure>());
     expect(frontiers.size() == 1 && frontiers[0].destination == 10
                && frontiers[0].candidates.size() == 1
-               && frontiers[0].candidates[0].wall == 51,
+               && frontiers[0].candidates[0].id == 51,
            "one_failed_boundary_inspection_does_not_exhaust_destination");
 }
 
@@ -824,14 +862,14 @@ static void testSemanticVisibilityExploration()
     Opportunity distantPickup;
     distantPickup.kind = kOpportunityPickup;
     distantPickup.id = WorkId(kWorkObject, 42);
-    distantPickup.sector = 8;
+    distantPickup.pose = 8;
     distantPickup.hops = 3;
     distantPickup.local = false;
     distantPickup.ready = true;
     Opportunity unknownView;
     unknownView.kind = kOpportunityCoverage;
     unknownView.id = WorkId(kWorkPose, 11);
-    unknownView.sector = 1;
+    unknownView.pose = 1;
     unknownView.hops = 0;
     unknownView.local = true;
     std::vector<Opportunity> semanticWork;
@@ -854,7 +892,7 @@ static void testSemanticVisibilityExploration()
     Opportunity visibleExit;
     visibleExit.kind = kOpportunityExit;
     visibleExit.id = WorkId(kWorkExit, 8);
-    visibleExit.sector = 8;
+    visibleExit.pose = 8;
     visibleExit.hops = 4;
     visibleExit.ready = false;
     semanticWork.push_back(visibleExit);
@@ -880,16 +918,16 @@ static void testSemanticVisibilityExploration()
 
     semanticWork.push_back(distantPickup);
     selection = selectWork(semanticWork, 0);
-    expect(selection.work == distantPickup.id,
-           "ready_task_precedes_causal_coverage_continuation");
+    expect(selection.work == enabledView.id,
+           "causal_continuation_retains_plan_ownership_over_pickup");
 }
 
 static void testDeferredEffectPrerequisites()
 {
     Opportunity crack;
     crack.kind = kOpportunityInteraction;
-    crack.id = WorkId(kWorkMechanism, 101);
-    crack.sector = 1;
+    crack.id = WorkId(kWorkStateVariable, 101);
+    crack.pose = 1;
     crack.hops = 0;
     crack.local = true;
     crack.ready = true;
@@ -898,8 +936,8 @@ static void testDeferredEffectPrerequisites()
     Opportunity exploration;
     exploration.kind = kOpportunityFrontier;
     exploration.id = WorkId(kWorkBoundary, 202, 2, 3);
-    exploration.sector = 2;
-    exploration.target = 3;
+    exploration.pose = 2;
+    exploration.destination = 3;
     exploration.hops = 1;
     exploration.local = false;
 
@@ -932,8 +970,8 @@ static void testConservedExplorationLedger()
     Opportunity deferred;
     deferred.kind = kOpportunityFrontier;
     deferred.id = WorkId(kWorkBoundary, 3001, 2, 3);
-    deferred.sector = 2;
-    deferred.target = 3;
+    deferred.pose = 2;
+    deferred.destination = 3;
     deferred.depth = 4;
     deferred.hops = -1;
 
@@ -949,8 +987,8 @@ static void testConservedExplorationLedger()
     Opportunity deadEnd;
     deadEnd.kind = kOpportunityFrontier;
     deadEnd.id = WorkId(kWorkBoundary, 3002, 8, 9);
-    deadEnd.sector = 8;
-    deadEnd.target = 9;
+    deadEnd.pose = 8;
+    deadEnd.destination = 9;
     deadEnd.depth = 9;
     deadEnd.hops = -1;
     Opportunity older = deferred;
@@ -993,8 +1031,8 @@ static void testConservedExplorationLedger()
     Opportunity coverage;
     coverage.kind = kOpportunityCoverage;
     coverage.id = WorkId(kWorkPose, 7001);
-    coverage.sector = 4;
-    coverage.target = 4;
+    coverage.pose = 4;
+    coverage.destination = 4;
     coverage.hops = -1;
     ledger.assign(1, coverage);
     selection = selectWork(ledger, 0);
@@ -1010,9 +1048,9 @@ static void testConservedExplorationLedger()
     // stronger causal priority over an unrelated local frontier.
     Opportunity keyedInteraction;
     keyedInteraction.kind = kOpportunityInteraction;
-    keyedInteraction.id = WorkId(kWorkMechanism, 42);
-    keyedInteraction.sector = 4;
-    keyedInteraction.target = 5;
+    keyedInteraction.id = WorkId(kWorkStateVariable, 42);
+    keyedInteraction.pose = 4;
+    keyedInteraction.destination = 5;
     keyedInteraction.local = true;
     keyedInteraction.hops = 0;
     keyedInteraction.ready = true;
@@ -1020,8 +1058,8 @@ static void testConservedExplorationLedger()
     Opportunity unrelatedFrontier;
     unrelatedFrontier.kind = kOpportunityFrontier;
     unrelatedFrontier.id = WorkId(kWorkBoundary, 43, 4, 6);
-    unrelatedFrontier.sector = 4;
-    unrelatedFrontier.target = 6;
+    unrelatedFrontier.pose = 4;
+    unrelatedFrontier.destination = 6;
     unrelatedFrontier.local = true;
     unrelatedFrontier.depth = 20;
     unrelatedFrontier.hops = 0;
@@ -1038,16 +1076,16 @@ static void testOneWayOpportunityPreference()
     Opportunity trap;
     trap.kind = kOpportunityFrontier;
     trap.id = WorkId(kWorkBoundary, 301, 1, 2);
-    trap.sector = 1;
-    trap.target = 2;
+    trap.pose = 1;
+    trap.destination = 2;
     trap.hops = 0;
     trap.local = true;
     trap.oneWayRisk = 1;
 
     Opportunity remoteTrigger;
     remoteTrigger.kind = kOpportunityInteraction;
-    remoteTrigger.id = WorkId(kWorkMechanism, 302);
-    remoteTrigger.sector = 1;
+    remoteTrigger.id = WorkId(kWorkStateVariable, 302);
+    remoteTrigger.pose = 1;
     remoteTrigger.hops = 0;
     remoteTrigger.local = true;
     remoteTrigger.ready = true;
@@ -1135,6 +1173,8 @@ static void testCombat()
 
 int main()
 {
+    testSparseConvexSkeleton();
+    testSemanticBoundary();
     testTraversalProbe();
     testContinuousWalkWaypointProgress();
     testNavGraph();

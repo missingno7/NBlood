@@ -1,6 +1,6 @@
 //-------------------------------------------------------------------------
 // Engine-free movement / exploration kernel for the LLMapper bot.
-// Geometry proposes traversability; the NBlood player model validates it.
+// Adapter observations propose traversability; engine physics validates it.
 //-------------------------------------------------------------------------
 #pragma once
 
@@ -28,57 +28,67 @@ enum NavEdgeMode
     kNavBlocked,
 };
 
-// A Build sector is a topological container, not a height layer.  SupportRef
-// names the physical thing under the player so two floors at the same XY do
-// not become the same navigation state.
-enum SupportKind
+template <typename Tag>
+struct SemanticId
 {
-    kSupportSectorFloor,
-    kSupportSpriteFloor,
+    int value;
+    SemanticId() : value(-1) {}
+    SemanticId(int aValue) : value(aValue) {}
+    explicit operator bool() const { return value >= 0; }
+    operator int() const { return value; }
+    bool operator==(const SemanticId &other) const { return value == other.value; }
+    bool operator!=(const SemanticId &other) const { return value != other.value; }
+    bool operator<(const SemanticId &other) const { return value < other.value; }
+    bool operator==(int other) const { return value == other; }
+    bool operator!=(int other) const { return value != other; }
+    bool operator<(int other) const { return value < other; }
+    bool operator<=(int other) const { return value <= other; }
+    bool operator>(int other) const { return value > other; }
+    bool operator>=(int other) const { return value >= other; }
 };
 
-struct SupportRef
-{
-    SupportKind kind;
-    int id;
-    SupportRef() : kind(kSupportSectorFloor), id(-1) {}
-    SupportRef(SupportKind aKind, int anId) : kind(aKind), id(anId) {}
-    bool operator==(const SupportRef &other) const
-    {
-        return kind == other.kind && id == other.id;
-    }
-    bool operator!=(const SupportRef &other) const { return !(*this == other); }
-    bool operator<(const SupportRef &other) const
-    {
-        return kind < other.kind || (kind == other.kind && id < other.id);
-    }
-};
+struct SupportTag;
+struct ObjectTag;
+struct RegionTag;
+struct PoseTag;
+struct BoundaryTag;
+struct TransitionTag;
+struct AffordanceTag;
+struct StateVariableTag;
+
+using SupportId = SemanticId<SupportTag>;
+using ObjectId = SemanticId<ObjectTag>;
+using RegionId = SemanticId<RegionTag>;
+using PoseId = SemanticId<PoseTag>;
+using BoundaryId = SemanticId<BoundaryTag>;
+using TransitionId = SemanticId<TransitionTag>;
+using AffordanceId = SemanticId<AffordanceTag>;
+using StateVariableId = SemanticId<StateVariableTag>;
 
 struct NavCondition
 {
-    int mechanism;
+    StateVariableId variable;
     int state;
     bool enabled;
-    NavCondition() : mechanism(-1), state(-1), enabled(false) {}
-    NavCondition(int aMechanism, int aState)
-        : mechanism(aMechanism), state(aState), enabled(true) {}
+    NavCondition() : variable(), state(-1), enabled(false) {}
+    NavCondition(StateVariableId aVariable, int aState)
+        : variable(aVariable), state(aState), enabled(true) {}
 };
 
-enum ActivationMode
+// Actions describe what the actor does. The adapter decides which native
+// delivery modality realizes an effect.
+enum ActionKind
 {
-    kActivateUse,
-    kActivateVector,
-    kActivateImpact,
-    kActivateTouch,
-    kActivateEnter,
-    kActivateExit,
-    kActivatePickup,
-    kActivateSight,
-    kActivateProximity,
-    // Damage-driven interactions are not Use/Vector triggers.  The planner
-    // records the effect the world object accepts and lets inventory or
-    // nearby-world satisfiers provide that effect later.
-    kActivateDamage,
+    kActionUse,
+    kActionDeliverRemoteEffect,
+    kActionCollide,
+    kActionTouch,
+    kActionEnter,
+    kActionExit,
+    kActionPickup,
+    kActionObserve,
+    kActionApproach,
+    kActionDeliverDamage,
 };
 
 enum EffectCapability
@@ -94,25 +104,6 @@ inline bool effectRequirementSatisfied(unsigned accepted, unsigned available)
 {
     return accepted == kEffectNone || (accepted & available) != 0;
 }
-
-enum WorldObjectKind
-{
-    kWorldSector,
-    kWorldWall,
-    kWorldSprite,
-};
-
-struct WorldObjectRef
-{
-    WorldObjectKind kind;
-    int id;
-    WorldObjectRef() : kind(kWorldSector), id(-1) {}
-    WorldObjectRef(WorldObjectKind aKind, int anId) : kind(aKind), id(anId) {}
-    bool operator==(const WorldObjectRef &other) const
-    {
-        return kind == other.kind && id == other.id;
-    }
-};
 
 enum TraversalResult
 {
@@ -150,6 +141,39 @@ struct NavWaypoint
     NavWaypoint(int ax, int ay) : x(ax), y(ay) {}
 };
 
+// Adapter-facing convex decomposition of one 2D support footprint. The
+// planner still receives only arbitrary XYZ poses; these polygons are a
+// bounded construction aid for placing those poses on the free-space
+// centerline instead of beside source-geometry walls.
+struct SkeletonCell
+{
+    std::vector<NavWaypoint> polygon;
+    NavWaypoint center;
+};
+
+struct SkeletonGateway
+{
+    int first;
+    int second;
+    NavWaypoint center;
+    SkeletonGateway() : first(-1), second(-1), center() {}
+};
+
+struct ConvexSkeleton
+{
+    std::vector<SkeletonCell> cells;
+    std::vector<SkeletonGateway> gateways;
+};
+
+ConvexSkeleton buildConvexSkeleton(
+    const std::vector<NavWaypoint> &footprint);
+
+// Geometry-driven decomposition for a support footprint with any number of
+// boundary loops (outer contours and holes).  Split coordinates come only
+// from actual vertices; this is not spatial rasterization.
+ConvexSkeleton buildConvexSkeleton(
+    const std::vector<std::vector<NavWaypoint> > &contours);
+
 // A sample along an ordinary walk corridor represents a cross-section, not
 // an exact pose.  Report progress only after the player has crossed the
 // sample's forward plane and remains within the corridor around that edge.
@@ -175,47 +199,45 @@ inline bool crossedWaypointCorridor(const NavWaypoint &source,
 
 struct NavLink
 {
-    int target;
+    PoseId target;
     NavEdgeMode mode;
-    int wall;
+    BoundaryId boundary;
     NavWaypoint gateway;
     bool hasGateway;
     NavWaypoint takeoff;
     bool hasTakeoff;
     NavCondition condition;
-    int transition;
+    TransitionId transition;
     int airControl;
+    int airControlAfter;
+    int airControlSwitchFrame;
     int airFrames;
+    int launchVelocity;
     bool hasAirControl;
-    // Revalidate this edge whenever live collision/topology changes.  This
-    // is deliberately independent of wall identity: a physically valid
-    // local transition may cross several tiny Build partitions and therefore
-    // have no single wall which owns it.
+    // Revalidate this edge whenever live collision/topology changes. This is
+    // independent of adapter provenance: a physical transition may cross
+    // several engine partitions and have no single boundary owner.
     bool dynamic;
     NavLink()
-        : target(-1), mode(kNavWalk), wall(-1), gateway(), hasGateway(false),
-          takeoff(), hasTakeoff(false), condition(), transition(-1),
-          airControl(0), airFrames(0), hasAirControl(false), dynamic(false)
+        : target(), mode(kNavWalk), boundary(), gateway(), hasGateway(false),
+          takeoff(), hasTakeoff(false), condition(), transition(),
+          airControl(0), airControlAfter(0), airControlSwitchFrame(0),
+          airFrames(0), launchVelocity(0),
+          hasAirControl(false), dynamic(false)
     {
     }
 };
 
-// One standable square of a sector's interior.  A uniform grid is used
-// instead of a triangulation because Build sectors routinely contain inner
-// wall loops (pillars, pits, alcoves); per-loop ear clipping silently
-// fragments exactly those rooms, and a fragmented mesh reports real routes
-// as unreachable.  Grid adjacency is also an O(1) lookup rather than an
-// O(cells^2) shared-edge search.
+// One standable pose. Spatial partitioning and tessellation are adapter
+// concerns; the planner sees only a region, a support and physical links.
 struct NavCell
 {
-    int id;
-    int sector;
-    int gx;
-    int gy;
+    PoseId id;
+    RegionId region;
     int z;
-    SupportRef support;
+    SupportId support;
     NavWaypoint center;
-    // Distance to the nearest sector boundary at this concrete pose.  It is
+    // Distance to the nearest boundary at this concrete pose. It is
     // a soft execution-safety cost, never a reachability test: narrow routes
     // remain valid when they are the only physical route.
     int clearance;
@@ -227,45 +249,54 @@ struct NavCell
     // interaction stance.
     bool live;
     // The support pose exists only with the crouched player collision hull.
-    // This is occupancy state, not a property of its Build sector.
+    // This is occupancy state, not a property of an engine partition.
     bool crouchOnly;
+    // This concrete pose lies on the visible side of an occlusion with
+    // engine-valid but not-yet-visible occupiable space beyond it. It is a
+    // spatial exploration fact, not an adapter-region boundary.
+    bool informationFrontier;
     std::vector<NavLink> links;
     NavCell()
-        : id(-1), sector(-1), gx(0), gy(0), z(0), support(), center(),
+        : id(), region(), z(0), support(), center(),
           clearance(INT32_MAX), walkArea(-1), inMotion(false), live(true),
-          crouchOnly(false)
+          crouchOnly(false), informationFrontier(false)
     {
     }
 };
 
 struct NavRouteStep
 {
-    int fromCell;
-    int toCell;
+    PoseId fromCell;
+    PoseId toCell;
     NavWaypoint gateway;
     bool hasGateway;
     NavWaypoint takeoff;
     bool hasTakeoff;
     NavWaypoint destination;
     NavEdgeMode mode;
-    int wall;
-    int sourceSector;
-    int targetSector;
+    BoundaryId boundary;
+    RegionId sourceRegion;
+    RegionId targetRegion;
     int sourceZ;
     int targetZ;
-    SupportRef sourceSupport;
-    SupportRef targetSupport;
+    SupportId sourceSupport;
+    SupportId targetSupport;
     NavCondition condition;
-    int transition;
+    TransitionId transition;
     int airControl;
+    int airControlAfter;
+    int airControlSwitchFrame;
     int airFrames;
+    int launchVelocity;
     bool hasAirControl;
     NavRouteStep()
-        : fromCell(-1), toCell(-1), gateway(), hasGateway(false), takeoff(),
-          hasTakeoff(false), destination(), mode(kNavWalk), wall(-1),
-          sourceSector(-1), targetSector(-1),
+        : fromCell(), toCell(), gateway(), hasGateway(false), takeoff(),
+          hasTakeoff(false), destination(), mode(kNavWalk), boundary(),
+          sourceRegion(), targetRegion(),
           sourceZ(0), targetZ(0), sourceSupport(), targetSupport(), condition(),
-          transition(-1), airControl(0), airFrames(0), hasAirControl(false)
+          transition(), airControl(0), airControlAfter(0),
+          airControlSwitchFrame(0), airFrames(0), launchVelocity(0),
+          hasAirControl(false)
     {
     }
 };
@@ -290,72 +321,55 @@ enum DynamicAffordance
     kAffordanceUnsafeSweptOccupancy = 1 << 2,
 };
 
-struct DynamicMechanism
+struct StatefulGeometry
 {
-    int id;
-    WorldObjectRef object;
-    SupportRef support;
+    StateVariableId stateVariable;
+    ObjectId object;
+    SupportId support;
     std::vector<StablePose> poses;
     std::vector<int> sweepClearances;
     bool crush;
     bool carriesSupport;
-    DynamicMechanism()
-        : id(-1), object(), support(), poses(), sweepClearances(), crush(false),
+    StatefulGeometry()
+        : stateVariable(), object(), support(), poses(), sweepClearances(), crush(false),
           carriesSupport(false)
     {
     }
 };
 
-struct Actuator
+struct Affordance
 {
-    int id;
-    WorldObjectRef object;
-    int locationCell;
-    int tx;
+    AffordanceId id;
+    ObjectId target;
+    PoseId actionPose;
     int command;
     bool destructible;
-    std::vector<ActivationMode> modes;
-    Actuator()
-        : id(-1), object(), locationCell(-1), tx(0), command(0),
-          destructible(false), modes()
-    {
-    }
-};
-
-struct CausalReceiver
-{
-    int channel;
-    WorldObjectRef object;
-    int mechanism;
-    int outgoingChannel;
-    int command;
-    CausalReceiver()
-        : channel(0), object(), mechanism(-1), outgoingChannel(0), command(0)
+    std::vector<ActionKind> actions;
+    Affordance()
+        : id(), target(), actionPose(), command(0),
+          destructible(false), actions()
     {
     }
 };
 
 struct LearnedEffect
 {
-    int actuator;
-    ActivationMode mode;
-    int mechanism;
+    AffordanceId affordance;
+    ActionKind action;
+    StateVariableId variable;
     int state;
     LearnedEffect()
-        : actuator(-1), mode(kActivateUse), mechanism(-1), state(-1) {}
+        : affordance(), action(kActionUse), variable(), state(-1) {}
 };
 
 struct CausalGraph
 {
-    std::vector<Actuator> actuators;
-    std::vector<CausalReceiver> receivers;
+    std::vector<Affordance> affordances;
     std::vector<LearnedEffect> effects;
 
-    std::vector<CausalReceiver> receiversFor(int channel) const;
-    std::vector<CausalReceiver> receiversReachableFrom(
-        int channel, int maxDepth, bool terminalOnly) const;
-    const Actuator *actuatorById(int id) const;
-    std::vector<LearnedEffect> effectsEstablishing(int mechanism, int state) const;
+    const Affordance *affordanceById(AffordanceId id) const;
+    std::vector<LearnedEffect> effectsEstablishing(StateVariableId variable,
+                                                    int state) const;
 };
 
 enum PlanOperationKind
@@ -370,16 +384,16 @@ enum PlanOperationKind
 struct PlanOperation
 {
     PlanOperationKind kind;
-    int fromCell;
-    int toCell;
+    PoseId fromCell;
+    PoseId toCell;
     NavEdgeMode traversal;
-    int actuator;
-    ActivationMode activation;
-    int mechanism;
+    AffordanceId affordance;
+    ActionKind action;
+    StateVariableId variable;
     int state;
     PlanOperation()
-        : kind(kPlanNavigate), fromCell(-1), toCell(-1), traversal(kNavWalk),
-          actuator(-1), activation(kActivateUse), mechanism(-1), state(-1)
+        : kind(kPlanNavigate), fromCell(), toCell(), traversal(kNavWalk),
+          affordance(), action(kActionUse), variable(), state(-1)
     {
     }
 };
@@ -388,22 +402,22 @@ struct DynamicPlanStats
 {
     int routeSearches;
     int prerequisiteExpansions;
-    std::set<int> mechanismsConsidered;
+    std::set<StateVariableId> variablesConsidered;
     DynamicPlanStats() : routeSearches(0), prerequisiteExpansions(0) {}
 };
 
 struct NavEdgeFailure
 {
-    int fromCell;
-    int toCell;
-    int wall;
+    PoseId fromCell;
+    PoseId toCell;
+    BoundaryId boundary;
     // kNavBlocked is the wildcard used when the attempted transition was an
     // observed boundary and its concrete graph mode may be re-derived.
     NavEdgeMode mode;
     int geometrySignature;
     int attempts;
     NavEdgeFailure()
-        : fromCell(-1), toCell(-1), wall(-1), mode(kNavWalk), geometrySignature(0),
+        : fromCell(), toCell(), boundary(), mode(kNavWalk), geometrySignature(0),
           attempts(0)
     {
     }
@@ -411,14 +425,14 @@ struct NavEdgeFailure
 
 struct Boundary
 {
-    int wall;
-    int from;
-    int to;
+    BoundaryId id;
+    RegionId source;
+    RegionId destination;
     bool traversable;
     bool jumpable;
     int geometrySignature;
     Boundary()
-        : wall(-1), from(-1), to(-1), traversable(false), jumpable(false),
+        : id(), source(), destination(), traversable(false), jumpable(false),
           geometrySignature(0)
     {
     }
@@ -426,15 +440,15 @@ struct Boundary
 
 struct DerivedFrontier
 {
-    int destination;
+    RegionId destination;
     FrontierKind kind;
     std::vector<Boundary> candidates;
-    DerivedFrontier() : destination(-1), kind(kFrontierOpen) {}
+    DerivedFrontier() : destination(), kind(kFrontierOpen) {}
 };
 
-// Semantic exploration samples deliberately contain no Build-sector
-// identity.  `partition` exists only so representation-invariance tests can
-// prove that changing mapper partitions cannot change the derived work.
+// Semantic exploration samples contain no engine-container identity.
+// `partition` exists only so representation-invariance tests can prove that
+// changing adapter tessellation cannot change the derived work.
 // Physical routing remains in NavCell/NavLink; this projection answers only
 // whether a reachable visibility boundary is worth investigating.
 struct VisibilityCell
@@ -469,11 +483,11 @@ struct VisibilityFrontier
 
 struct InvestigateRecord
 {
-    int wall;
-    int from;
-    int to;
+    BoundaryId boundary;
+    RegionId source;
+    RegionId destination;
     int geometrySignature;
-    InvestigateRecord() : wall(-1), from(-1), to(-1), geometrySignature(0) {}
+    InvestigateRecord() : boundary(), source(), destination(), geometrySignature(0) {}
 };
 
 struct CombatSituation
@@ -513,7 +527,7 @@ struct CombatDecision
 // and retry backoff only annotate that work; they never delete it. Selection
 // preserves an actionable commitment, consumes physical space enabled by a
 // world-changing action, finishes the current reachable region, then returns
-// to the nearest remembered work. Build sectors are not exploration state.
+// to the nearest remembered work. Engine partitions are not exploration state.
 // ---------------------------------------------------------------------
 
 enum OpportunityKind
@@ -532,7 +546,7 @@ inline int mixHash(int hash, int value);
 enum WorkIdentityKind
 {
     kWorkBoundary,
-    kWorkMechanism,
+    kWorkStateVariable,
     kWorkObject,
     kWorkPose,
     kWorkExit,
@@ -597,10 +611,10 @@ struct Opportunity
 {
     WorkId id;
     OpportunityKind kind;
-    int sector;        // where the bot must stand to act
-    int target;        // sector it leads to, -1 when not a crossing
-    int approach;      // reachable observation/takeoff pose, or -1
-    int wall;
+    PoseId pose;                 // where the actor must stand to act
+    RegionId destination;       // region it exposes, invalid when not spatial
+    PoseId approach;             // reachable observation/takeoff pose
+    BoundaryId transition;
     int requiredKey;   // 0 when no key is involved
     unsigned requiredEffects; // abstract effects, independent of their satisfier
     int depth;         // retained for telemetry; never used for selection
@@ -612,7 +626,7 @@ struct Opportunity
     bool ready;        // actor currently has a valid pose for the task
     bool requiresOccupancy; // player must occupy the pose; seeing its surface is insufficient
     Opportunity()
-        : id(), kind(kOpportunityFrontier), sector(-1), target(-1), approach(-1), wall(-1),
+        : id(), kind(kOpportunityFrontier), pose(), destination(), approach(), transition(),
           requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1),
           descent(0), oneWayRisk(0),
           local(false), continuation(false), ready(false),
@@ -635,7 +649,7 @@ struct WorkSelection
 //
 // `heldKeys` is a bitmask of key ids 1..15 the bot currently carries.
 // The selector is intentionally kind-agnostic. It does not have separate
-// priority ladders for keys, exits, pickups, doors, and coverage. Those are
+// priority ladders for keys, exits, pickups, mechanisms, and coverage. Those are
 // all unresolved work with availability and distance annotations.
 WorkSelection selectWork(const std::vector<Opportunity> &ledger,
                          unsigned heldKeys,
@@ -658,36 +672,6 @@ inline int selectTargetNavCell(int areaCell, int64_t areaDistance2,
         || areaDistance2 <= strictDistance2)
         return areaCell;
     return strictCell;
-}
-
-// Physical attempt identity is deliberately separate from causal receiver
-// identity. Several faces around one pushable sector are one actuator, but
-// two actuator sectors remain two things to try even when their TX channels
-// ultimately affect the same receiver. A bare XWALL has no actuator sector,
-// so its own wall record is the stable physical identity.
-inline int wallInteractionAttemptKey(int wallId, int fromSector,
-                                     int targetSector, bool wallPush,
-                                     bool sectorPush, bool sectorPushCurrent,
-                                     int causalReceiver)
-{
-    if (sectorPush && targetSector >= 0)
-        return 4000000 + targetSector + 1;
-    if (sectorPushCurrent && fromSector >= 0)
-        return 4000000 + fromSector + 1;
-    if (wallPush && targetSector >= 0)
-        return 4000000 + targetSector + 1;
-    if (wallPush && wallId >= 0)
-        return 5000000 + wallId + 1;
-    if (causalReceiver >= 0)
-        return 4000000 + causalReceiver + 1;
-    return -1;
-}
-
-inline int wallInteractionActuatorSector(int observedTargetSector,
-                                         int immediateReceiverSector)
-{
-    return observedTargetSector >= 0
-        ? observedTargetSector : immediateReceiverSector;
 }
 
 inline bool shouldReselectInteractionSurface(bool activeObjectiveOwnsMemory,
@@ -719,22 +703,22 @@ inline bool walkMode(NavEdgeMode mode)
     return mode == kNavWalk || mode == kNavStep;
 }
 
-inline bool edgeFailed(const NavEdgeFailure &failure, int fromCell, int toCell,
-                       int wall, NavEdgeMode mode, int geometrySignature)
+inline bool edgeFailed(const NavEdgeFailure &failure, PoseId fromCell, PoseId toCell,
+                       BoundaryId boundary, NavEdgeMode mode, int geometrySignature)
 {
-    // Unset fields act as wildcards, so a record that identifies no wall and
+    // Unset fields act as wildcards, so a record that identifies no boundary and
     // no cells would match every link and erase the whole mesh.  Such a
     // record describes nothing and must never block anything.
-    if (failure.wall < 0 && failure.fromCell < 0 && failure.toCell < 0)
+    if (!failure.boundary && !failure.fromCell && !failure.toCell)
         return false;
     if (geometrySignature != 0 && failure.geometrySignature != 0
         && failure.geometrySignature != geometrySignature)
         return false;
     // Only unset fields in the RECORD are wildcards.  Treating an unset
-    // field in the QUERY as a wildcard too meant a record naming one wall
-    // matched every wall-less intra-sector link -- that is, the whole
+    // field in the QUERY as a wildcard too meant a record naming one boundary
+    // matched every boundary-less local link -- that is, the whole
     // navigation mesh -- and the bot lost the ability to cross its own room.
-    if (failure.wall >= 0 && failure.wall != wall)
+    if (failure.boundary && failure.boundary != boundary)
         return false;
     if (failure.fromCell >= 0 && failure.fromCell != fromCell)
         return false;
@@ -745,13 +729,13 @@ inline bool edgeFailed(const NavEdgeFailure &failure, int fromCell, int toCell,
     return true;
 }
 
-inline bool edgeFailedAny(const std::vector<NavEdgeFailure> &failures, int fromCell,
-                          int toCell, int wall, NavEdgeMode mode,
+inline bool edgeFailedAny(const std::vector<NavEdgeFailure> &failures, PoseId fromCell,
+                          PoseId toCell, BoundaryId boundary, NavEdgeMode mode,
                           int geometrySignature)
 {
     for (size_t i = 0; i < failures.size(); ++i)
     {
-        if (edgeFailed(failures[i], fromCell, toCell, wall, mode, geometrySignature))
+        if (edgeFailed(failures[i], fromCell, toCell, boundary, mode, geometrySignature))
             return true;
     }
     return false;
@@ -764,10 +748,10 @@ inline TraversalResult classifyTraversal(int floorDelta, int clearance,
                                          bool clipFits)
 {
     // A horizontal clipmove probe is the authority for ordinary movement,
-    // not for a future jump arc.  A raised, clear portal may deliberately
-    // fail the horizontal probe until the player presses Blood's jump input.
+    // not for a future jump arc. A raised, clear opening may deliberately
+    // fail the horizontal probe until the actor applies jump input.
     // Keep body clearance as a hard constraint, but preserve that special
-    // capability edge even when the probe ended at the source-side wall.
+    // capability edge even when the probe ended at the source boundary.
     if (clearance < bodyClearance)
         return kTraverseNoFit;
     const int rise = floorDelta < 0 ? -floorDelta : 0;
@@ -840,51 +824,50 @@ inline NavEdgeMode modeFromTraversal(TraversalResult result)
     }
 }
 
-int deriveDynamicAffordances(const DynamicMechanism &mechanism,
+int deriveDynamicAffordances(const StatefulGeometry &geometry,
                              int requiredClearance);
 
-NavLink makeConditionalTraversal(int target, NavEdgeMode mode, int mechanism,
-                                 int state, int transition = -1);
+NavLink makeConditionalTraversal(PoseId target, NavEdgeMode mode,
+                                 StateVariableId variable, int state,
+                                 TransitionId transition = TransitionId());
 
-bool planDynamicRoute(const std::vector<NavCell> &cells, int startCell,
-                      int targetCell, const std::map<int, int> &mechanismStates,
+bool planDynamicRoute(const std::vector<NavCell> &cells, PoseId startCell,
+                      PoseId targetCell,
+                      const std::map<StateVariableId, int> &worldState,
                       const CausalGraph &causality,
                       std::vector<PlanOperation> &outPlan,
                       DynamicPlanStats *stats = nullptr);
 
 void assignWalkAreas(std::vector<NavCell> &cells);
 
-// Mark the cells physically reachable in the current geometry.  Sector ids
-// are only Build containers: one sector can contain several disconnected
-// support layers, so sector membership alone is not proof that an approach
-// pose can be reached.
-void markReachableNavCells(const std::vector<NavCell> &cells, int startCell,
+// Mark the poses physically reachable in the current geometry. Region
+// membership alone is not proof that an approach pose can be reached.
+void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
                            const std::vector<NavEdgeFailure> &failures,
                            int geometrySignature,
                            std::vector<char> &reachable);
 
-// Blood's stacked-room links are explicit engine transitions.  Connect two
-// otherwise independent sector-local layers through the marker-authored XY
-// translation; mere XY overlap never creates an edge.  The upper-to-lower
-// direction is a fall and the reverse direction requires a jump through the
-// lower ceiling.
-int linkTranslatedNavLayers(std::vector<NavCell> &cells, int upperSector,
-                            int lowerSector, int deltaX, int deltaY,
-                            int maximumError, int transitionEdge);
+// Connect two otherwise independent region-local layers through an
+// adapter-observed translation; mere XY overlap never creates an edge.
+int linkTranslatedNavLayers(std::vector<NavCell> &cells, RegionId upperRegion,
+                            SupportId upperSupport, RegionId lowerRegion,
+                            SupportId lowerSupport, int deltaX, int deltaY,
+                            int maximumError, TransitionId transition);
 
-bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
-                  int targetCell,
+bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
+                  PoseId targetCell,
                   const std::vector<NavEdgeFailure> &failures,
                   int geometrySignature,
                   std::vector<NavRouteStep> &outRoute);
 
 std::vector<DerivedFrontier> deriveFrontiers(
-    const std::vector<int> &visitedSectors, const std::vector<Boundary> &boundaries,
+    const std::vector<RegionId> &visitedRegions,
+    const std::vector<Boundary> &boundaries,
     const std::vector<InvestigateRecord> &investigated,
     const std::vector<NavEdgeFailure> &failedCrossings);
 
 int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
-                        int currentSector, const int *hops, int hopCount);
+                        RegionId currentRegion, const int *hops, int hopCount);
 
 std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
     const std::vector<VisibilityCell> &cells, int mergeRadius,
@@ -898,11 +881,13 @@ const char *combatTacticName(CombatTactic tactic);
 CombatDecision chooseCombatTactic(const CombatSituation &situation);
 
 inline bool investigatedNow(const std::vector<InvestigateRecord> &records,
-                            int wall, int from, int to, int geometrySignature)
+                            BoundaryId boundary, RegionId source,
+                            RegionId destination, int geometrySignature)
 {
     for (size_t i = 0; i < records.size(); ++i)
     {
-        if (records[i].wall == wall && records[i].from == from && records[i].to == to
+        if (records[i].boundary == boundary && records[i].source == source
+            && records[i].destination == destination
             && records[i].geometrySignature == geometrySignature)
             return true;
     }

@@ -11,6 +11,407 @@
 namespace llmapper
 {
 
+static int64_t skeletonCross(const NavWaypoint &a, const NavWaypoint &b,
+                             const NavWaypoint &c)
+{
+    return int64_t(b.x - a.x) * (c.y - a.y)
+        - int64_t(b.y - a.y) * (c.x - a.x);
+}
+
+static int64_t skeletonArea2(const std::vector<NavWaypoint> &polygon)
+{
+    int64_t area = 0;
+    for (size_t i = 0; i < polygon.size(); ++i)
+    {
+        const NavWaypoint &a = polygon[i];
+        const NavWaypoint &b = polygon[(i + 1) % polygon.size()];
+        area += int64_t(a.x) * b.y - int64_t(a.y) * b.x;
+    }
+    return area;
+}
+
+static void removeSkeletonCollinear(std::vector<NavWaypoint> &polygon)
+{
+    for (size_t i = 0; polygon.size() >= 3 && i < polygon.size(); )
+    {
+        const size_t previous = (i + polygon.size() - 1) % polygon.size();
+        const size_t next = (i + 1) % polygon.size();
+        if (skeletonCross(polygon[previous], polygon[i], polygon[next]) == 0)
+            polygon.erase(polygon.begin() + i);
+        else
+            ++i;
+    }
+}
+
+static bool skeletonPointInTriangle(const NavWaypoint &point,
+                                    const NavWaypoint &a,
+                                    const NavWaypoint &b,
+                                    const NavWaypoint &c)
+{
+    const int64_t ab = skeletonCross(a, b, point);
+    const int64_t bc = skeletonCross(b, c, point);
+    const int64_t ca = skeletonCross(c, a, point);
+    return ab >= 0 && bc >= 0 && ca >= 0;
+}
+
+static bool skeletonConvex(const std::vector<NavWaypoint> &polygon)
+{
+    if (polygon.size() < 3)
+        return false;
+    for (size_t i = 0; i < polygon.size(); ++i)
+        if (skeletonCross(
+                polygon[i], polygon[(i + 1) % polygon.size()],
+                polygon[(i + 2) % polygon.size()]) < 0)
+            return false;
+    return true;
+}
+
+static bool mergeSkeletonPolygons(const std::vector<NavWaypoint> &first,
+                                  const std::vector<NavWaypoint> &second,
+                                  std::vector<NavWaypoint> &merged)
+{
+    for (size_t i = 0; i < first.size(); ++i)
+    {
+        const NavWaypoint &a = first[i];
+        const NavWaypoint &b = first[(i + 1) % first.size()];
+        for (size_t j = 0; j < second.size(); ++j)
+        {
+            const NavWaypoint &reverseA = second[j];
+            const NavWaypoint &reverseB = second[(j + 1) % second.size()];
+            if (a.x != reverseB.x || a.y != reverseB.y
+                || b.x != reverseA.x || b.y != reverseA.y)
+                continue;
+            merged.clear();
+            for (size_t k = 0; k < first.size(); ++k)
+                merged.push_back(first[(i + 1 + k) % first.size()]);
+            for (size_t k = 1; k + 1 < second.size(); ++k)
+                merged.push_back(second[(j + 1 + k) % second.size()]);
+            removeSkeletonCollinear(merged);
+            if (skeletonConvex(merged))
+                return true;
+        }
+    }
+    return false;
+}
+
+static NavWaypoint skeletonCentroid(const std::vector<NavWaypoint> &polygon)
+{
+    int64_t area = 0;
+    int64_t weightedX = 0;
+    int64_t weightedY = 0;
+    for (size_t i = 0; i < polygon.size(); ++i)
+    {
+        const NavWaypoint &a = polygon[i];
+        const NavWaypoint &b = polygon[(i + 1) % polygon.size()];
+        const int64_t cross = int64_t(a.x) * b.y
+            - int64_t(a.y) * b.x;
+        area += cross;
+        weightedX += int64_t(a.x + b.x) * cross;
+        weightedY += int64_t(a.y + b.y) * cross;
+    }
+    if (area == 0)
+    {
+        int64_t x = 0, y = 0;
+        for (const NavWaypoint &point : polygon)
+        {
+            x += point.x;
+            y += point.y;
+        }
+        return NavWaypoint(int(x / int64_t(polygon.size())),
+                           int(y / int64_t(polygon.size())));
+    }
+    return NavWaypoint(int(weightedX / (3 * area)),
+                       int(weightedY / (3 * area)));
+}
+
+static bool skeletonPointOnSegment(const NavWaypoint &point,
+                                   const NavWaypoint &a,
+                                   const NavWaypoint &b)
+{
+    if (skeletonCross(a, b, point) != 0)
+        return false;
+    return point.x >= std::min(a.x, b.x)
+        && point.x <= std::max(a.x, b.x)
+        && point.y >= std::min(a.y, b.y)
+        && point.y <= std::max(a.y, b.y);
+}
+
+// Split long shared edges at every incident polygon vertex.  A sweep cell
+// can meet two cells across different portions of one edge; representing
+// those portions explicitly gives the sparse graph one gateway per real
+// adjacency without inserting any navigation sample interval.
+static void alignSkeletonPieceEdges(
+    std::vector<std::vector<NavWaypoint> > &pieces)
+{
+    std::vector<NavWaypoint> vertices;
+    for (const std::vector<NavWaypoint> &piece : pieces)
+        vertices.insert(vertices.end(), piece.begin(), piece.end());
+    for (std::vector<NavWaypoint> &piece : pieces)
+    {
+        std::vector<NavWaypoint> aligned;
+        for (size_t edge = 0; edge < piece.size(); ++edge)
+        {
+            const NavWaypoint &a = piece[edge];
+            const NavWaypoint &b = piece[(edge + 1) % piece.size()];
+            aligned.push_back(a);
+            std::vector<NavWaypoint> interior;
+            for (const NavWaypoint &candidate : vertices)
+            {
+                if ((candidate.x == a.x && candidate.y == a.y)
+                    || (candidate.x == b.x && candidate.y == b.y)
+                    || !skeletonPointOnSegment(candidate, a, b))
+                    continue;
+                if (std::find_if(interior.begin(), interior.end(),
+                    [&](const NavWaypoint &known) {
+                        return known.x == candidate.x
+                            && known.y == candidate.y;
+                    }) == interior.end())
+                    interior.push_back(candidate);
+            }
+            std::sort(interior.begin(), interior.end(),
+                [&](const NavWaypoint &first, const NavWaypoint &second) {
+                    const int64_t firstDistance =
+                        int64_t(first.x - a.x) * (first.x - a.x)
+                        + int64_t(first.y - a.y) * (first.y - a.y);
+                    const int64_t secondDistance =
+                        int64_t(second.x - a.x) * (second.x - a.x)
+                        + int64_t(second.y - a.y) * (second.y - a.y);
+                    return firstDistance < secondDistance;
+                });
+            aligned.insert(aligned.end(), interior.begin(), interior.end());
+        }
+        piece.swap(aligned);
+    }
+}
+
+static ConvexSkeleton finishConvexSkeleton(
+    std::vector<std::vector<NavWaypoint> > pieces)
+{
+    ConvexSkeleton result;
+    if (pieces.empty())
+        return result;
+
+    alignSkeletonPieceEdges(pieces);
+    // Maximal convex merging makes the result independent of arbitrary
+    // triangle or sweep density.
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (size_t i = 0; i < pieces.size() && !changed; ++i)
+            for (size_t j = i + 1; j < pieces.size(); ++j)
+            {
+                std::vector<NavWaypoint> merged;
+                if (!mergeSkeletonPolygons(pieces[i], pieces[j], merged))
+                    continue;
+                pieces[i] = merged;
+                pieces.erase(pieces.begin() + j);
+                changed = true;
+                break;
+            }
+    }
+    alignSkeletonPieceEdges(pieces);
+
+    for (const std::vector<NavWaypoint> &piece : pieces)
+    {
+        SkeletonCell cell;
+        cell.polygon = piece;
+        cell.center = skeletonCentroid(piece);
+        result.cells.push_back(cell);
+    }
+    for (size_t i = 0; i < pieces.size(); ++i)
+        for (size_t j = i + 1; j < pieces.size(); ++j)
+            for (size_t a = 0; a < pieces[i].size(); ++a)
+            {
+                const NavWaypoint &start = pieces[i][a];
+                const NavWaypoint &end = pieces[i][(a + 1) % pieces[i].size()];
+                for (size_t b = 0; b < pieces[j].size(); ++b)
+                {
+                    const NavWaypoint &reverseStart = pieces[j][b];
+                    const NavWaypoint &reverseEnd = pieces[j][
+                        (b + 1) % pieces[j].size()];
+                    if (start.x != reverseEnd.x || start.y != reverseEnd.y
+                        || end.x != reverseStart.x || end.y != reverseStart.y)
+                        continue;
+                    SkeletonGateway gateway;
+                    gateway.first = int(i);
+                    gateway.second = int(j);
+                    gateway.center = NavWaypoint(
+                        (start.x + end.x) / 2,
+                        (start.y + end.y) / 2);
+                    result.gateways.push_back(gateway);
+                }
+            }
+    return result;
+}
+
+ConvexSkeleton buildConvexSkeleton(
+    const std::vector<NavWaypoint> &footprint)
+{
+    std::vector<NavWaypoint> polygon = footprint;
+    if (polygon.size() > 1
+        && polygon.front().x == polygon.back().x
+        && polygon.front().y == polygon.back().y)
+        polygon.pop_back();
+    removeSkeletonCollinear(polygon);
+    if (polygon.size() < 3)
+        return ConvexSkeleton();
+    if (skeletonArea2(polygon) < 0)
+        std::reverse(polygon.begin(), polygon.end());
+
+    std::vector<int> remaining;
+    for (size_t i = 0; i < polygon.size(); ++i)
+        remaining.push_back(int(i));
+    std::vector<std::vector<NavWaypoint> > pieces;
+    while (remaining.size() > 3)
+    {
+        bool clipped = false;
+        for (size_t cursor = 0; cursor < remaining.size(); ++cursor)
+        {
+            const int previous = remaining[
+                (cursor + remaining.size() - 1) % remaining.size()];
+            const int current = remaining[cursor];
+            const int next = remaining[(cursor + 1) % remaining.size()];
+            if (skeletonCross(polygon[size_t(previous)],
+                              polygon[size_t(current)],
+                              polygon[size_t(next)]) <= 0)
+                continue;
+            bool contains = false;
+            for (int candidate : remaining)
+            {
+                if (candidate == previous || candidate == current
+                    || candidate == next)
+                    continue;
+                if (skeletonPointInTriangle(
+                        polygon[size_t(candidate)],
+                        polygon[size_t(previous)],
+                        polygon[size_t(current)],
+                        polygon[size_t(next)]))
+                {
+                    contains = true;
+                    break;
+                }
+            }
+            if (contains)
+                continue;
+            pieces.push_back({ polygon[size_t(previous)],
+                               polygon[size_t(current)],
+                               polygon[size_t(next)] });
+            remaining.erase(remaining.begin() + cursor);
+            clipped = true;
+            break;
+        }
+        if (!clipped)
+            return ConvexSkeleton();
+    }
+    pieces.push_back({ polygon[size_t(remaining[0])],
+                       polygon[size_t(remaining[1])],
+                       polygon[size_t(remaining[2])] });
+
+    return finishConvexSkeleton(pieces);
+}
+
+ConvexSkeleton buildConvexSkeleton(
+    const std::vector<std::vector<NavWaypoint> > &inputContours)
+{
+    std::vector<std::vector<NavWaypoint> > contours;
+    std::vector<int> splitX;
+    for (std::vector<NavWaypoint> contour : inputContours)
+    {
+        if (contour.size() > 1
+            && contour.front().x == contour.back().x
+            && contour.front().y == contour.back().y)
+            contour.pop_back();
+        removeSkeletonCollinear(contour);
+        if (contour.size() < 3)
+            continue;
+        for (const NavWaypoint &point : contour)
+            splitX.push_back(point.x);
+        contours.push_back(contour);
+    }
+    if (contours.empty())
+        return ConvexSkeleton();
+    if (contours.size() == 1)
+        return buildConvexSkeleton(contours.front());
+    std::sort(splitX.begin(), splitX.end());
+    splitX.erase(std::unique(splitX.begin(), splitX.end()), splitX.end());
+
+    struct Crossing
+    {
+        const NavWaypoint *a;
+        const NavWaypoint *b;
+        long double y;
+    };
+    auto edgeY = [](const NavWaypoint &a, const NavWaypoint &b,
+                    long double x) {
+        return a.y + (x - a.x) * (b.y - a.y)
+            / static_cast<long double>(b.x - a.x);
+    };
+    std::vector<std::vector<NavWaypoint> > pieces;
+    for (size_t slab = 0; slab + 1 < splitX.size(); ++slab)
+    {
+        const int left = splitX[slab];
+        const int right = splitX[slab + 1];
+        if (left == right)
+            continue;
+        const long double middle =
+            (static_cast<long double>(left)
+             + static_cast<long double>(right)) / 2.0L;
+        std::vector<Crossing> crossings;
+        for (const std::vector<NavWaypoint> &contour : contours)
+            for (size_t edge = 0; edge < contour.size(); ++edge)
+            {
+                const NavWaypoint &a = contour[edge];
+                const NavWaypoint &b = contour[(edge + 1) % contour.size()];
+                if (a.x == b.x
+                    || middle <= std::min(a.x, b.x)
+                    || middle >= std::max(a.x, b.x))
+                    continue;
+                crossings.push_back(Crossing{ &a, &b, edgeY(a, b, middle) });
+            }
+        std::sort(crossings.begin(), crossings.end(),
+                  [](const Crossing &a, const Crossing &b) {
+                      return a.y < b.y;
+                  });
+        // Even/odd fill handles outer contours and arbitrarily nested holes
+        // without depending on source winding or engine ownership.
+        for (size_t crossing = 0; crossing + 1 < crossings.size();
+             crossing += 2)
+        {
+            const Crossing &lower = crossings[crossing];
+            const Crossing &upper = crossings[crossing + 1];
+            const int lowerLeft = int(std::llround(
+                edgeY(*lower.a, *lower.b, left)));
+            const int lowerRight = int(std::llround(
+                edgeY(*lower.a, *lower.b, right)));
+            const int upperLeft = int(std::llround(
+                edgeY(*upper.a, *upper.b, left)));
+            const int upperRight = int(std::llround(
+                edgeY(*upper.a, *upper.b, right)));
+            std::vector<NavWaypoint> piece = {
+                { left, lowerLeft }, { right, lowerRight },
+                { right, upperRight }, { left, upperLeft },
+            };
+            for (size_t i = 0; piece.size() > 1 && i < piece.size(); )
+            {
+                const size_t next = (i + 1) % piece.size();
+                if (piece[i].x == piece[next].x
+                    && piece[i].y == piece[next].y)
+                    piece.erase(piece.begin() + next);
+                else
+                    ++i;
+            }
+            removeSkeletonCollinear(piece);
+            if (piece.size() < 3 || skeletonArea2(piece) == 0)
+                continue;
+            if (skeletonArea2(piece) < 0)
+                std::reverse(piece.begin(), piece.end());
+            pieces.push_back(piece);
+        }
+    }
+    return finishConvexSkeleton(pieces);
+}
+
 const char *navEdgeModeName(NavEdgeMode mode)
 {
     switch (mode)
@@ -87,7 +488,7 @@ void assignWalkAreas(std::vector<NavCell> &cells)
     }
 }
 
-void markReachableNavCells(const std::vector<NavCell> &cells, int startCell,
+void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
                            const std::vector<NavEdgeFailure> &failures,
                            int geometrySignature,
                            std::vector<char> &reachable)
@@ -111,7 +512,7 @@ void markReachableNavCells(const std::vector<NavCell> &cells, int startCell,
             if (!traversableMode(link.mode) || link.condition.enabled
                 || link.target < 0 || link.target >= int(cells.size())
                 || reachable[size_t(link.target)]
-                || edgeFailedAny(failures, current, link.target, link.wall,
+                || edgeFailedAny(failures, current, link.target, link.boundary,
                                  link.mode, geometrySignature))
                 continue;
             reachable[size_t(link.target)] = 1;
@@ -120,35 +521,34 @@ void markReachableNavCells(const std::vector<NavCell> &cells, int startCell,
     }
 }
 
-int linkTranslatedNavLayers(std::vector<NavCell> &cells, int upperSector,
-                            int lowerSector, int deltaX, int deltaY,
-                            int maximumError, int transitionEdge)
+int linkTranslatedNavLayers(std::vector<NavCell> &cells, RegionId upperRegion,
+                            SupportId upperSupport, RegionId lowerRegion,
+                            SupportId lowerSupport, int deltaX, int deltaY,
+                            int maximumError, TransitionId transition)
 {
     const int64_t maximumError2 = int64_t(maximumError) * maximumError;
     int linked = 0;
-    auto addLink = [&](int from, int to, NavEdgeMode mode,
-                       int transitionSector, const NavWaypoint &gateway) {
+    auto addLink = [&](PoseId from, PoseId to, NavEdgeMode mode,
+                       const NavWaypoint &gateway) {
         if (from < 0 || to < 0 || from >= int(cells.size())
             || to >= int(cells.size()) || from == to)
             return false;
         for (const NavLink &link : cells[size_t(from)].links)
-            if (link.target == to && link.wall == transitionEdge)
+            if (link.target == to && link.transition == transition)
                 return false;
         NavLink link;
         link.target = to;
         link.mode = mode;
-        link.wall = transitionEdge;
         link.gateway = gateway;
         link.hasGateway = true;
-        link.transition = transitionSector;
+        link.transition = transition;
         cells[size_t(from)].links.push_back(link);
         return true;
     };
 
     for (const NavCell &upper : cells)
     {
-        if (upper.sector != upperSector
-            || upper.support != SupportRef(kSupportSectorFloor, upperSector))
+        if (upper.region != upperRegion || upper.support != upperSupport)
             continue;
         const int wantedX = upper.center.x + deltaX;
         const int wantedY = upper.center.y + deltaY;
@@ -156,8 +556,7 @@ int linkTranslatedNavLayers(std::vector<NavCell> &cells, int upperSector,
         int64_t bestDistance = maximumError2 + 1;
         for (const NavCell &lower : cells)
         {
-            if (lower.sector != lowerSector
-                || lower.support != SupportRef(kSupportSectorFloor, lowerSector))
+            if (lower.region != lowerRegion || lower.support != lowerSupport)
                 continue;
             const int64_t candidate = int64_t(lower.center.x - wantedX)
                     * (lower.center.x - wantedX)
@@ -172,29 +571,28 @@ int linkTranslatedNavLayers(std::vector<NavCell> &cells, int upperSector,
         if (lowerId < 0 || lowerId >= int(cells.size()))
             continue;
         const NavCell &lower = cells[size_t(lowerId)];
-        // A room-over-room link is an engine coordinate-space portal.  The
+        // A translated-layer link connects two coordinate-space projections. The
         // player walks through its source pose and the engine translates the
         // body to the receiving layer; no ballistic capability is involved.
         // Labelling this DROP/JUMP handed a remote translated coordinate to
         // the jump executor and invented a flight across ordinary geometry.
-        if (addLink(upper.id, lower.id, kNavWalk, lowerSector,
-                    upper.center))
+        if (addLink(upper.id, lower.id, kNavWalk, upper.center))
             ++linked;
-        if (addLink(lower.id, upper.id, kNavWalk, upperSector,
-                    lower.center))
+        if (addLink(lower.id, upper.id, kNavWalk, lower.center))
             ++linked;
     }
     return linked;
 }
 
-static const NavLink *findLink(const NavCell &cell, int target, int wall)
+static const NavLink *findLink(const NavCell &cell, PoseId target,
+                               BoundaryId boundary)
 {
     for (size_t i = 0; i < cell.links.size(); ++i)
     {
         const NavLink &link = cell.links[i];
         if (link.target != target)
             continue;
-        if (wall >= 0 && link.wall >= 0 && link.wall != wall)
+        if (boundary && link.boundary && link.boundary != boundary)
             continue;
         return &link;
     }
@@ -202,16 +600,17 @@ static const NavLink *findLink(const NavCell &cell, int target, int wall)
 }
 
 static bool conditionSatisfied(const NavCondition &condition,
-                               const std::map<int, int> &states)
+                               const std::map<StateVariableId, int> &states)
 {
     if (!condition.enabled)
         return true;
-    std::map<int, int>::const_iterator found = states.find(condition.mechanism);
+    std::map<StateVariableId, int>::const_iterator found =
+        states.find(condition.variable);
     return found != states.end() && found->second == condition.state;
 }
 
-bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
-                  int targetCell,
+bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
+                  PoseId targetCell,
                   const std::vector<NavEdgeFailure> &failures,
                   int geometrySignature,
                   std::vector<NavRouteStep> &outRoute)
@@ -220,11 +619,9 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
     if (startCell < 0 || startCell >= int(cells.size()))
         return false;
 
-    // Routing begins and ends at concrete physical poses.  A Build-sector
-    // label is useful metadata for collision calls and telemetry, but it is
-    // too lossy to manufacture a goal: several disconnected floors/supports
-    // can share it, and several sector labels can describe one continuous
-    // floor.  The caller must resolve its task to a NavCell first.
+    // Routing begins and ends at concrete physical poses. A region label is
+    // too lossy to manufacture a goal: several disconnected supports can
+    // share it. The caller must resolve its task to a pose first.
     const int goal = targetCell;
     if (goal < 0 || goal >= int(cells.size()))
         return false;
@@ -234,7 +631,7 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
     // Prefer physically conservative routes.  A jump or irreversible drop
     // is not equivalent to one ordinary grid step merely because both are
     // represented by one graph link.  The old breadth-first search chose a
-    // long leap across a pit over the adjacent sprite bridge because it had
+    // long leap across a pit over an adjacent support because it had
     // fewer links.  Dijkstra costs keep those capabilities available while
     // preferring a modest walk around whenever one is known.
     auto traversalPenalty = [](NavEdgeMode mode) {
@@ -250,7 +647,7 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
     };
     std::set<std::pair<int, int> > queue;
     std::vector<int> parent(cells.size(), -1);
-    std::vector<int> viaWall(cells.size(), -1);
+    std::vector<BoundaryId> viaBoundary(cells.size());
     std::vector<NavEdgeMode> viaMode(cells.size(), kNavWalk);
     std::vector<int> bestCost(cells.size(), 0x3fffffff);
     bestCost[size_t(startCell)] = 0;
@@ -277,12 +674,12 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
                 continue;
             if (link.target < 0 || link.target >= int(cells.size()))
                 continue;
-            if (edgeFailedAny(failures, current, link.target, link.wall, link.mode,
+            if (edgeFailedAny(failures, current, link.target, link.boundary, link.mode,
                               geometrySignature))
                 continue;
             // A graph link is a concrete movement between two poses.  Count
             // its physical span, not merely one abstract hop: otherwise two
-            // equal-hop routes through different doorways are tied and cell
+            // equal-hop routes through different boundaries are tied and pose
             // insertion order chooses the crossing.  The 256-unit penalty
             // scale preserves the established preference for supported walk
             // over jump/drop shortcuts while making geometry authoritative
@@ -332,7 +729,7 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
                 queue.erase(std::make_pair(bestCost[size_t(link.target)], link.target));
             bestCost[size_t(link.target)] = candidateCost;
             parent[size_t(link.target)] = current;
-            viaWall[size_t(link.target)] = link.wall;
+            viaBoundary[size_t(link.target)] = link.boundary;
             viaMode[size_t(link.target)] = link.mode;
             queue.insert(std::make_pair(candidateCost, link.target));
         }
@@ -358,14 +755,14 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
         step.fromCell = from;
         step.toCell = to;
         step.mode = viaMode[size_t(to)];
-        step.wall = viaWall[size_t(to)];
-        step.sourceSector = cells[size_t(from)].sector;
-        step.targetSector = cells[size_t(to)].sector;
+        step.boundary = viaBoundary[size_t(to)];
+        step.sourceRegion = cells[size_t(from)].region;
+        step.targetRegion = cells[size_t(to)].region;
         step.sourceZ = cells[size_t(from)].z;
         step.targetZ = cells[size_t(to)].z;
         step.sourceSupport = cells[size_t(from)].support;
         step.targetSupport = cells[size_t(to)].support;
-        const NavLink *link = findLink(cells[size_t(from)], to, step.wall);
+        const NavLink *link = findLink(cells[size_t(from)], to, step.boundary);
         if (link && link->hasGateway)
         {
             step.gateway = link->gateway;
@@ -377,7 +774,7 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
             step.hasTakeoff = true;
         }
         // Gateway and destination are different physical facts.  The former
-        // is a doorway/takeoff pose on the source side; the latter is the
+        // is a gateway/takeoff pose on the source side; the latter is the
         // target support pose.  Collapsing both into the gateway made jump
         // execution aim at its own takeoff point and then wait for a landing
         // it could never reach.
@@ -387,7 +784,10 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
             step.condition = link->condition;
             step.transition = link->transition;
             step.airControl = link->airControl;
+            step.airControlAfter = link->airControlAfter;
+            step.airControlSwitchFrame = link->airControlSwitchFrame;
             step.airFrames = link->airFrames;
+            step.launchVelocity = link->launchVelocity;
             step.hasAirControl = link->hasAirControl;
         }
         outRoute.push_back(step);
@@ -395,96 +795,36 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
     return !outRoute.empty();
 }
 
-std::vector<CausalReceiver> CausalGraph::receiversFor(int channel) const
+const Affordance *CausalGraph::affordanceById(AffordanceId id) const
 {
-    std::vector<CausalReceiver> result;
-    for (size_t i = 0; i < receivers.size(); ++i)
-        if (receivers[i].channel == channel)
-            result.push_back(receivers[i]);
-    return result;
-}
-
-std::vector<CausalReceiver> CausalGraph::receiversReachableFrom(
-    int channel, int maxDepth, bool terminalOnly) const
-{
-    std::vector<CausalReceiver> result;
-    if (channel <= 0 || maxDepth < 0)
-        return result;
-
-    struct PendingChannel
-    {
-        int channel;
-        int depth;
-        PendingChannel(int aChannel, int aDepth)
-            : channel(aChannel), depth(aDepth) {}
-    };
-    std::deque<PendingChannel> pending;
-    std::set<int> visitedChannels;
-    std::set<int64_t> emittedObjects;
-    pending.push_back(PendingChannel(channel, 0));
-    visitedChannels.insert(channel);
-    while (!pending.empty())
-    {
-        const PendingChannel current = pending.front();
-        pending.pop_front();
-        const std::vector<CausalReceiver> direct = receiversFor(current.channel);
-        for (size_t i = 0; i < direct.size(); ++i)
-        {
-            const CausalReceiver &receiver = direct[i];
-            const bool hasOutgoing = receiver.outgoingChannel > 0;
-            const bool canFollow = hasOutgoing && current.depth < maxDepth
-                && !visitedChannels.count(receiver.outgoingChannel);
-            if (canFollow)
-            {
-                visitedChannels.insert(receiver.outgoingChannel);
-                pending.push_back(PendingChannel(receiver.outgoingChannel,
-                                                 current.depth + 1));
-            }
-
-            // A receiver that forwards is an intermediate causal node, not
-            // the final effect. A cycle or depth cap terminates exploration
-            // safely but does not promote that relay into a fake leaf.
-            if (terminalOnly && (hasOutgoing || canFollow))
-                continue;
-            const int64_t identity = (int64_t(receiver.object.kind) << 32)
-                | uint32_t(receiver.object.id);
-            if (emittedObjects.insert(identity).second)
-                result.push_back(receiver);
-        }
-    }
-    return result;
-}
-
-const Actuator *CausalGraph::actuatorById(int id) const
-{
-    for (size_t i = 0; i < actuators.size(); ++i)
-        if (actuators[i].id == id)
-            return &actuators[i];
+    for (size_t i = 0; i < affordances.size(); ++i)
+        if (affordances[i].id == id)
+            return &affordances[i];
     return nullptr;
 }
 
-std::vector<LearnedEffect> CausalGraph::effectsEstablishing(int mechanism,
-                                                            int state) const
+std::vector<LearnedEffect> CausalGraph::effectsEstablishing(
+    StateVariableId variable, int state) const
 {
     std::vector<LearnedEffect> result;
     for (size_t i = 0; i < effects.size(); ++i)
-        if (effects[i].mechanism == mechanism && effects[i].state == state)
+        if (effects[i].variable == variable && effects[i].state == state)
             result.push_back(effects[i]);
     return result;
 }
 
-int deriveDynamicAffordances(const DynamicMechanism &mechanism,
+int deriveDynamicAffordances(const StatefulGeometry &geometry,
                              int requiredClearance)
 {
     int result = kAffordanceNone;
     bool anyPassable = false;
     bool anyBlocked = false;
-    bool endpointsSafe = mechanism.poses.size() >= 2;
+    bool endpointsSafe = geometry.poses.size() >= 2;
     std::set<int> firstConnections;
     bool differentConnections = false;
-    for (size_t i = 0; i < mechanism.poses.size(); ++i)
+    for (size_t i = 0; i < geometry.poses.size(); ++i)
     {
-        const StablePose &pose = mechanism.poses[i];
+        const StablePose &pose = geometry.poses[i];
         const bool passable = pose.occupiable && pose.clearance >= requiredClearance;
         anyPassable = anyPassable || passable;
         anyBlocked = anyBlocked || !passable;
@@ -500,26 +840,27 @@ int deriveDynamicAffordances(const DynamicMechanism &mechanism,
         result |= kAffordanceEnablePassage;
 
     bool sweepSafe = endpointsSafe;
-    for (size_t i = 0; i < mechanism.sweepClearances.size(); ++i)
-        if (mechanism.sweepClearances[i] < requiredClearance)
+    for (size_t i = 0; i < geometry.sweepClearances.size(); ++i)
+        if (geometry.sweepClearances[i] < requiredClearance)
             sweepSafe = false;
-    if (mechanism.crush && mechanism.sweepClearances.empty())
+    if (geometry.crush && geometry.sweepClearances.empty())
         sweepSafe = false;
 
-    if (mechanism.carriesSupport && sweepSafe && differentConnections)
+    if (geometry.carriesSupport && sweepSafe && differentConnections)
         result |= kAffordanceTransportSupportedPlayer;
     if (!sweepSafe)
         result |= kAffordanceUnsafeSweptOccupancy;
     return result;
 }
 
-NavLink makeConditionalTraversal(int target, NavEdgeMode mode, int mechanism,
-                                 int state, int transition)
+NavLink makeConditionalTraversal(PoseId target, NavEdgeMode mode,
+                                 StateVariableId variable, int state,
+                                 TransitionId transition)
 {
     NavLink link;
     link.target = target;
     link.mode = mode;
-    link.condition = NavCondition(mechanism, state);
+    link.condition = NavCondition(variable, state);
     link.transition = transition;
     return link;
 }
@@ -531,7 +872,8 @@ struct AvailableRoute
 };
 
 static bool findAvailableRoute(const std::vector<NavCell> &cells, int start,
-                               int goal, const std::map<int, int> &states,
+                               int goal,
+                               const std::map<StateVariableId, int> &states,
                                AvailableRoute &route,
                                std::vector<char> *reachable = nullptr)
 {
@@ -598,7 +940,7 @@ static void appendAvailableRoute(const std::vector<NavCell> &cells,
             remain.kind = kPlanRemainSupported;
             remain.fromCell = from;
             remain.toCell = to;
-            remain.mechanism = link.condition.mechanism;
+            remain.variable = link.condition.variable;
             remain.state = link.condition.state;
             plan.push_back(remain);
         }
@@ -607,7 +949,7 @@ static void appendAvailableRoute(const std::vector<NavCell> &cells,
         operation.fromCell = from;
         operation.toCell = to;
         operation.traversal = link.mode;
-        operation.mechanism = link.condition.mechanism;
+        operation.variable = link.condition.variable;
         operation.state = link.condition.state;
         plan.push_back(operation);
     }
@@ -615,7 +957,7 @@ static void appendAvailableRoute(const std::vector<NavCell> &cells,
 
 static bool planDynamicRouteRecursive(
     const std::vector<NavCell> &cells, int start, int goal,
-    std::map<int, int> &states, const CausalGraph &causality,
+    std::map<StateVariableId, int> &states, const CausalGraph &causality,
     std::set<int64_t> &resolving, std::vector<PlanOperation> &plan,
     DynamicPlanStats &stats, int depth)
 {
@@ -632,7 +974,7 @@ static bool planDynamicRouteRecursive(
     }
 
     // Only conditions on the boundary of space reachable right now matter.
-    // Unrelated mechanisms are never assigned or enumerated.
+    // Unrelated state variables are never assigned or enumerated.
     for (size_t c = 0; c < cells.size(); ++c)
     {
         if (!reachable[c])
@@ -644,23 +986,24 @@ static bool planDynamicRouteRecursive(
             if (!traversableMode(link.mode) || !link.condition.enabled
                 || conditionSatisfied(link.condition, states))
                 continue;
-            const int64_t key = (int64_t(link.condition.mechanism) << 32)
+            const int64_t key = (int64_t(link.condition.variable.value) << 32)
                 ^ uint32_t(link.condition.state);
             if (resolving.count(key))
                 continue;
             const std::vector<LearnedEffect> effects = causality.effectsEstablishing(
-                link.condition.mechanism, link.condition.state);
+                link.condition.variable, link.condition.state);
             for (size_t e = 0; e < effects.size(); ++e)
             {
                 const LearnedEffect &effect = effects[e];
-                const Actuator *actuator = causality.actuatorById(effect.actuator);
-                if (!actuator || actuator->locationCell < 0
-                    || actuator->locationCell >= int(cells.size()))
+                const Affordance *affordance =
+                    causality.affordanceById(effect.affordance);
+                if (!affordance || !affordance->actionPose
+                    || affordance->actionPose >= int(cells.size()))
                     continue;
                 resolving.insert(key);
-                std::map<int, int> candidateStates = states;
+                std::map<StateVariableId, int> candidateStates = states;
                 std::vector<PlanOperation> candidatePlan = plan;
-                if (!planDynamicRouteRecursive(cells, start, actuator->locationCell,
+                if (!planDynamicRouteRecursive(cells, start, affordance->actionPose,
                                                candidateStates, causality, resolving,
                                                candidatePlan, stats, depth + 1))
                 {
@@ -670,26 +1013,26 @@ static bool planDynamicRouteRecursive(
 
                 PlanOperation activate;
                 activate.kind = kPlanActivate;
-                activate.fromCell = actuator->locationCell;
-                activate.toCell = actuator->locationCell;
-                activate.actuator = actuator->id;
-                activate.activation = effect.mode;
-                activate.mechanism = effect.mechanism;
+                activate.fromCell = affordance->actionPose;
+                activate.toCell = affordance->actionPose;
+                activate.affordance = affordance->id;
+                activate.action = effect.action;
+                activate.variable = effect.variable;
                 activate.state = effect.state;
                 candidatePlan.push_back(activate);
 
                 PlanOperation wait;
                 wait.kind = kPlanWaitForTransition;
-                wait.fromCell = actuator->locationCell;
-                wait.toCell = actuator->locationCell;
-                wait.mechanism = effect.mechanism;
+                wait.fromCell = affordance->actionPose;
+                wait.toCell = affordance->actionPose;
+                wait.variable = effect.variable;
                 wait.state = effect.state;
                 candidatePlan.push_back(wait);
 
-                candidateStates[effect.mechanism] = effect.state;
+                candidateStates[effect.variable] = effect.state;
                 ++stats.prerequisiteExpansions;
-                stats.mechanismsConsidered.insert(effect.mechanism);
-                if (planDynamicRouteRecursive(cells, actuator->locationCell, goal,
+                stats.variablesConsidered.insert(effect.variable);
+                if (planDynamicRouteRecursive(cells, affordance->actionPose, goal,
                                               candidateStates, causality, resolving,
                                               candidatePlan, stats, depth + 1))
                 {
@@ -705,15 +1048,16 @@ static bool planDynamicRouteRecursive(
     return false;
 }
 
-bool planDynamicRoute(const std::vector<NavCell> &cells, int startCell,
-                      int targetCell, const std::map<int, int> &mechanismStates,
+bool planDynamicRoute(const std::vector<NavCell> &cells, PoseId startCell,
+                      PoseId targetCell,
+                      const std::map<StateVariableId, int> &worldState,
                       const CausalGraph &causality,
                       std::vector<PlanOperation> &outPlan,
                       DynamicPlanStats *stats)
 {
     outPlan.clear();
     DynamicPlanStats localStats;
-    std::map<int, int> states = mechanismStates;
+    std::map<StateVariableId, int> states = worldState;
     std::set<int64_t> resolving;
     const bool result = planDynamicRouteRecursive(cells, startCell, targetCell,
                                                    states, causality, resolving,
@@ -725,20 +1069,18 @@ bool planDynamicRoute(const std::vector<NavCell> &cells, int startCell,
     return result;
 }
 
-static bool crossingFailed(const std::vector<NavEdgeFailure> &failures, int wall,
-                           int from, int to, int geometrySignature)
+static bool crossingFailed(const std::vector<NavEdgeFailure> &failures,
+                           BoundaryId boundary, int geometrySignature)
 {
     for (size_t i = 0; i < failures.size(); ++i)
     {
         const NavEdgeFailure &failure = failures[i];
-        if (failure.wall < 0 && failure.fromCell < 0 && failure.toCell < 0)
+        if (!failure.boundary)
             continue;
         if (failure.geometrySignature != 0 && geometrySignature != 0
             && failure.geometrySignature != geometrySignature)
             continue;
-        if (failure.wall == wall)
-            return true;
-        if (failure.wall < 0 && failure.fromCell == from && failure.toCell == to)
+        if (failure.boundary == boundary)
             return true;
     }
     return false;
@@ -777,7 +1119,7 @@ std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
         if (!bordersKnownSpace)
             continue;
 
-        // A raised support or sprite top may be visible without yet having a
+        // A raised support may be visible without yet having a
         // traversal edge to the floor below it. The missing prerequisite is
         // a valid takeoff/inspection pose, not proof that the surface is
         // impossible. Use the nearest observed reachable physical pose as
@@ -893,44 +1235,46 @@ std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
 }
 
 std::vector<DerivedFrontier> deriveFrontiers(
-    const std::vector<int> &visitedSectors, const std::vector<Boundary> &boundaries,
+    const std::vector<RegionId> &visitedRegions,
+    const std::vector<Boundary> &boundaries,
     const std::vector<InvestigateRecord> &investigated,
     const std::vector<NavEdgeFailure> &failedCrossings)
 {
-    std::set<int> visited(visitedSectors.begin(), visitedSectors.end());
-    std::map<int, DerivedFrontier> openByDest;
-    std::map<int, DerivedFrontier> blockedByDest;
+    std::set<RegionId> visited(visitedRegions.begin(), visitedRegions.end());
+    std::map<RegionId, DerivedFrontier> openByDest;
+    std::map<RegionId, DerivedFrontier> blockedByDest;
     for (size_t i = 0; i < boundaries.size(); ++i)
     {
         const Boundary &boundary = boundaries[i];
-        if (visited.find(boundary.from) == visited.end())
+        if (visited.find(boundary.source) == visited.end())
             continue;
-        if (visited.find(boundary.to) != visited.end())
+        if (visited.find(boundary.destination) != visited.end())
             continue;
         const bool open = (boundary.traversable || boundary.jumpable)
-            && !crossingFailed(failedCrossings, boundary.wall, boundary.from,
-                               boundary.to, boundary.geometrySignature);
+            && !crossingFailed(failedCrossings, boundary.id,
+                               boundary.geometrySignature);
         if (open)
         {
-            DerivedFrontier &frontier = openByDest[boundary.to];
-            frontier.destination = boundary.to;
+            DerivedFrontier &frontier = openByDest[boundary.destination];
+            frontier.destination = boundary.destination;
             frontier.kind = kFrontierOpen;
             frontier.candidates.push_back(boundary);
             continue;
         }
-        if (investigatedNow(investigated, boundary.wall, boundary.from, boundary.to,
+        if (investigatedNow(investigated, boundary.id, boundary.source,
+                            boundary.destination,
                             boundary.geometrySignature))
             continue;
-        DerivedFrontier &frontier = blockedByDest[boundary.to];
-        frontier.destination = boundary.to;
+        DerivedFrontier &frontier = blockedByDest[boundary.destination];
+        frontier.destination = boundary.destination;
         frontier.kind = kFrontierBlocked;
         frontier.candidates.push_back(boundary);
     }
     std::vector<DerivedFrontier> result;
-    for (std::map<int, DerivedFrontier>::iterator it = openByDest.begin();
+    for (std::map<RegionId, DerivedFrontier>::iterator it = openByDest.begin();
          it != openByDest.end(); ++it)
         result.push_back(it->second);
-    for (std::map<int, DerivedFrontier>::iterator it = blockedByDest.begin();
+    for (std::map<RegionId, DerivedFrontier>::iterator it = blockedByDest.begin();
          it != blockedByDest.end(); ++it)
     {
         if (openByDest.find(it->first) != openByDest.end())
@@ -941,7 +1285,7 @@ std::vector<DerivedFrontier> deriveFrontiers(
 }
 
 int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
-                        int currentSector, const int *hops, int hopCount)
+                        RegionId currentRegion, const int *hops, int hopCount)
 {
     int bestOpenLocal = -1;
     int bestOpenRemote = -1;
@@ -955,7 +1299,7 @@ int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
         bool local = false;
         for (size_t c = 0; c < frontier.candidates.size(); ++c)
         {
-            if (frontier.candidates[c].from == currentSector)
+            if (frontier.candidates[c].source == currentRegion)
             {
                 local = true;
                 break;
@@ -1006,7 +1350,7 @@ static const char *workReason(const Opportunity &work)
     case kOpportunityExit:
         return "CONTINUE_FORWARD";
     default:
-        return "SOLVE_BLOCKING_OBSTACLE";
+        return "EXECUTE_AFFORDANCE";
     }
 }
 
@@ -1032,6 +1376,13 @@ static bool isDiscoveredTask(const Opportunity &opportunity)
 
 static int workClass(const Opportunity &opportunity)
 {
+    // A world-changing action and the newly enabled physical continuation
+    // form one causal plan. Once that successor is executable, retain plan
+    // ownership until it is consumed; an unrelated pickup discovered before
+    // the action must not make the actor turn away from the opening it just
+    // created.
+    if (opportunity.continuation)
+        return -1;
     if (isDiscoveredTask(opportunity) && opportunity.ready)
         return 0; // executable at the actor's present pose/component
     if (!isDiscoveredTask(opportunity))
@@ -1062,10 +1413,7 @@ static bool betterWork(const Opportunity &candidate, const Opportunity &best)
     // every known task is still pose-blocked, inspect unknown physical space;
     // once discovery is exhausted, return to the nearest deferred task. The
     // task itself never disappears from the ledger during that process.
-    // A causal successor breaks ties between work of the same execution
-    // class. It must not make generic coverage outrank a known task whose
-    // action pose is now reachable: the world change exists to enable useful
-    // work, not to impose a separate exploration mission.
+    // A causal successor also breaks ties within its execution class.
     if (candidate.continuation != best.continuation)
         return candidate.continuation;
 
