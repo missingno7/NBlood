@@ -271,6 +271,23 @@ inline int playerHarmlessDropHeight()
 // the posture's acceleration by it, so it is the full-throttle input.
 inline int playerMoveInputMax() { return kMaxMoveInput; }
 
+// Largest upward floor change which MoveDude's grounded player can cross.
+// ClipMove does not compare the floor delta with CLIPCURBHEIGHT alone.  Its
+// portal predicate compares the sprite origin with the destination floor
+// after applying MoveDude's `fd = (bottom-z)/4`; CLIPCURBHEIGHT only exempts
+// still smaller curbs from that test.  For a grounded player the exact last
+// accepted rise is therefore (bottom-origin)-fd, or CLIPCURBHEIGHT when the
+// body is unusually short.  Reading the live envelope preserves animation
+// and player-scale changes and reproduces the predicate used by ClipMove.
+inline int playerStepHeight()
+{
+    const Envelope body = playerEnvelope();
+    if (!body.known || !gMe || !gMe->pSprite)
+        return CLIPCURBHEIGHT;
+    const int footOffset = body.bottom - gMe->pSprite->z;
+    return std::max(CLIPCURBHEIGHT, footOffset - body.floorDistance);
+}
+
 // Pitch limits ProcessInput clamps the view to.
 inline int playerLookUpLimit() { return kLookUpLimit; }
 inline int playerLookDownLimit() { return kLookDownLimit; }
@@ -417,6 +434,28 @@ inline int playerRunUpDistance()
             break;
     }
     return travelled;
+}
+
+// Velocity produced by a real ground run of the requested length.  The
+// return value uses Blood's internal 20.12 horizontal-velocity units so it
+// can seed the same airborne motion replay used by navigation and execution.
+inline int playerRunVelocityForDistance(int distance)
+{
+    const POSTURE *stand = playerPosture(kPostureStand);
+    if (!stand || distance <= 0)
+        return 0;
+    const int accel = mulscale8(stand->frontAccel, playerMoveInputMax());
+    const AirDrag air = playerAirDrag();
+    int velocity = 0;
+    int travelled = 0;
+    for (int frame = 0; frame < 128 && travelled < distance; ++frame)
+    {
+        velocity += accel;
+        velocity -= mulscale16(velocity, air.factor);
+        velocity -= mulscale16r(velocity, gDudeDrag);
+        travelled += velocity >> 12;
+    }
+    return velocity;
 }
 
 // How much further the player slides after letting go, under drag alone.

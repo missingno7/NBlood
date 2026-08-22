@@ -1278,6 +1278,8 @@ SWITCH switches[] = {
     { "bot_realtime", 51, 0 },
     { "bot_visible", 52, 0 },
     { "playback_speed", 53, 1 },
+    { "bot_navmesh", 54, 1 },
+    { "bot_debug", 55, 0 },
     { NULL, 0, 0 }
 };
 
@@ -1315,6 +1317,8 @@ void PrintHelp(void)
         "-bot_demo [file.dem]\tNormal NBlood demo output\n"
         "-bot_realtime\tDisable accelerated bot timing\n"
         "-bot_visible\tShow the bot in the normal game window\n"
+        "-bot_navmesh [file]\tNDJSON physical navigation graph snapshots\n"
+        "-bot_debug\tObserve manual play and draw the bot model live\n"
         "-playback_speed [1..8]\tDemo playback speed multiplier\n\n"
         "-server [players]\tStart a multiplayer server\n"
 #ifdef STARTUP_SETUP_WINDOW
@@ -1647,6 +1651,14 @@ void ParseOptions(void)
             if (OptArgc < 1)
                 ThrowError("Missing argument");
             gDemo.SetPlaybackSpeed(atoi(OptArgv[0]));
+            break;
+        case 54:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gLLMapperBot.ConfigureNavMeshDump(OptArgv[0]);
+            break;
+        case 55:
+            gLLMapperBot.ConfigureDebugOverlay("on");
             break;
         }
     }

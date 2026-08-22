@@ -344,6 +344,7 @@ void        playerResetScores(int nPlayer);
 void        playerReset(PLAYER *pPlayer);
 void        playerInit(int nPlayer, unsigned int a2);
 char        findDroppedLeech(PLAYER *a1, spritetype *a2);
+char        playerCanBenefitFromPickup(PLAYER *pPlayer, spritetype *pItem);
 char        PickupItem(PLAYER *pPlayer, spritetype *pItem);
 char        PickupAmmo(PLAYER *pPlayer, spritetype *pAmmo);
 char        PickupWeapon(PLAYER *pPlayer, spritetype *pWeapon);

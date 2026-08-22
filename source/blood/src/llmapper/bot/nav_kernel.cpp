@@ -3,6 +3,8 @@
 //-------------------------------------------------------------------------
 #include "nav_kernel.h"
 
+#include <cmath>
+#include <deque>
 #include <map>
 #include <set>
 
@@ -85,6 +87,106 @@ void assignWalkAreas(std::vector<NavCell> &cells)
     }
 }
 
+void markReachableNavCells(const std::vector<NavCell> &cells, int startCell,
+                           const std::vector<NavEdgeFailure> &failures,
+                           int geometrySignature,
+                           std::vector<char> &reachable)
+{
+    reachable.assign(cells.size(), 0);
+    if (startCell < 0 || startCell >= int(cells.size()))
+        return;
+    std::deque<int> queue;
+    reachable[size_t(startCell)] = 1;
+    queue.push_back(startCell);
+    while (!queue.empty())
+    {
+        const int current = queue.front();
+        queue.pop_front();
+        const NavCell &cell = cells[size_t(current)];
+        for (const NavLink &link : cell.links)
+        {
+            // Conditional links describe a route after some prerequisite has
+            // changed.  They are conserved by the causal planner, but are not
+            // physically reachable in the world state being ranked now.
+            if (!traversableMode(link.mode) || link.condition.enabled
+                || link.target < 0 || link.target >= int(cells.size())
+                || reachable[size_t(link.target)]
+                || edgeFailedAny(failures, current, link.target, link.wall,
+                                 link.mode, geometrySignature))
+                continue;
+            reachable[size_t(link.target)] = 1;
+            queue.push_back(link.target);
+        }
+    }
+}
+
+int linkTranslatedNavLayers(std::vector<NavCell> &cells, int upperSector,
+                            int lowerSector, int deltaX, int deltaY,
+                            int maximumError, int transitionEdge)
+{
+    const int64_t maximumError2 = int64_t(maximumError) * maximumError;
+    int linked = 0;
+    auto addLink = [&](int from, int to, NavEdgeMode mode,
+                       int transitionSector, const NavWaypoint &gateway) {
+        if (from < 0 || to < 0 || from >= int(cells.size())
+            || to >= int(cells.size()) || from == to)
+            return false;
+        for (const NavLink &link : cells[size_t(from)].links)
+            if (link.target == to && link.wall == transitionEdge)
+                return false;
+        NavLink link;
+        link.target = to;
+        link.mode = mode;
+        link.wall = transitionEdge;
+        link.gateway = gateway;
+        link.hasGateway = true;
+        link.transition = transitionSector;
+        cells[size_t(from)].links.push_back(link);
+        return true;
+    };
+
+    for (const NavCell &upper : cells)
+    {
+        if (upper.sector != upperSector
+            || upper.support != SupportRef(kSupportSectorFloor, upperSector))
+            continue;
+        const int wantedX = upper.center.x + deltaX;
+        const int wantedY = upper.center.y + deltaY;
+        int lowerId = -1;
+        int64_t bestDistance = maximumError2 + 1;
+        for (const NavCell &lower : cells)
+        {
+            if (lower.sector != lowerSector
+                || lower.support != SupportRef(kSupportSectorFloor, lowerSector))
+                continue;
+            const int64_t candidate = int64_t(lower.center.x - wantedX)
+                    * (lower.center.x - wantedX)
+                + int64_t(lower.center.y - wantedY)
+                    * (lower.center.y - wantedY);
+            if (candidate < bestDistance)
+            {
+                bestDistance = candidate;
+                lowerId = lower.id;
+            }
+        }
+        if (lowerId < 0 || lowerId >= int(cells.size()))
+            continue;
+        const NavCell &lower = cells[size_t(lowerId)];
+        // A room-over-room link is an engine coordinate-space portal.  The
+        // player walks through its source pose and the engine translates the
+        // body to the receiving layer; no ballistic capability is involved.
+        // Labelling this DROP/JUMP handed a remote translated coordinate to
+        // the jump executor and invented a flight across ordinary geometry.
+        if (addLink(upper.id, lower.id, kNavWalk, lowerSector,
+                    upper.center))
+            ++linked;
+        if (addLink(lower.id, upper.id, kNavWalk, upperSector,
+                    lower.center))
+            ++linked;
+    }
+    return linked;
+}
+
 static const NavLink *findLink(const NavCell &cell, int target, int wall)
 {
     for (size_t i = 0; i < cell.links.size(); ++i)
@@ -108,50 +210,26 @@ static bool conditionSatisfied(const NavCondition &condition,
     return found != states.end() && found->second == condition.state;
 }
 
-bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCell,
-                  int targetX, int targetY, int targetSector, int crossingWall,
-                  const std::vector<NavEdgeFailure> &failures, int geometrySignature,
+bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
+                  int targetCell,
+                  const std::vector<NavEdgeFailure> &failures,
+                  int geometrySignature,
                   std::vector<NavRouteStep> &outRoute)
 {
     outRoute.clear();
     if (startCell < 0 || startCell >= int(cells.size()))
         return false;
 
-    int goal = targetCell;
+    // Routing begins and ends at concrete physical poses.  A Build-sector
+    // label is useful metadata for collision calls and telemetry, but it is
+    // too lossy to manufacture a goal: several disconnected floors/supports
+    // can share it, and several sector labels can describe one continuous
+    // floor.  The caller must resolve its task to a NavCell first.
+    const int goal = targetCell;
     if (goal < 0 || goal >= int(cells.size()))
-    {
-        int best = -1;
-        int bestDistance = 0x7fffffff;
-        for (size_t i = 0; i < cells.size(); ++i)
-        {
-            if (targetSector >= 0 && cells[i].sector != targetSector)
-                continue;
-            const int dx = cells[i].center.x - targetX;
-            const int dy = cells[i].center.y - targetY;
-            const int distance = dx * dx + dy * dy;
-            if (distance < bestDistance)
-            {
-                bestDistance = distance;
-                best = int(i);
-            }
-        }
-        goal = best;
-    }
-    if (goal < 0)
         return false;
     if (goal == startCell)
-    {
-        NavRouteStep step;
-        step.fromCell = startCell;
-        step.toCell = startCell;
-        step.destination = NavWaypoint(targetX, targetY);
-        step.mode = kNavWalk;
-        step.sourceSector = cells[size_t(startCell)].sector;
-        step.targetSector = targetSector >= 0 ? targetSector : step.sourceSector;
-        step.wall = crossingWall;
-        outRoute.push_back(step);
         return true;
-    }
 
     // Prefer physically conservative routes.  A jump or irreversible drop
     // is not equivalent to one ordinary grid step merely because both are
@@ -159,15 +237,15 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
     // long leap across a pit over the adjacent sprite bridge because it had
     // fewer links.  Dijkstra costs keep those capabilities available while
     // preferring a modest walk around whenever one is known.
-    auto traversalCost = [](NavEdgeMode mode) {
+    auto traversalPenalty = [](NavEdgeMode mode) {
         switch (mode)
         {
-        case kNavStep: return 2;
-        case kNavCrouch: return 3;
-        case kNavRide: return 4;
-        case kNavDrop: return 16;
-        case kNavJump: return 32;
-        default: return 1;
+        case kNavStep: return 1;
+        case kNavCrouch: return 2;
+        case kNavRide: return 3;
+        case kNavDrop: return 15;
+        case kNavJump: return 31;
+        default: return 0;
         }
     };
     std::set<std::pair<int, int> > queue;
@@ -202,7 +280,29 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
             if (edgeFailedAny(failures, current, link.target, link.wall, link.mode,
                               geometrySignature))
                 continue;
-            int edgeCost = traversalCost(link.mode);
+            // A graph link is a concrete movement between two poses.  Count
+            // its physical span, not merely one abstract hop: otherwise two
+            // equal-hop routes through different doorways are tied and cell
+            // insertion order chooses the crossing.  The 256-unit penalty
+            // scale preserves the established preference for supported walk
+            // over jump/drop shortcuts while making geometry authoritative
+            // within each traversal class.
+            const int64_t dx = int64_t(cells[size_t(link.target)].center.x)
+                - cell.center.x;
+            const int64_t dy = int64_t(cells[size_t(link.target)].center.y)
+                - cell.center.y;
+            int edgeCost = std::max(1, int(std::sqrt(double(dx * dx + dy * dy))))
+                + traversalPenalty(link.mode) * 256;
+            // A running actor has a finite turn/coast envelope.  Among
+            // otherwise equivalent supported routes, prefer cells with room
+            // to execute the turn instead of shaving a corner beside a pit.
+            // This is deliberately a penalty rather than a rejection so a
+            // genuinely narrow corridor never becomes falsely unreachable.
+            const int desiredClearance = 512;
+            const int edgeClearance = std::min(
+                cell.clearance, cells[size_t(link.target)].clearance);
+            if (edgeClearance < desiredClearance)
+                edgeCost += (desiredClearance - edgeClearance) * 4;
             if (link.mode == kNavJump)
             {
                 // Near-apex jumps are disproportionately fragile: a small
@@ -212,7 +312,18 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
                 const int rise = std::max(0, cells[size_t(current)].z
                                              - cells[size_t(link.target)].z);
                 const int riseUnits = (rise + 1023) / 1024;
-                edgeCost += riseUnits * riseUnits;
+                edgeCost += riseUnits * riseUnits * 256;
+                // A long jump is also harder to execute and stop than the
+                // same physical distance walked to a nearby takeoff first.
+                // Linear distance alone makes those routes exactly tied, so
+                // insertion order can select a full-speed leap onto a narrow
+                // collision support even when connected ground reaches its
+                // edge. Penalize flight span quadratically; indispensable
+                // long jumps remain reachable, while a stable short takeoff
+                // is preferred whenever the authoritative graph provides it.
+                const int spanUnits = (int(std::sqrt(double(dx * dx + dy * dy)))
+                                       + 255) / 256;
+                edgeCost += spanUnits * spanUnits * 64;
             }
             const int candidateCost = bestCost[size_t(current)] + edgeCost;
             if (candidateCost >= bestCost[size_t(link.target)])
@@ -259,25 +370,27 @@ bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCe
         {
             step.gateway = link->gateway;
             step.hasGateway = true;
-            step.destination = link->gateway;
         }
-        else
-            step.destination = cells[size_t(to)].center;
+        if (link && link->hasTakeoff)
+        {
+            step.takeoff = link->takeoff;
+            step.hasTakeoff = true;
+        }
+        // Gateway and destination are different physical facts.  The former
+        // is a doorway/takeoff pose on the source side; the latter is the
+        // target support pose.  Collapsing both into the gateway made jump
+        // execution aim at its own takeoff point and then wait for a landing
+        // it could never reach.
+        step.destination = cells[size_t(to)].center;
         if (link)
         {
             step.condition = link->condition;
             step.transition = link->transition;
+            step.airControl = link->airControl;
+            step.airFrames = link->airFrames;
+            step.hasAirControl = link->hasAirControl;
         }
         outRoute.push_back(step);
-    }
-    if (!outRoute.empty())
-    {
-        NavRouteStep &last = outRoute.back();
-        last.destination = NavWaypoint(targetX, targetY);
-        if (crossingWall >= 0)
-            last.wall = crossingWall;
-        if (targetSector >= 0)
-            last.targetSector = targetSector;
     }
     return !outRoute.empty();
 }
@@ -288,6 +401,57 @@ std::vector<CausalReceiver> CausalGraph::receiversFor(int channel) const
     for (size_t i = 0; i < receivers.size(); ++i)
         if (receivers[i].channel == channel)
             result.push_back(receivers[i]);
+    return result;
+}
+
+std::vector<CausalReceiver> CausalGraph::receiversReachableFrom(
+    int channel, int maxDepth, bool terminalOnly) const
+{
+    std::vector<CausalReceiver> result;
+    if (channel <= 0 || maxDepth < 0)
+        return result;
+
+    struct PendingChannel
+    {
+        int channel;
+        int depth;
+        PendingChannel(int aChannel, int aDepth)
+            : channel(aChannel), depth(aDepth) {}
+    };
+    std::deque<PendingChannel> pending;
+    std::set<int> visitedChannels;
+    std::set<int64_t> emittedObjects;
+    pending.push_back(PendingChannel(channel, 0));
+    visitedChannels.insert(channel);
+    while (!pending.empty())
+    {
+        const PendingChannel current = pending.front();
+        pending.pop_front();
+        const std::vector<CausalReceiver> direct = receiversFor(current.channel);
+        for (size_t i = 0; i < direct.size(); ++i)
+        {
+            const CausalReceiver &receiver = direct[i];
+            const bool hasOutgoing = receiver.outgoingChannel > 0;
+            const bool canFollow = hasOutgoing && current.depth < maxDepth
+                && !visitedChannels.count(receiver.outgoingChannel);
+            if (canFollow)
+            {
+                visitedChannels.insert(receiver.outgoingChannel);
+                pending.push_back(PendingChannel(receiver.outgoingChannel,
+                                                 current.depth + 1));
+            }
+
+            // A receiver that forwards is an intermediate causal node, not
+            // the final effect. A cycle or depth cap terminates exploration
+            // safely but does not promote that relay into a fake leaf.
+            if (terminalOnly && (hasOutgoing || canFollow))
+                continue;
+            const int64_t identity = (int64_t(receiver.object.kind) << 32)
+                | uint32_t(receiver.object.id);
+            if (emittedObjects.insert(identity).second)
+                result.push_back(receiver);
+        }
+    }
     return result;
 }
 
@@ -580,6 +744,154 @@ static bool crossingFailed(const std::vector<NavEdgeFailure> &failures, int wall
     return false;
 }
 
+std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
+    const std::vector<VisibilityCell> &cells, int mergeRadius,
+    int gainRadius, int approachRadius, int maximumRise)
+{
+    std::map<int, size_t> byId;
+    for (size_t i = 0; i < cells.size(); ++i)
+        byId[cells[i].id] = i;
+
+    std::vector<VisibilityFrontier> candidates;
+    const int64_t gainRadius2 = int64_t(gainRadius) * gainRadius;
+    for (size_t i = 0; i < cells.size(); ++i)
+    {
+        const VisibilityCell &cell = cells[i];
+        if (cell.observed)
+            continue;
+        bool bordersKnownSpace = false;
+        int approachCell = -1;
+        for (size_t n = 0; n < cell.neighbors.size(); ++n)
+        {
+            std::map<int, size_t>::const_iterator neighbor =
+                byId.find(cell.neighbors[n]);
+            if (neighbor != byId.end() && cells[neighbor->second].observed)
+            {
+                bordersKnownSpace = true;
+                if (approachCell < 0 || cells[neighbor->second].reachable)
+                    approachCell = cells[neighbor->second].id;
+                if (cells[neighbor->second].reachable)
+                    break;
+            }
+        }
+        if (!bordersKnownSpace)
+            continue;
+
+        // A raised support or sprite top may be visible without yet having a
+        // traversal edge to the floor below it. The missing prerequisite is
+        // a valid takeoff/inspection pose, not proof that the surface is
+        // impossible. Use the nearest observed reachable physical pose as
+        // the boundary approach; execution can then discover the jump/link.
+        if (!cell.reachable)
+        {
+            if (approachCell >= 0)
+            {
+                const VisibilityCell &neighbor = cells[byId.find(approachCell)->second];
+                if (neighbor.reachable && neighbor.z - cell.z > maximumRise)
+                    approachCell = -1;
+            }
+            const int64_t approachRadius2 = int64_t(approachRadius)
+                * approachRadius;
+            int64_t bestApproachDistance2 = approachRadius2 + 1;
+            for (size_t j = 0; j < cells.size(); ++j)
+            {
+                const VisibilityCell &known = cells[j];
+                if (!known.observed || !known.reachable)
+                    continue;
+                const int rise = known.z - cell.z;
+                if (rise > maximumRise)
+                    continue;
+                const int64_t dx = int64_t(known.x) - cell.x;
+                const int64_t dy = int64_t(known.y) - cell.y;
+                const int64_t distance2 = dx * dx + dy * dy;
+                if (distance2 < bestApproachDistance2)
+                {
+                    bestApproachDistance2 = distance2;
+                    approachCell = known.id;
+                }
+            }
+        }
+
+        VisibilityFrontier frontier;
+        frontier.cell = cell.id;
+        frontier.approachCell = approachCell;
+        frontier.reachable = cell.reachable;
+        for (size_t j = 0; j < cells.size(); ++j)
+        {
+            const VisibilityCell &unknown = cells[j];
+            if (unknown.observed || unknown.area != cell.area)
+                continue;
+            const int64_t dx = int64_t(unknown.x) - cell.x;
+            const int64_t dy = int64_t(unknown.y) - cell.y;
+            if (dx * dx + dy * dy <= gainRadius2)
+                ++frontier.informationGain;
+        }
+        candidates.push_back(frontier);
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [&cells, &byId](const VisibilityFrontier &a,
+                              const VisibilityFrontier &b)
+              {
+                  const VisibilityCell &aCell = cells[byId.find(a.cell)->second];
+                  const VisibilityCell &bCell = cells[byId.find(b.cell)->second];
+                  const std::map<int, size_t>::const_iterator aApproachIndex =
+                      byId.find(a.approachCell);
+                  const std::map<int, size_t>::const_iterator bApproachIndex =
+                      byId.find(b.approachCell);
+                  const int64_t aDistance2 = aApproachIndex == byId.end()
+                      ? INT64_MAX
+                      : (int64_t(aCell.x) - cells[aApproachIndex->second].x)
+                            * (int64_t(aCell.x) - cells[aApproachIndex->second].x)
+                        + (int64_t(aCell.y) - cells[aApproachIndex->second].y)
+                            * (int64_t(aCell.y) - cells[aApproachIndex->second].y);
+                  const int64_t bDistance2 = bApproachIndex == byId.end()
+                      ? INT64_MAX
+                      : (int64_t(bCell.x) - cells[bApproachIndex->second].x)
+                            * (int64_t(bCell.x) - cells[bApproachIndex->second].x)
+                        + (int64_t(bCell.y) - cells[bApproachIndex->second].y)
+                            * (int64_t(bCell.y) - cells[bApproachIndex->second].y);
+                  if (aDistance2 != bDistance2)
+                      return aDistance2 < bDistance2;
+                  if (a.informationGain != b.informationGain)
+                      return a.informationGain > b.informationGain;
+                  return a.cell < b.cell;
+              });
+
+    std::vector<VisibilityFrontier> result;
+    const int64_t mergeRadius2 = int64_t(mergeRadius) * mergeRadius;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        std::map<int, size_t>::const_iterator candidateIndex =
+            byId.find(candidates[i].cell);
+        if (candidateIndex == byId.end())
+            continue;
+        const VisibilityCell &candidate = cells[candidateIndex->second];
+        bool merged = false;
+        for (size_t j = 0; j < result.size(); ++j)
+        {
+            std::map<int, size_t>::const_iterator selectedIndex =
+                byId.find(result[j].cell);
+            if (selectedIndex == byId.end())
+                continue;
+            const VisibilityCell &selected = cells[selectedIndex->second];
+            if (selected.area != candidate.area
+                || result[j].reachable != candidates[i].reachable)
+                continue;
+            const int64_t dx = int64_t(selected.x) - candidate.x;
+            const int64_t dy = int64_t(selected.y) - candidate.y;
+            if (dx * dx + dy * dy <= mergeRadius2)
+            {
+                merged = true;
+                break;
+            }
+        }
+        if (!merged)
+            result.push_back(candidates[i]);
+    }
+    return result;
+}
+
 std::vector<DerivedFrontier> deriveFrontiers(
     const std::vector<int> &visitedSectors, const std::vector<Boundary> &boundaries,
     const std::vector<InvestigateRecord> &investigated,
@@ -681,194 +993,117 @@ int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
     return bestBlockedRemote;
 }
 
-const char *missionReason(MissionKind kind)
+static const char *workReason(const Opportunity &work)
 {
-    switch (kind)
+    switch (work.kind)
     {
-    case kMissionContinue: return "CONTINUE_FORWARD";
-    case kMissionReturnForKey: return "RETURN_FOR_KEY_DOOR";
-    case kMissionReturnToBranch: return "RETURN_TO_UNEXPLORED_BRANCH";
-    case kMissionSolveBlocker: return "SOLVE_BLOCKING_OBSTACLE";
-    case kMissionCollect: return "COLLECT_ON_THE_WAY";
-    case kMissionExpose: return "EXPOSE_UNSEEN_LOCAL_SPACE";
-    default: return "NO_KNOWN_PROGRESS";
+    case kOpportunityFrontier:
+        return work.local ? "CONTINUE_FORWARD" : "RETURN_TO_UNEXPLORED_BRANCH";
+    case kOpportunityPickup:
+        return "COLLECT_ON_THE_WAY";
+    case kOpportunityCoverage:
+        return "EXPOSE_UNSEEN_LOCAL_SPACE";
+    case kOpportunityExit:
+        return "CONTINUE_FORWARD";
+    default:
+        return "SOLVE_BLOCKING_OBSTACLE";
     }
 }
 
-static bool availableNow(const Opportunity &opportunity, int tick, unsigned heldKeys,
-                         unsigned availableEffects)
+static bool availableNow(const Opportunity &opportunity, unsigned heldKeys,
+                          unsigned availableEffects)
 {
     if (opportunity.hops < 0)
-        return false;
-    if (opportunity.dormantUntil > tick)
         return false;
     if (opportunity.requiredKey > 0
         && !(heldKeys & (1u << unsigned(opportunity.requiredKey & 31))))
         return false;
-    if ((opportunity.requiredEffects & availableEffects)
-        != opportunity.requiredEffects)
+    if (!effectRequirementSatisfied(opportunity.requiredEffects,
+                                    availableEffects))
         return false;
     return true;
 }
 
-// Deeper first, then closer.  Depth is the branch the bot is already on.
-static bool deeperThan(const Opportunity &candidate, const Opportunity &best)
+static bool isDiscoveredTask(const Opportunity &opportunity)
 {
-    if (candidate.depth != best.depth)
-        return candidate.depth > best.depth;
-    if (candidate.hops != best.hops)
-        return candidate.hops < best.hops;
-    // Equally deep and equally close, so prefer the one that does not cost
-    // height.  A drop is cheap to take and expensive to undo -- a chain of
-    // individually survivable ones walks the bot down into somewhere it
-    // cannot climb out of -- while a ledge across the way leaves the rest of
-    // the level exactly as reachable as it was.  Without this the tie falls
-    // to whichever was discovered first, which is always the plain doorway.
-    return candidate.descent < best.descent;
+    return opportunity.kind != kOpportunityFrontier
+        && opportunity.kind != kOpportunityCoverage;
 }
 
-Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
-                      unsigned heldKeys, int committedOpportunity,
-                      unsigned availableEffects)
+static int workClass(const Opportunity &opportunity)
 {
-    Mission mission;
-    const Opportunity *keyDoor = 0;
-    const Opportunity *localFrontier = 0;
-    const Opportunity *remoteFrontier = 0;
-    const Opportunity *riskyLocalFrontier = 0;
-    const Opportunity *riskyRemoteFrontier = 0;
-    const Opportunity *localPickup = 0;
-    const Opportunity *blocker = 0;
-    const Opportunity *localBlocker = 0;
-    const Opportunity *coverage = 0;
-    const Opportunity *committed = 0;
+    if (isDiscoveredTask(opportunity) && opportunity.ready)
+        return 0; // executable at the actor's present pose/component
+    if (!isDiscoveredTask(opportunity))
+        return 1; // explore to discover work or a missing route/prerequisite
+    return 2;     // remembered task, deferred on reaching a valid pose
+}
+
+static bool betterWork(const Opportunity &candidate, const Opportunity &best)
+{
+    // First decide what kind of work can actually be executed.  Route risk
+    // is an ordering fact between equivalent tasks, not permission for
+    // generic exploration to suppress a known actionable mechanism.
+    const int candidateClass = workClass(candidate);
+    const int bestClass = workClass(best);
+    if (candidateClass != bestClass)
+        return candidateClass < bestClass;
+
+    // Preserve future options. A known irreversible drop is considered only
+    // after reversible work of the same execution class, but is never erased
+    // from the ledger.
+    const bool candidateSafe = candidate.oneWayRisk <= 0;
+    const bool bestSafe = best.oneWayRisk <= 0;
+    if (candidateSafe != bestSafe)
+        return candidateSafe;
+
+    // Exploration discovers work and the physical poses that make remembered
+    // work executable. A task already at a valid action pose goes first. If
+    // every known task is still pose-blocked, inspect unknown physical space;
+    // once discovery is exhausted, return to the nearest deferred task. The
+    // task itself never disappears from the ledger during that process.
+    // A causal successor breaks ties between work of the same execution
+    // class. It must not make generic coverage outrank a known task whose
+    // action pose is now reachable: the world change exists to enable useful
+    // work, not to impose a separate exploration mission.
+    if (candidate.continuation != best.continuation)
+        return candidate.continuation;
+
+    // Exhaust the current physical component before backtracking through
+    // remembered connectivity to another one, within the same class of work.
+    if (candidate.local != best.local)
+        return candidate.local;
+    if (candidate.hops != best.hops)
+        return candidate.hops < best.hops;
+    if (candidate.descent != best.descent)
+        return candidate.descent < best.descent;
+    return candidate.id < best.id;
+}
+
+WorkSelection selectWork(const std::vector<Opportunity> &ledger,
+                         unsigned heldKeys,
+                         unsigned availableEffects)
+{
+    WorkSelection selection;
+    const Opportunity *best = 0;
 
     for (size_t i = 0; i < ledger.size(); ++i)
     {
         const Opportunity &candidate = ledger[i];
-        if (candidate.id == committedOpportunity && candidate.hops >= 0)
-            committed = &candidate;
-        if (!availableNow(candidate, tick, heldKeys, availableEffects))
+        if (!availableNow(candidate, heldKeys, availableEffects))
             continue;
-        switch (candidate.kind)
-        {
-        case kOpportunityLocked:
-            // Reaching this arm means the key is now held: a remembered
-            // locked door has just become the strongest progression clue
-            // in the level.  Nearest one wins; depth is irrelevant here.
-            if (!keyDoor || candidate.hops < keyDoor->hops)
-                keyDoor = &candidate;
-            break;
-        case kOpportunityFrontier:
-            if (candidate.oneWayRisk > 0)
-            {
-                Opportunity const *&risky = candidate.local
-                    ? riskyLocalFrontier : riskyRemoteFrontier;
-                if (!risky || deeperThan(candidate, *risky))
-                    risky = &candidate;
-            }
-            else if (candidate.local)
-            {
-                if (!localFrontier || deeperThan(candidate, *localFrontier))
-                    localFrontier = &candidate;
-            }
-            else if (!remoteFrontier || deeperThan(candidate, *remoteFrontier))
-                remoteFrontier = &candidate;
-            break;
-        case kOpportunityPickup:
-            if (candidate.local && (!localPickup || candidate.hops < localPickup->hops))
-                localPickup = &candidate;
-            break;
-        case kOpportunityBlocked:
-        case kOpportunityInteraction:
-            if (candidate.local)
-            {
-                if (!localBlocker || deeperThan(candidate, *localBlocker))
-                    localBlocker = &candidate;
-            }
-            else if (!blocker || deeperThan(candidate, *blocker))
-                blocker = &candidate;
-            break;
-        case kOpportunityCoverage:
-            // Nearest unseen space first: a Build sector is not an
-            // observation unit, and the interesting thing is usually just
-            // around the corner of wherever the bot already is.
-            if (!coverage || candidate.hops < coverage->hops
-                || (candidate.hops == coverage->hops && candidate.local && !coverage->local))
-                coverage = &candidate;
-            break;
-        }
+        if (!best || betterWork(candidate, *best))
+            best = &candidate;
     }
 
-    // A held key changes the progression model immediately, and an obvious
-    // threat-free pickup underfoot is free.  Everything else defers to the
-    // standing commitment so the bot keeps its momentum.
-    if (keyDoor)
-    {
-        mission.kind = kMissionReturnForKey;
-        mission.opportunity = keyDoor->id;
-    }
-    else if (localPickup)
-    {
-        mission.kind = kMissionCollect;
-        mission.opportunity = localPickup->id;
-    }
-    else if (committed && committed->dormantUntil <= tick)
-    {
-        mission.kind = committed->kind == kOpportunityFrontier
-            ? (committed->local ? kMissionContinue : kMissionReturnToBranch)
-            : kMissionSolveBlocker;
-        mission.opportunity = committed->id;
-    }
-    else if (localFrontier)
-    {
-        mission.kind = kMissionContinue;
-        mission.opportunity = localFrontier->id;
-    }
-    // An obstacle right here that the bot knows how to solve beats walking
-    // to the far side of the level for a branch it could take afterwards.
-    // Ranking a remote frontier first is what made the bot arrive at a shut
-    // door, give up within seconds, and trek away without ever trying the
-    // mechanism standing in front of it.
-    else if (localBlocker)
-    {
-        mission.kind = kMissionSolveBlocker;
-        mission.opportunity = localBlocker->id;
-    }
-    else if (remoteFrontier)
-    {
-        mission.kind = kMissionReturnToBranch;
-        mission.opportunity = remoteFrontier->id;
-    }
-    else if (blocker)
-    {
-        mission.kind = kMissionSolveBlocker;
-        mission.opportunity = blocker->id;
-    }
-    // Nothing known is actionable.  Before concluding the level is finished,
-    // go and look at the reachable space that has never been observed --
-    // entering a sector is not the same as having seen what is in it.
-    else if (coverage)
-    {
-        mission.kind = kMissionExpose;
-        mission.opportunity = coverage->id;
-    }
-    // A physically possible one-way route is retained as a last-resort
-    // hypothesis.  It follows every currently actionable reversible task so
-    // the bot does not discard its known options merely to enter a smaller
-    // component, but it still wins over declaring the map exhausted.
-    else if (riskyLocalFrontier)
-    {
-        mission.kind = kMissionContinue;
-        mission.opportunity = riskyLocalFrontier->id;
-    }
-    else if (riskyRemoteFrontier)
-    {
-        mission.kind = kMissionReturnToBranch;
-        mission.opportunity = riskyRemoteFrontier->id;
-    }
-    mission.reason = missionReason(mission.kind);
-    return mission;
+    if (!best)
+        return selection;
+    selection.work = best->id;
+    if (best->continuation)
+        selection.reason = "CONSUME_ENABLED_SPACE";
+    else
+        selection.reason = workReason(*best);
+    return selection;
 }
 
 CombatDecision chooseCombatTactic(const CombatSituation &situation)

@@ -3883,6 +3883,13 @@ RORHACK:
         renderDrawMasks();
         gView->pSprite->cstat = bakCstat;
 
+        // Draw from the exact camera passed to Polymost so the diagnostic
+        // projection is merely a view of the bot's authoritative physical
+        // graph, not a second approximation of the player's pose.
+        gLLMapperBot.DrawDebugOverlay(
+            cX, cY, cZ, cA,
+            q16horiz + fix16_from_int(defaultHoriz) + deliriumPitchI);
+
         if (nTilt || bDelirium)
         {
             if (videoGetRenderMode() == REND_CLASSIC)

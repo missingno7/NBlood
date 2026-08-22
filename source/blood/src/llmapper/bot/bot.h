@@ -18,12 +18,16 @@ public:
     void Enable(const char *telemetry, const char *trajectory, const char *demo);
     void ConfigureTimeout(int seconds);
     void ConfigureStallTimeout(int seconds);
+    void ConfigureNavMeshDump(const char *path);
+    bool ConfigureDebugOverlay(const char *setting);
+    void DescribeDebugOverlay(char *buffer, int size) const;
     void SetFast(bool fast);
     void SetVisible(bool visible);
 
     bool Enabled() const { return m_enabled; }
     bool Fast() const { return m_fast; }
     bool Visible() const { return m_visible; }
+    bool DebugOverlayEnabled() const { return m_debugOverlay; }
 
     // Called once after resources and the demo subsystem are initialized.
     void PrepareLaunch();
@@ -49,6 +53,8 @@ public:
     // the game_time field in the telemetry, so a moment seen on screen can
     // be looked up directly in the run log.
     void DrawStatus();
+    void DrawDebugOverlay(int cameraX, int cameraY, int cameraZ,
+                          fix16_t cameraAngle, fix16_t cameraHoriz);
 
 private:
     LLMapperBot(const LLMapperBot &) = delete;
@@ -59,6 +65,7 @@ private:
     bool m_enabled;
     bool m_fast;
     bool m_visible;
+    bool m_debugOverlay;
 };
 
 extern LLMapperBot gLLMapperBot;

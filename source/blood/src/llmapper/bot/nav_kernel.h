@@ -48,6 +48,10 @@ struct SupportRef
         return kind == other.kind && id == other.id;
     }
     bool operator!=(const SupportRef &other) const { return !(*this == other); }
+    bool operator<(const SupportRef &other) const
+    {
+        return kind < other.kind || (kind == other.kind && id < other.id);
+    }
 };
 
 struct NavCondition
@@ -81,7 +85,15 @@ enum EffectCapability
 {
     kEffectNone = 0,
     kEffectExplosive = 1u << 0,
+    kEffectBulletDamage = 1u << 1,
 };
+
+// Damage opportunities contain alternative accepted effect classes. One
+// available producer is sufficient; an empty requirement remains satisfied.
+inline bool effectRequirementSatisfied(unsigned accepted, unsigned available)
+{
+    return accepted == kEffectNone || (accepted & available) != 0;
+}
 
 enum WorldObjectKind
 {
@@ -138,6 +150,29 @@ struct NavWaypoint
     NavWaypoint(int ax, int ay) : x(ax), y(ay) {}
 };
 
+// A sample along an ordinary walk corridor represents a cross-section, not
+// an exact pose.  Report progress only after the player has crossed the
+// sample's forward plane and remains within the corridor around that edge.
+// Special physical transitions deliberately do not use this helper.
+inline bool crossedWaypointCorridor(const NavWaypoint &source,
+                                    const NavWaypoint &waypoint,
+                                    const NavWaypoint &player,
+                                    int corridorHalfWidth)
+{
+    const int64_t axisX = int64_t(waypoint.x) - source.x;
+    const int64_t axisY = int64_t(waypoint.y) - source.y;
+    const int64_t pastX = int64_t(player.x) - waypoint.x;
+    const int64_t pastY = int64_t(player.y) - waypoint.y;
+    const int64_t axisLength2 = axisX * axisX + axisY * axisY;
+    if (axisLength2 <= 0 || pastX * axisX + pastY * axisY < 0)
+        return false;
+    const int64_t cross = pastX * axisY - pastY * axisX;
+    const long double cross2 = static_cast<long double>(cross) * cross;
+    const long double corridor2 =
+        static_cast<long double>(corridorHalfWidth) * corridorHalfWidth;
+    return cross2 <= corridor2 * axisLength2;
+}
+
 struct NavLink
 {
     int target;
@@ -145,11 +180,22 @@ struct NavLink
     int wall;
     NavWaypoint gateway;
     bool hasGateway;
+    NavWaypoint takeoff;
+    bool hasTakeoff;
     NavCondition condition;
     int transition;
+    int airControl;
+    int airFrames;
+    bool hasAirControl;
+    // Revalidate this edge whenever live collision/topology changes.  This
+    // is deliberately independent of wall identity: a physically valid
+    // local transition may cross several tiny Build partitions and therefore
+    // have no single wall which owns it.
+    bool dynamic;
     NavLink()
         : target(-1), mode(kNavWalk), wall(-1), gateway(), hasGateway(false),
-          condition(), transition(-1)
+          takeoff(), hasTakeoff(false), condition(), transition(-1),
+          airControl(0), airFrames(0), hasAirControl(false), dynamic(false)
     {
     }
 };
@@ -169,12 +215,25 @@ struct NavCell
     int z;
     SupportRef support;
     NavWaypoint center;
+    // Distance to the nearest sector boundary at this concrete pose.  It is
+    // a soft execution-safety cost, never a reachability test: narrow routes
+    // remain valid when they are the only physical route.
+    int clearance;
     int walkArea;
     bool inMotion;
+    // True when this pose exists in current engine collision.  A mechanism
+    // may also contribute hypothetical stable endpoint cells for conditional
+    // planning; those must never be mistaken for a presently occupiable
+    // interaction stance.
+    bool live;
+    // The support pose exists only with the crouched player collision hull.
+    // This is occupancy state, not a property of its Build sector.
+    bool crouchOnly;
     std::vector<NavLink> links;
     NavCell()
         : id(-1), sector(-1), gx(0), gy(0), z(0), support(), center(),
-          walkArea(-1), inMotion(false)
+          clearance(INT32_MAX), walkArea(-1), inMotion(false), live(true),
+          crouchOnly(false)
     {
     }
 };
@@ -185,6 +244,8 @@ struct NavRouteStep
     int toCell;
     NavWaypoint gateway;
     bool hasGateway;
+    NavWaypoint takeoff;
+    bool hasTakeoff;
     NavWaypoint destination;
     NavEdgeMode mode;
     int wall;
@@ -196,11 +257,15 @@ struct NavRouteStep
     SupportRef targetSupport;
     NavCondition condition;
     int transition;
+    int airControl;
+    int airFrames;
+    bool hasAirControl;
     NavRouteStep()
-        : fromCell(-1), toCell(-1), gateway(), hasGateway(false), destination(),
-          mode(kNavWalk), wall(-1), sourceSector(-1), targetSector(-1),
+        : fromCell(-1), toCell(-1), gateway(), hasGateway(false), takeoff(),
+          hasTakeoff(false), destination(), mode(kNavWalk), wall(-1),
+          sourceSector(-1), targetSector(-1),
           sourceZ(0), targetZ(0), sourceSupport(), targetSupport(), condition(),
-          transition(-1)
+          transition(-1), airControl(0), airFrames(0), hasAirControl(false)
     {
     }
 };
@@ -262,7 +327,12 @@ struct CausalReceiver
     int channel;
     WorldObjectRef object;
     int mechanism;
-    CausalReceiver() : channel(0), object(), mechanism(-1) {}
+    int outgoingChannel;
+    int command;
+    CausalReceiver()
+        : channel(0), object(), mechanism(-1), outgoingChannel(0), command(0)
+    {
+    }
 };
 
 struct LearnedEffect
@@ -282,6 +352,8 @@ struct CausalGraph
     std::vector<LearnedEffect> effects;
 
     std::vector<CausalReceiver> receiversFor(int channel) const;
+    std::vector<CausalReceiver> receiversReachableFrom(
+        int channel, int maxDepth, bool terminalOnly) const;
     const Actuator *actuatorById(int id) const;
     std::vector<LearnedEffect> effectsEstablishing(int mechanism, int state) const;
 };
@@ -325,16 +397,14 @@ struct NavEdgeFailure
     int fromCell;
     int toCell;
     int wall;
+    // kNavBlocked is the wildcard used when the attempted transition was an
+    // observed boundary and its concrete graph mode may be re-derived.
     NavEdgeMode mode;
     int geometrySignature;
-    // A local trajectory failure is temporary knowledge, not topology.
-    // The owner expires the record so a real route is never deleted for
-    // good by one bad approach.  Zero means "no expiry recorded".
-    int expiresTick;
     int attempts;
     NavEdgeFailure()
         : fromCell(-1), toCell(-1), wall(-1), mode(kNavWalk), geometrySignature(0),
-          expiresTick(0), attempts(0)
+          attempts(0)
     {
     }
 };
@@ -360,6 +430,41 @@ struct DerivedFrontier
     FrontierKind kind;
     std::vector<Boundary> candidates;
     DerivedFrontier() : destination(-1), kind(kFrontierOpen) {}
+};
+
+// Semantic exploration samples deliberately contain no Build-sector
+// identity.  `partition` exists only so representation-invariance tests can
+// prove that changing mapper partitions cannot change the derived work.
+// Physical routing remains in NavCell/NavLink; this projection answers only
+// whether a reachable visibility boundary is worth investigating.
+struct VisibilityCell
+{
+    int id;
+    int x;
+    int y;
+    int z;
+    int area;
+    int partition;
+    bool observed;
+    bool reachable;
+    std::vector<int> neighbors;
+    VisibilityCell()
+        : id(-1), x(0), y(0), z(0), area(-1), partition(-1), observed(false),
+          reachable(false)
+    {
+    }
+};
+
+struct VisibilityFrontier
+{
+    int cell;
+    int approachCell;
+    int informationGain;
+    bool reachable;
+    bool requiresOccupancy;
+    VisibilityFrontier()
+        : cell(-1), approachCell(-1), informationGain(0), reachable(false),
+          requiresOccupancy(false) {}
 };
 
 struct InvestigateRecord
@@ -404,11 +509,11 @@ struct CombatDecision
 // ---------------------------------------------------------------------
 // Exploration model.
 //
-// The bot follows one branch into new territory and remembers what it
-// passes.  Everything unresolved lives in one ledger; most of it stays
-// dormant until circumstances make it useful.  Selection is a single
-// ranked choice with an explicit, reportable reason, so any run can answer
-// "what am I doing and why" from telemetry alone.
+// Everything unresolved lives in one ledger. Reachability, prerequisites
+// and retry backoff only annotate that work; they never delete it. Selection
+// preserves an actionable commitment, consumes physical space enabled by a
+// world-changing action, finishes the current reachable region, then returns
+// to the nearest remembered work. Build sectors are not exploration state.
 // ---------------------------------------------------------------------
 
 enum OpportunityKind
@@ -418,63 +523,185 @@ enum OpportunityKind
     kOpportunityBlocked,    // a continuation with an unresolved obstacle
     kOpportunityInteraction,// an affordance worth using when relevant
     kOpportunityPickup,     // something useful to collect
+    kOpportunityExit,       // a visible reachable level-exit affordance
     kOpportunityCoverage,   // reachable space here that has not been looked at
 };
 
-enum MissionKind
+inline int mixHash(int hash, int value);
+
+enum WorkIdentityKind
 {
-    kMissionNone,
-    kMissionContinue,        // keep pushing the branch the bot is on
-    kMissionReturnForKey,    // a held key just made a known door actionable
-    kMissionReturnToBranch,  // this branch ended; go back to unresolved work
-    kMissionSolveBlocker,    // the way forward is blocked; work the obstacle
-    kMissionCollect,         // pick something up that is on the way
-    kMissionExpose,          // go look at reachable space not yet observed
+    kWorkBoundary,
+    kWorkMechanism,
+    kWorkObject,
+    kWorkPose,
+    kWorkExit,
 };
+
+// Stable semantic identity for one unit of work.  The old implementation
+// encoded the work kind in decimal integer ranges (3,000,000 for boundaries,
+// 5,000,000 for pickups, and so on).  Besides being collision-prone, that
+// made every consumer reverse-engineer the payload from the number.  Keep the
+// identity typed and retain the physical context needed to distinguish two
+// directed uses of the same boundary.
+struct WorkId
+{
+    WorkIdentityKind kind;
+    int subject;
+    int from;
+    int to;
+    bool valid;
+    WorkId()
+        : kind(kWorkBoundary), subject(-1), from(-1), to(-1),
+          valid(false)
+    {
+    }
+    WorkId(WorkIdentityKind aKind, int aSubject, int aFrom = -1, int aTo = -1)
+        : kind(aKind), subject(aSubject), from(aFrom), to(aTo), valid(true)
+    {
+    }
+    bool operator==(const WorkId &other) const
+    {
+        return valid == other.valid
+            && (!valid || (kind == other.kind && subject == other.subject
+                           && from == other.from && to == other.to));
+    }
+    bool operator!=(const WorkId &other) const { return !(*this == other); }
+    bool operator<(const WorkId &other) const
+    {
+        if (valid != other.valid)
+            return valid < other.valid;
+        if (!valid)
+            return false;
+        if (kind != other.kind)
+            return kind < other.kind;
+        if (subject != other.subject)
+            return subject < other.subject;
+        if (from != other.from)
+            return from < other.from;
+        return to < other.to;
+    }
+    explicit operator bool() const { return valid; }
+};
+
+inline int workIdHash(const WorkId &work)
+{
+    if (!work)
+        return -1;
+    int hash = mixHash(int(work.kind), work.subject);
+    hash = mixHash(hash, work.from);
+    return mixHash(hash, work.to);
+}
 
 struct Opportunity
 {
-    int id;
+    WorkId id;
     OpportunityKind kind;
     int sector;        // where the bot must stand to act
     int target;        // sector it leads to, -1 when not a crossing
+    int approach;      // reachable observation/takeoff pose, or -1
     int wall;
     int requiredKey;   // 0 when no key is involved
     unsigned requiredEffects; // abstract effects, independent of their satisfier
-    int depth;         // exploration-tree depth of the discovering node
+    int depth;         // retained for telemetry; never used for selection
     int hops;          // route distance from the bot right now, -1 unreachable
-    int dormantUntil;  // tick before which this stays out of the way
     int descent;       // height given up by taking it, 0 when level or upward
     int oneWayRisk;    // 0 reversible/unknown-safe, >0 known loss of optionality
-    bool local;        // discovered from, and actionable in, the current sector
+    bool local;        // physically in the player's current reachable region
+    bool continuation;// observes space newly enabled by a causal world change
+    bool ready;        // actor currently has a valid pose for the task
+    bool requiresOccupancy; // player must occupy the pose; seeing its surface is insufficient
     Opportunity()
-        : id(-1), kind(kOpportunityFrontier), sector(-1), target(-1), wall(-1),
-          requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1), dormantUntil(0), descent(0), oneWayRisk(0),
-          local(false)
+        : id(), kind(kOpportunityFrontier), sector(-1), target(-1), approach(-1), wall(-1),
+          requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1),
+          descent(0), oneWayRisk(0),
+          local(false), continuation(false), ready(false),
+          requiresOccupancy(false)
     {
     }
 };
 
-struct Mission
+// The policy returns only stable work identity and an explanatory reason.
+// It does not create a second intent hierarchy between WorkItem and Plan.
+struct WorkSelection
 {
-    MissionKind kind;
-    int opportunity;
+    WorkId work;
     const char *reason;
-    Mission() : kind(kMissionNone), opportunity(-1), reason("NO_KNOWN_PROGRESS") {}
+    WorkSelection() : work(), reason("NO_APPLICABLE_ACTION") {}
+    explicit operator bool() const { return bool(work); }
 };
 
 // Rank the ledger and return the single next thing to do.
 //
 // `heldKeys` is a bitmask of key ids 1..15 the bot currently carries.
-// Ordering is deliberately depth-first: a deeper pending frontier is the
-// continuation of the branch already being followed, so preferring depth
-// gives forward momentum, and popping to the next-deepest gives a natural
-// backtrack instead of a random hop across the map.
-Mission selectMission(const std::vector<Opportunity> &ledger, int tick,
-                      unsigned heldKeys, int committedOpportunity,
-                      unsigned availableEffects = ~0u);
+// The selector is intentionally kind-agnostic. It does not have separate
+// priority ladders for keys, exits, pickups, doors, and coverage. Those are
+// all unresolved work with availability and distance annotations.
+WorkSelection selectWork(const std::vector<Opportunity> &ledger,
+                         unsigned heldKeys,
+                         unsigned availableEffects = ~0u);
 
-const char *missionReason(MissionKind kind);
+// Resolve an interaction/object XY onto navigation support without letting
+// an unrelated overlapping layer win merely because its floor Z resembles
+// the target's aim Z.  The exact-support projection is useful when it is
+// genuinely the closer physical endpoint (for example the far end of a
+// bridge); otherwise the currently reachable stance is the causal approach.
+inline int selectTargetNavCell(int areaCell, int64_t areaDistance2,
+                               int strictCell, int64_t strictDistance2,
+                               int64_t stanceDistance2)
+{
+    if (areaCell < 0)
+        return strictCell;
+    if (strictCell < 0)
+        return areaCell;
+    if (areaDistance2 <= stanceDistance2
+        || areaDistance2 <= strictDistance2)
+        return areaCell;
+    return strictCell;
+}
+
+// Physical attempt identity is deliberately separate from causal receiver
+// identity. Several faces around one pushable sector are one actuator, but
+// two actuator sectors remain two things to try even when their TX channels
+// ultimately affect the same receiver. A bare XWALL has no actuator sector,
+// so its own wall record is the stable physical identity.
+inline int wallInteractionAttemptKey(int wallId, int fromSector,
+                                     int targetSector, bool wallPush,
+                                     bool sectorPush, bool sectorPushCurrent,
+                                     int causalReceiver)
+{
+    if (sectorPush && targetSector >= 0)
+        return 4000000 + targetSector + 1;
+    if (sectorPushCurrent && fromSector >= 0)
+        return 4000000 + fromSector + 1;
+    if (wallPush && targetSector >= 0)
+        return 4000000 + targetSector + 1;
+    if (wallPush && wallId >= 0)
+        return 5000000 + wallId + 1;
+    if (causalReceiver >= 0)
+        return 4000000 + causalReceiver + 1;
+    return -1;
+}
+
+inline int wallInteractionActuatorSector(int observedTargetSector,
+                                         int immediateReceiverSector)
+{
+    return observedTargetSector >= 0
+        ? observedTargetSector : immediateReceiverSector;
+}
+
+inline bool shouldReselectInteractionSurface(bool activeObjectiveOwnsMemory,
+                                             bool differentSurface,
+                                             bool candidateIsCloser)
+{
+    return !activeObjectiveOwnsMemory && differentSurface && candidateIsCloser;
+}
+
+inline bool preserveActiveInteractionSurface(bool activeObjectiveOwnsMemory,
+                                             bool differentSurface)
+{
+    return activeObjectiveOwnsMemory && differentSurface;
+}
 
 inline int mixHash(int hash, int value)
 {
@@ -513,7 +740,7 @@ inline bool edgeFailed(const NavEdgeFailure &failure, int fromCell, int toCell,
         return false;
     if (failure.toCell >= 0 && failure.toCell != toCell)
         return false;
-    if (failure.mode != mode)
+    if (failure.mode != kNavBlocked && failure.mode != mode)
         return false;
     return true;
 }
@@ -627,9 +854,28 @@ bool planDynamicRoute(const std::vector<NavCell> &cells, int startCell,
 
 void assignWalkAreas(std::vector<NavCell> &cells);
 
-bool planNavRoute(const std::vector<NavCell> &cells, int startCell, int targetCell,
-                  int targetX, int targetY, int targetSector, int crossingWall,
-                  const std::vector<NavEdgeFailure> &failures, int geometrySignature,
+// Mark the cells physically reachable in the current geometry.  Sector ids
+// are only Build containers: one sector can contain several disconnected
+// support layers, so sector membership alone is not proof that an approach
+// pose can be reached.
+void markReachableNavCells(const std::vector<NavCell> &cells, int startCell,
+                           const std::vector<NavEdgeFailure> &failures,
+                           int geometrySignature,
+                           std::vector<char> &reachable);
+
+// Blood's stacked-room links are explicit engine transitions.  Connect two
+// otherwise independent sector-local layers through the marker-authored XY
+// translation; mere XY overlap never creates an edge.  The upper-to-lower
+// direction is a fall and the reverse direction requires a jump through the
+// lower ceiling.
+int linkTranslatedNavLayers(std::vector<NavCell> &cells, int upperSector,
+                            int lowerSector, int deltaX, int deltaY,
+                            int maximumError, int transitionEdge);
+
+bool planNavRoute(const std::vector<NavCell> &cells, int startCell,
+                  int targetCell,
+                  const std::vector<NavEdgeFailure> &failures,
+                  int geometrySignature,
                   std::vector<NavRouteStep> &outRoute);
 
 std::vector<DerivedFrontier> deriveFrontiers(
@@ -639,6 +885,11 @@ std::vector<DerivedFrontier> deriveFrontiers(
 
 int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
                         int currentSector, const int *hops, int hopCount);
+
+std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
+    const std::vector<VisibilityCell> &cells, int mergeRadius,
+    int gainRadius, int approachRadius = 0x7fffffff,
+    int maximumRise = 0x7fffffff);
 
 const char *navEdgeModeName(NavEdgeMode mode);
 const char *traversalResultName(TraversalResult result);

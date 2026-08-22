@@ -1086,6 +1086,120 @@ char findDroppedLeech(PLAYER *a1, spritetype *a2)
     return 0;
 }
 
+// Side-effect-free counterpart to the pickup handlers below.  Autonomous
+// planning must distinguish an item sprite from a useful pickup *now*: Blood
+// deliberately leaves health, ammo, armour, packs and duplicate weapons in
+// the world when the corresponding resource cannot increase.  Keeping this
+// test beside the authoritative tables prevents the bot from inventing its
+// own tile/type whitelist or walking repeatedly into an item the engine will
+// reject.  A remembered item can naturally become useful again after damage
+// is taken or ammunition is spent.
+char playerCanBenefitFromPickup(PLAYER *pPlayer, spritetype *pItem)
+{
+    if (!pPlayer || !pItem || pItem->statnum != kStatItem)
+        return 0;
+
+    const int type = pItem->type;
+    if (type >= kItemAmmoBase && type < kItemAmmoMax)
+    {
+        const int ammo = gAmmoItemData[type - kItemAmmoBase].type;
+        return ammo >= 0 && ammo < LENGTH(PLAYER::ammoCount)
+            && pPlayer->ammoCount[ammo] < gAmmoInfo[ammo].max;
+    }
+    if (type >= kItemWeaponBase && type < kItemWeaponMax)
+    {
+        const WEAPONITEMDATA &weapon = gWeaponItemData[type - kItemWeaponBase];
+        if (weapon.type < 0 || weapon.type >= LENGTH(PLAYER::hasWeapon))
+            return 0;
+        if (!pPlayer->hasWeapon[weapon.type])
+        {
+            if (type == kItemWeaponLifeLeech
+                && gGameOptions.nGameType >= kGameTypeBloodBath
+                && findDroppedLeech(pPlayer, NULL))
+                return 0;
+            return 1;
+        }
+        if (gGameOptions.nWeaponSettings == 2
+            || gGameOptions.nWeaponSettings == 3)
+        {
+            return weapon.ammoType >= 0
+                && weapon.ammoType < LENGTH(PLAYER::ammoCount)
+                && pPlayer->ammoCount[weapon.ammoType]
+                    < gAmmoInfo[weapon.ammoType].max;
+        }
+        if (!actGetRespawnTime(pItem) || weapon.ammoType < 0
+            || weapon.ammoType >= LENGTH(PLAYER::ammoCount))
+            return 0;
+        return pPlayer->ammoCount[weapon.ammoType]
+            < gAmmoInfo[weapon.ammoType].max;
+    }
+    if (type < kItemBase || type >= kItemMax)
+        return 0;
+
+    const int item = type - kItemBase;
+    if (type >= kItemKeyBase && type < kItemKeyMax)
+    {
+        const int key = type - kItemKeyBase + 1;
+        return key >= 0 && key < LENGTH(PLAYER::hasKey)
+            && !pPlayer->hasKey[key];
+    }
+    switch (type)
+    {
+    case kItemHealthMedPouch:
+    case kItemHealthLifeEssense:
+    case kItemHealthLifeSeed:
+    case kItemHealthRedPotion:
+        return pPlayer->pXSprite && pPlayer->pXSprite->health > 0
+            && pPlayer->pXSprite->health < gPowerUpInfo[item].maxTime;
+
+    case kItemHealthDoctorBag:
+    case kItemJumpBoots:
+    case kItemDivingSuit:
+    case kItemBeastVision:
+    {
+        const int pack = gItemData[item].packSlot;
+        return pack >= 0 && pack < kPackMax
+            && pPlayer->packSlots[pack].curAmount < 100;
+    }
+
+    case kItemArmorBasic:
+    case kItemArmorBody:
+    case kItemArmorFire:
+    case kItemArmorSpirit:
+    case kItemArmorSuper:
+    {
+        const ARMORDATA &armor = armorData[type - kItemArmorBasic];
+        return pPlayer->armor[1] < armor.atc
+            || pPlayer->armor[0] < armor.at4
+            || pPlayer->armor[2] < armor.at14;
+    }
+
+    // Team flag bases are operated in place rather than consumed.  The loose
+    // flags themselves are irrelevant to the single-player bot.
+    case kItemFlagABase:
+    case kItemFlagBBase:
+        return 0;
+    case kItemFlagA:
+    case kItemFlagB:
+        return gGameOptions.nGameType == kGameTypeTeams;
+
+    // Blood explicitly rejects Crystal Ball inventory in single player.
+    case kItemCrystalBall:
+        if (gGameOptions.nGameType == kGameTypeSinglePlayer)
+            return 0;
+        return gItemData[item].packSlot >= 0
+            && gItemData[item].packSlot < kPackMax
+            && pPlayer->packSlots[gItemData[item].packSlot].curAmount < 100;
+
+    default:
+        // Timed powerups do not gain duration while already active.  Walking
+        // over a second copy may consume it for some modes, but it provides
+        // no capability/resource benefit and is not useful exploration work.
+        return item >= 0 && item < kMaxPowerUps
+            && powerupCheck(pPlayer, item) <= 0;
+    }
+}
+
 char PickupItem(PLAYER *pPlayer, spritetype *pItem) {
     
     spritetype *pSprite = pPlayer->pSprite; XSPRITE *pXSprite = pPlayer->pXSprite;

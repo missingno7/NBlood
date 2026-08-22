@@ -37,6 +37,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gamemenu.h"
 #include "globals.h"
 #include "levels.h"
+#include "llmapper/bot/bot.h"
 #include "menu.h"
 #include "messages.h"
 #include "network.h"
@@ -52,6 +53,19 @@ static inline int osdcmd_quit(osdcmdptr_t UNUSED(parm))
     UNREFERENCED_CONST_PARAMETER(parm);
     OSD_ShowDisplay(0);
     QuitGame();
+    return OSDCMD_OK;
+}
+
+static int osdcmd_botdebug(osdcmdptr_t parm)
+{
+    if (parm->numparms > 1)
+        return OSDCMD_SHOWHELP;
+    const char *setting = parm->numparms == 1 ? parm->parms[0] : "toggle";
+    if (!gLLMapperBot.ConfigureDebugOverlay(setting))
+        return OSDCMD_SHOWHELP;
+    char status[256];
+    gLLMapperBot.DescribeDebugOverlay(status, sizeof(status));
+    OSD_Printf("botdebug %s\n", status);
     return OSDCMD_OK;
 }
 
@@ -951,6 +965,11 @@ static int osdcmd_cvar_set_multi(osdcmdptr_t parm)
 int32_t registerosdcommands(void)
 {
     FX_InitCvars();
+
+    OSD_RegisterFunction(
+        "botdebug",
+        "botdebug [on|off|all|default|mesh|poses|walk|jump|crouch|ride|observation|interactions|tasks|route|hypothetical]: toggle the live bot world-model overlay or one layer",
+        osdcmd_botdebug);
 
     char buffer[256];
     static osdcvardata_t cvars_game[] =

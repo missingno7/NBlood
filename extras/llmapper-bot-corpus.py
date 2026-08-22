@@ -24,6 +24,7 @@ from pathlib import Path
 
 RETAIL_MAP = re.compile(r"^E(?:1|2|3|4|6)M\d+\.MAP$", re.IGNORECASE)
 FIELD = re.compile(r"(\w+)=([^\s]+)")
+ROUTE_WANT = re.compile(r"want=\((-?\d+),(-?\d+)\)")
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -212,6 +213,22 @@ def summarize_run(map_name: str, mode: str, telemetry: Path,
     result = summary.get("result", "RUNTIME_ERROR")
     repeat_selections = sum(max(0, count - 1) for count in objectives.values())
     hottest = max(transitions.values()) if transitions else 0
+    route_targets = []
+    for row in rows:
+        if row.get("event") != "nav_route_selected":
+            continue
+        match = ROUTE_WANT.search(str(row.get("detail", "")))
+        if match:
+            route_targets.append((integer(row.get("game_time")), match.groups()))
+    # ABA target changes in a short interval are the characteristic trace of
+    # two planners overwriting one another. Ordinary progress through several
+    # route legs changes targets without immediately returning to the first.
+    route_target_ping_pongs = sum(
+        1 for index in range(2, len(route_targets))
+        if route_targets[index][1] == route_targets[index - 2][1]
+        and route_targets[index][1] != route_targets[index - 1][1]
+        and route_targets[index][0] - route_targets[index - 2][0] <= 5
+    )
 
     return {
         "map": map_name,
@@ -249,12 +266,15 @@ def summarize_run(map_name: str, mode: str, telemetry: Path,
             "repeated_target_selections": repeat_selections,
             "route_plans": counts["nav_route_selected"],
             "route_plan_failures": counts["nav_route_unavailable"],
+            "route_target_ping_pongs": route_target_ping_pongs,
             "portal_plan_failures": counts["local_portal_failed"],
             "escape_route_failures": counts["navigation_escape_failed"],
             "interaction_route_failures": sum(
                 1 for row in rows
                 if row.get("event") == "interaction_unavailable"
                 and "NO_ROUTE_TO_APPROACH" in str(row.get("detail", ""))),
+            "portal_route_retentions": counts["portal_approach_route_retained"],
+            "portal_plan_owner_changes": counts["portal_plan_owner_changed"],
             "edge_rejections": counts["nav_edge_rejected"] + counts["route_step_failed"],
             "objective_timeouts": counts["objective_budget_exhausted"],
             "opportunity_suppressions": counts["opportunity_dormant"],
@@ -294,9 +314,12 @@ def flatten(row: dict) -> dict:
         "interactions_activated": objects["interactions_activated"],
         "route_plans": nav["route_plans"],
         "route_failures": nav["route_plan_failures"],
+        "route_ping_pongs": nav["route_target_ping_pongs"],
         "portal_failures": nav["portal_plan_failures"],
         "escape_failures": nav["escape_route_failures"],
         "interaction_route_failures": nav["interaction_route_failures"],
+        "portal_route_retentions": nav["portal_route_retentions"],
+        "portal_plan_owner_changes": nav["portal_plan_owner_changes"],
         "repeat_selections": nav["repeated_target_selections"],
         "loop_breaks": nav["loop_breaks"],
         "topology_rebuilds": nav["topology_rebuilds"],
@@ -440,6 +463,7 @@ def run_command(args) -> int:
             run_dir = output / "runs" / mode / level.stem.upper()
             telemetry = run_dir / "telemetry.ndjson"
             trajectory = run_dir / "trajectory.ndjson"
+            navmesh = run_dir / "navmesh.ndjson"
             metrics = run_dir / "metrics.json"
             if args.resume and metrics.exists():
                 runs.append(json.loads(metrics.read_text(encoding="utf-8")))
@@ -450,6 +474,8 @@ def run_command(args) -> int:
                        "-bot_timeout", str(args.timeout), "-bot_stall", str(args.stall),
                        "-bot_telemetry", str(telemetry),
                        "-bot_trajectory", str(trajectory)]
+            if args.navmesh:
+                command.extend(["-bot_navmesh", str(navmesh)])
             if mode == "nodudes":
                 command.extend(["-nodudes", "1"])
             print("%-7s %-8s" % (level.stem.upper(), mode), flush=True)
@@ -565,6 +591,8 @@ def main() -> int:
     run.add_argument("--stall", type=int, default=300)
     run.add_argument("--wall-timeout", type=int, default=30,
                      help="per-run wall-clock safety cap; 0 disables it")
+    run.add_argument("--navmesh", action="store_true",
+                     help="capture physical navigation graph snapshots")
     run.add_argument("--resume", action="store_true")
     run.set_defaults(function=run_command)
     summarize = commands.add_parser("summarize")
