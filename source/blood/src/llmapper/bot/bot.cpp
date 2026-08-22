@@ -2447,6 +2447,11 @@ struct LLMapperBot::Impl
     std::map<int, RegionPoseCache> regionPoseCaches;
     mutable std::map<std::pair<int, int>, int> jumpReachCache;
     std::vector<NavCell> navCells;
+    // Ground-traversal edges in the currently committed route. A moving
+    // actor may temporarily occupy one of them, but must not rewrite that
+    // physical transaction into a different world topology.
+    std::set<std::pair<PhysicalPoseKey, PhysicalPoseKey> >
+        committedGroundEdges;
     int navTopologySignature = 0;
     int navPoseSignatureValue = 0;
     int navDynamicSignatureValue = 0;
@@ -2497,7 +2502,13 @@ struct LLMapperBot::Impl
     // state: if a pose exists in navCells, it is seen.
     std::set<PhysicalPoseKey> publishedPoses;
     std::set<PhysicalPoseKey> occupiedFrontierPoses;
+    // Concrete observed poses at the boundary of the currently visible
+    // free-space chunk. The adapter may use engine containers to discover
+    // them, but the planner receives only these stable XYZ/support handles.
+    std::set<PhysicalPoseKey> visibleChunkFrontierPoses;
+    int visibleChunkFrontierRevision = 0;
     int visibilityFrontierTopologyRevision = -1;
+    int visibilityFrontierChunkRevision = -1;
     size_t visibilityFrontierObservedCount = size_t(-1);
     size_t visibilityFrontierFailureCount = size_t(-1);
     size_t visibilityFrontierVisitedSupportCount = size_t(-1);
@@ -8838,6 +8849,8 @@ struct LLMapperBot::Impl
                 reachableSignature = llmapper::mixHash(
                     reachableSignature, int(i));
         if (visibilityFrontierTopologyRevision == navTopologyRevision
+            && visibilityFrontierChunkRevision
+                == visibleChunkFrontierRevision
             && visibilityFrontierFailureCount == navEdgeFailures.size()
             && visibilityFrontierVisitedSupportCount
                 == occupiedFrontierPoses.size()
@@ -8847,11 +8860,13 @@ struct LLMapperBot::Impl
         const int64_t mergeRadius2 = int64_t(768) * 768;
         for (const NavCell &cell : navCells)
         {
-            if (!cell.informationFrontier
+            const PhysicalPoseKey pose = physicalPoseKey(cell);
+            const bool informationBoundary = cell.informationFrontier
+                || visibleChunkFrontierPoses.count(pose) != 0;
+            if (!informationBoundary
                 || !inRange(cell.id, 0, int(reachable.size()))
                 || !reachable[size_t(cell.id)])
                 continue;
-            const PhysicalPoseKey pose = physicalPoseKey(cell);
             if (occupiedFrontierPoses.count(pose))
                 continue;
             const bool sameSpatialFrontier = std::any_of(
@@ -8878,6 +8893,7 @@ struct LLMapperBot::Impl
             result.push_back(frontier);
         }
         visibilityFrontierTopologyRevision = navTopologyRevision;
+        visibilityFrontierChunkRevision = visibleChunkFrontierRevision;
         visibilityFrontierObservedCount = navCells.size();
         visibilityFrontierFailureCount = navEdgeFailures.size();
         visibilityFrontierVisitedSupportCount = occupiedFrontierPoses.size();
@@ -10090,6 +10106,14 @@ struct LLMapperBot::Impl
                 if (occupied)
                 {
                     occupiedFrontierPoses.insert(handle);
+                    // Consuming an information boundary is semantic
+                    // progress even when the newly visible pose publication
+                    // lands on the following observation tick. Without this
+                    // handoff the global watchdog can terminate a long,
+                    // valid traversal on the exact frame it reaches the
+                    // requested viewpoint.
+                    progressMonitor.semanticProgressTick = observation.tick;
+                    progressMonitor.explorationSnapshotEmitted = false;
                     const auto continuation =
                         causalContinuationCells.find(handle);
                     if (continuation != causalContinuationCells.end())
@@ -10571,8 +10595,11 @@ struct LLMapperBot::Impl
             {
                 if (gMe && gMe->pSprite && nSprite == gMe->pSprite->index)
                     continue;
-                if (!(sprite[nSprite].cstat & CSTAT_SPRITE_BLOCK)
-                    || sprite[nSprite].statnum == kStatDude)
+                // Actors occupy free space transiently; their coordinates
+                // are not part of the static support/pose identity. They
+                // remain present in live movement probes and execution.
+                if (sprite[nSprite].statnum == kStatDude
+                    || !(sprite[nSprite].cstat & CSTAT_SPRITE_BLOCK))
                     continue;
                 signature = llmapper::mixHash(signature, nSprite);
                 signature = llmapper::mixHash(signature, sprite[nSprite].x);
@@ -12253,8 +12280,8 @@ struct LLMapperBot::Impl
         for (int nSprite = headspritesect[sectorId]; nSprite >= 0;
              nSprite = nextspritesect[nSprite])
         {
-            if (!(sprite[nSprite].cstat & CSTAT_SPRITE_BLOCK)
-                || sprite[nSprite].statnum == kStatDude)
+            if (sprite[nSprite].statnum == kStatDude
+                || !(sprite[nSprite].cstat & CSTAT_SPRITE_BLOCK))
                 continue;
             signature = llmapper::mixHash(signature, sprite[nSprite].x);
             signature = llmapper::mixHash(signature, sprite[nSprite].y);
@@ -12316,6 +12343,7 @@ struct LLMapperBot::Impl
         // chain of pillar/support layers without entering the damaging space
         // below, while an occlusion stops the scan naturally. Region IDs are
         // adapter traversal keys only; the published model contains poses.
+        std::set<PhysicalPoseKey> nextChunkFrontiers;
         std::deque<int> pending(regions.begin(), regions.end());
         std::set<int> tested = regions;
         while (!pending.empty())
@@ -12339,10 +12367,54 @@ struct LLMapperBot::Impl
                 const auto cache = regionPoseCaches.find(neighbour);
                 if (cache == regionPoseCaches.end()
                     || cache->second.poses.empty())
+                {
+                    // The adjacent container contributes no currently
+                    // visible occupiable pose. Preserve the nearest concrete
+                    // pose on the observed side as the boundary of this
+                    // visible chunk. The planner never receives wall or
+                    // container identity; it only sees an XYZ/support pose
+                    // whose occupancy may extend passive perception.
+                    const auto sourceCache = regionPoseCaches.find(current);
+                    if (sourceCache == regionPoseCaches.end()
+                        || !inRange(wall[wallId].point2, 0, numwalls))
+                        continue;
+                    const walltype &boundaryStart = wall[wallId];
+                    const walltype &boundaryEnd =
+                        wall[wall[wallId].point2];
+                    const SupportPose *nearest = nullptr;
+                    int64_t nearestDistance = INT64_MAX;
+                    for (const SupportPose &pose : sourceCache->second.poses)
+                    {
+                        if (!pose.live)
+                            continue;
+                        const int64_t boundaryDistance = dist2ToSegment(
+                            pose.x, pose.y,
+                            boundaryStart.x, boundaryStart.y,
+                            boundaryEnd.x, boundaryEnd.y);
+                        if (boundaryDistance >= nearestDistance)
+                            continue;
+                        nearestDistance = boundaryDistance;
+                        nearest = &pose;
+                    }
+                    const int maximumBoundaryDistance =
+                        std::max(1536, kActionApproachRange);
+                    if (nearest && nearestDistance
+                            <= int64_t(maximumBoundaryDistance)
+                                * maximumBoundaryDistance)
+                        nextChunkFrontiers.insert(std::make_tuple(
+                            current, nearest->x, nearest->y, nearest->z,
+                            int(supportKind(nearest->support)),
+                            supportIndex(nearest->support)));
                     continue;
+                }
                 regions.insert(neighbour);
                 pending.push_back(neighbour);
             }
+        }
+        if (nextChunkFrontiers != visibleChunkFrontierPoses)
+        {
+            visibleChunkFrontierPoses.swap(nextChunkFrontiers);
+            ++visibleChunkFrontierRevision;
         }
     }
 
@@ -12520,9 +12592,14 @@ struct LLMapperBot::Impl
                         a.center.x, a.center.y, originZ, a.region,
                         b.center.x, b.center.y, b.region,
                         std::max(64, playerClipRadius()), crouched);
-                    if (!physical.reachable)
+                    const bool transientActorOcclusion = !physical.reachable
+                        && inRange(physical.sprite, 0, kMaxSprites)
+                        && sprite[physical.sprite].statnum == kStatDude
+                        && committedGroundEdges.count(std::make_pair(
+                            physicalPoseKey(a), physicalPoseKey(b))) != 0;
+                    if (!physical.reachable && !transientActorOcclusion)
                         return false;
-                    if (!lineRetainsSupport(
+                    if (!transientActorOcclusion && !lineRetainsSupport(
                             a.center.x, a.center.y, a.region, a.z, a.support,
                             b.center.x, b.center.y, b.z))
                         return false;
@@ -13601,6 +13678,18 @@ struct LLMapperBot::Impl
         navRouteIndex = 0;
         navRouteSignature = signature;
         navRouteTopologyRevision = navTopologyRevision;
+        committedGroundEdges.clear();
+        for (const NavRouteStep &step : navRoute)
+        {
+            if ((step.mode != kNavWalk && step.mode != kNavStep
+                 && step.mode != kNavCrouch)
+                || !inRange(step.fromCell, 0, int(navCells.size()))
+                || !inRange(step.toCell, 0, int(navCells.size())))
+                continue;
+            committedGroundEdges.insert(std::make_pair(
+                physicalPoseKey(navCells[size_t(step.fromCell)]),
+                physicalPoseKey(navCells[size_t(step.toCell)])));
+        }
         char routeDetail[256];
         snprintf(routeDetail, sizeof(routeDetail),
                  "steps=%u start_cell=%d goal_cell=%d goal_pose=(%d,%d,z%d,s%d) player=(%d,%d,s%d)",
@@ -13802,6 +13891,7 @@ struct LLMapperBot::Impl
         navigationDetourWall = -1;
         navigationDetourDepth = 0;
         navigationRecentWalls.clear();
+        committedGroundEdges.clear();
         navRoute.clear();
         navRouteIndex = 0;
         navRouteSignature = 0;
