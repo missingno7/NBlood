@@ -471,11 +471,9 @@ def run_command(args) -> int:
             run_dir.mkdir(parents=True, exist_ok=True)
             command = [str(exe), "-usecwd", "-nosetup", "-noautoload",
                        "-s", str(args.difficulty), "-map", str(level), "-bot",
-                       "-bot_timeout", str(args.timeout), "-bot_stall", str(args.stall),
+                       "-bot_timeout", str(args.timeout),
                        "-bot_telemetry", str(telemetry),
                        "-bot_trajectory", str(trajectory)]
-            if args.navmesh:
-                command.extend(["-bot_navmesh", str(navmesh)])
             if mode == "nodudes":
                 command.extend(["-nodudes", "1"])
             print("%-7s %-8s" % (level.stem.upper(), mode), flush=True)

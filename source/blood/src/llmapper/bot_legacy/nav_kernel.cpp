@@ -490,8 +490,6 @@ void assignWalkAreas(std::vector<NavCell> &cells)
 }
 
 void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
-                           const AttemptLedger &attempts,
-                           int geometrySignature,
                            std::vector<char> &reachable)
 {
     reachable.assign(cells.size(), 0);
@@ -512,11 +510,9 @@ void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
             // changed.  They are conserved by the causal planner, but are not
             // physically reachable in the world state being ranked now.
             if (!traversableMode(link.mode) || link.condition.enabled
-                || link.target < 0 || link.target >= int(cells.size())
-                || !cells[size_t(link.target)].exists
-                || reachable[size_t(link.target)]
-                || traversalBlocked(attempts, current, link.target, link.boundary,
-                                    link.mode, geometrySignature))
+                 || link.target < 0 || link.target >= int(cells.size())
+                 || !cells[size_t(link.target)].exists
+                 || reachable[size_t(link.target)])
                 continue;
             reachable[size_t(link.target)] = 1;
             queue.push_back(link.target);
@@ -550,10 +546,8 @@ static bool conditionSatisfied(const NavCondition &condition,
 }
 
 bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
-                  PoseId targetCell,
-                  const AttemptLedger &attempts,
-                  int geometrySignature,
-                  std::vector<NavRouteStep> &outRoute)
+                   PoseId targetCell,
+                   std::vector<NavRouteStep> &outRoute)
 {
     outRoute.clear();
     if (startCell < 0 || startCell >= int(cells.size()))
@@ -614,9 +608,6 @@ bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
                 continue;
             if (link.target < 0 || link.target >= int(cells.size())
                 || !cells[size_t(link.target)].exists)
-                continue;
-            if (traversalBlocked(attempts, current, link.target, link.boundary,
-                                 link.mode, geometrySignature))
                 continue;
             // A graph link is a concrete movement between two poses.  Count
             // its physical span, not merely one abstract hop: otherwise two
@@ -1003,7 +994,17 @@ static const char *workReason(const Opportunity &work)
 static bool availableNow(const Opportunity &opportunity, unsigned heldKeys,
                           unsigned availableEffects)
 {
-    if (opportunity.hops < 0)
+    // Missing positive route evidence is not a negative world fact, but it
+    // is not an executable operation either.  Topology candidates remain in
+    // the world ledger as UNKNOWN while the physical layer refines them.  A
+    // planner may own one only after that refinement has produced a concrete
+    // engine-backed execution domain.
+    if (opportunity.spatial == Opportunity::kSpatialCurrentlyBlocked)
+        return false;
+    if (opportunity.spatial == Opportunity::kSpatialUnknown)
+        return false;
+    if (opportunity.spatial == Opportunity::kSpatialProvenPassable
+        && opportunity.hops < 0)
         return false;
     if (opportunity.requiredKey > 0
         && !(heldKeys & (1u << unsigned(opportunity.requiredKey & 31))))

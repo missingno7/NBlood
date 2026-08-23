@@ -151,7 +151,6 @@
   <ItemGroup>
     <ClCompile Include="..\..\source\blood\rsrc\eduke32_icon.c" />
     <ClCompile Include="..\..\source\blood\src\llmapper\bot\bot.cpp" />
-    <ClCompile Include="..\..\source\blood\src\llmapper\bot\nav_kernel.cpp" />
     <ClCompile Include="..\..\source\blood\src\actor.cpp" />
     <ClCompile Include="..\..\source\blood\src\ai.cpp" />
     <ClCompile Include="..\..\source\blood\src\aibat.cpp" />

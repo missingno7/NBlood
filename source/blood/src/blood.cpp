@@ -1271,15 +1271,12 @@ SWITCH switches[] = {
     { "s", 44, 1 },
     { "bot", 45, 0 },
     { "bot_timeout", 46, 1 },
-    { "bot_stall", 47, 1 },
     { "bot_telemetry", 48, 1 },
     { "bot_trajectory", 49, 1 },
     { "bot_demo", 50, 1 },
     { "bot_realtime", 51, 0 },
     { "bot_visible", 52, 0 },
     { "playback_speed", 53, 1 },
-    { "bot_navmesh", 54, 1 },
-    { "bot_debug", 55, 0 },
     { NULL, 0, 0 }
 };
 
@@ -1311,14 +1308,11 @@ void PrintHelp(void)
         "-s\t\tStart game on difficulty level; Range:0..4; Default:2;\n\n"
         "-bot\t\tRun the in-process autonomous playtest bot\n"
         "-bot_timeout [seconds]\tSimulated game-time limit\n"
-        "-bot_stall [seconds]\tProgress watchdog limit\n"
         "-bot_telemetry [file]\tNDJSON event output\n"
         "-bot_trajectory [file]\tNDJSON player trajectory output\n"
         "-bot_demo [file.dem]\tNormal NBlood demo output\n"
         "-bot_realtime\tDisable accelerated bot timing\n"
         "-bot_visible\tShow the bot in the normal game window\n"
-        "-bot_navmesh [file]\tNDJSON physical navigation graph snapshots\n"
-        "-bot_debug\tObserve manual play and draw the bot model live\n"
         "-playback_speed [1..8]\tDemo playback speed multiplier\n\n"
         "-server [players]\tStart a multiplayer server\n"
 #ifdef STARTUP_SETUP_WINDOW
@@ -1621,11 +1615,6 @@ void ParseOptions(void)
                 ThrowError("Missing argument");
             gLLMapperBot.ConfigureTimeout(atoi(OptArgv[0]));
             break;
-        case 47:
-            if (OptArgc < 1)
-                ThrowError("Missing argument");
-            gLLMapperBot.ConfigureStallTimeout(atoi(OptArgv[0]));
-            break;
         case 48:
             if (OptArgc < 1)
                 ThrowError("Missing argument");
@@ -1651,14 +1640,6 @@ void ParseOptions(void)
             if (OptArgc < 1)
                 ThrowError("Missing argument");
             gDemo.SetPlaybackSpeed(atoi(OptArgv[0]));
-            break;
-        case 54:
-            if (OptArgc < 1)
-                ThrowError("Missing argument");
-            gLLMapperBot.ConfigureNavMeshDump(OptArgv[0]);
-            break;
-        case 55:
-            gLLMapperBot.ConfigureDebugOverlay("on");
             break;
         }
     }

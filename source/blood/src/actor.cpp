@@ -6431,14 +6431,6 @@ void actFireVector(spritetype *pShooter, int a2, int a3, int a4, int a5, int a6,
         hit = VectorScan(pShooter, a2, a3, a4, a5, a6, nRange, 1);
         shooterPos = pShooter->xyz;
     }
-    if (gLLMapperBot.Enabled() && IsPlayerSprite(pShooter)
-        && gMe && pShooter == gMe->pSprite)
-    {
-        gLLMapperBot.OnVectorResolved(hit, gHitInfo.hitsect,
-                                      gHitInfo.hitwall, gHitInfo.hitsprite,
-                                      gHitInfo.hitx, gHitInfo.hity,
-                                      gHitInfo.hitz);
-    }
     if (hit == 3)
     {
         int nSprite = gHitInfo.hitsprite;

@@ -327,6 +327,18 @@ struct EngineBoundaryObservation
     bool blockedBySprite = false;
     int blockerSprite = -1;
     TraversalCapability capability = kTraversalUnknown;
+    // One concrete engine-certified crossing retained with this observation.
+    // It is positive evidence only; witnessValid == false means UNKNOWN.
+    bool witnessValid = false;
+    int witnessSourceX = 0;
+    int witnessSourceY = 0;
+    int witnessSourceZ = 0;
+    SupportRef witnessSourceSupport;
+    int witnessTargetX = 0;
+    int witnessTargetY = 0;
+    int witnessTargetZ = 0;
+    SupportRef witnessTargetSupport;
+    bool witnessCrouched = false;
     int wallState = -1;
     int wallBusy = 0;
     int sectorState = -1;
@@ -460,6 +472,24 @@ struct MovementProbe
     int sector = -1;
 };
 
+// One concrete engine-accepted way through a Build boundary span.  The span
+// itself remains lossless topology even when this list is empty: witnesses
+// cache positive evidence only.
+struct PortalTraversalWitness
+{
+    int sourceX = 0;
+    int sourceY = 0;
+    int sourceZ = 0;
+    int sourceSector = -1;
+    SupportRef sourceSupport;
+    int targetX = 0;
+    int targetY = 0;
+    int targetZ = 0;
+    int targetSector = -1;
+    SupportRef targetSupport;
+    bool crouched = false;
+};
+
 
 
 
@@ -497,6 +527,8 @@ struct PlayerCollisionCycle
     std::vector<PlayerCollisionShape> frames;
     int ticksPerFrame = 0;
     bool looping = false;
+    int currentFrame = -1;
+    int ticksUntilAdvance = -1;
 };
 
 struct PlayerGroundObservation
@@ -546,6 +578,7 @@ struct TntThrowSolution
 };
 
 extern PlayerCollisionShape gObservedCrouchShape;
+extern PlayerCollisionShape gObservedStandingShape;
 struct StandableSurface
 {
     SupportRef support;
@@ -631,6 +664,12 @@ MovementProbe probeMovement(
     int startX, int startY, int startZ, int startSector,
     int targetX, int targetY, int targetSector,
     int tolerance, bool crouched = false);
+bool engineLineKeepsSupport(
+    int startX, int startY, int startSector, int startSupportZ,
+    const SupportRef &startSupport, int targetX, int targetY,
+    bool crouched = false);
+std::vector<PortalTraversalWitness> enginePortalTraversalWitnesses(
+    const EngineBoundaryObservation &portal);
 int vectorLookAngleForTarget(int eyeZ, int targetZ, int horizontal);
 // Ask Blood whether a player standing on this exact support pose can deliver
 // the selected Vector to the semantic target.  Unlike cansee(), this applies
@@ -671,6 +710,7 @@ void setSpriteInteractionGeometry(InteractionCandidate &interaction, int spriteI
 const char *itemCategory(int type);
 unsigned acceptedDamageEffects(const spritetype &record);
 Observation observeWorld();
+std::vector<EngineBoundaryObservation> engineTopologyBoundaries(int sectorId);
 // Ask Blood's real Use acquisition which affordances are executable from the
 // current physical pose while the actor merely turns in place. This is a lazy
 // execution-domain query, not a second interaction store.

@@ -11,6 +11,7 @@ int gNextAffordanceId;
 int gObservedCrouchClearance;
 int gStandingClearance;
 PlayerCollisionShape gObservedCrouchShape;
+PlayerCollisionShape gObservedStandingShape;
 
  SupportRef engineSupport(EngineHandleKind kind, int index)
 {
@@ -293,6 +294,12 @@ PlayerCollisionCycle playerMovingCollisionCycle()
 
     result.ticksPerFrame = std::max(1, int(sequence->ticksPerFrame));
     result.looping = (sequence->flags & 1) != 0;
+    SEQINST *instance = GetInstance(3, gMe->pSprite->extra);
+    if (instance && instance->isPlaying && instance->nSeq == sequenceId)
+    {
+        result.currentFrame = instance->frameIndex;
+        result.ticksUntilAdvance = instance->timeCount;
+    }
     const int scale = gMe->pXSprite->scale;
     int sampleYRepeat = gMe->pSprite->yrepeat;
     const int sampleZ = gMe->pSprite->z;
@@ -322,6 +329,15 @@ PlayerCollisionCycle playerMovingCollisionCycle()
     }
     gSysRes.Unlock(resource);
     return result;
+}
+
+static PlayerCollisionShape collisionShapeForPosture(bool crouched)
+{
+    if (crouched && gObservedCrouchShape.known)
+        return gObservedCrouchShape;
+    if (!crouched && gObservedStandingShape.known)
+        return gObservedStandingShape;
+    return livePlayerCollisionShape();
 }
 
 static llmapper::capability::GroundContactMotion groundContactMotion(
@@ -367,8 +383,21 @@ int engineClipMoveIgnoringActor(
         // live actor equally absent: leaving the hitscan-blocking bit set can
         // make the copied future body collide with its present-world self.
         actor->cstat &= ~257;
-    const int hit = clipmove(&position, &sectorNumber, xvect, yvect, radius,
-                             ceilingDistance, floorDistance, clipMask);
+    // Blood's actors do not call Build's current clipmove() directly.
+    // MoveDude calls the Blood compatibility wrapper, which delegates to
+    // clipmove_old(). Hypothetical movement must use that exact path or it
+    // can certify an arc which the live player collides out of.
+    int x = position.x;
+    int y = position.y;
+    int z = position.z;
+    int sectorId = sectorNumber;
+    const int hit = ClipMove(
+        &x, &y, &z, &sectorId, xvect >> 14, yvect >> 14, radius,
+        ceilingDistance, floorDistance, clipMask);
+    position.x = x;
+    position.y = y;
+    position.z = z;
+    sectorNumber = int16_t(sectorId);
     if (actor)
         actor->cstat = int16_t(savedCstat);
     return hit;
@@ -542,9 +571,7 @@ MovementProbe probeMovement(
     const int32_t yvect = int32_t(std::max<int64_t>(
         INT32_MIN + 1, std::min<int64_t>(
             INT32_MAX, dy * (int64_t(1) << 14))));
-    const PlayerCollisionShape liveShape = livePlayerCollisionShape();
-    const PlayerCollisionShape &shape = crouched && gObservedCrouchShape.known
-        ? gObservedCrouchShape : liveShape;
+    const PlayerCollisionShape shape = collisionShapeForPosture(crouched);
     const int radius = shape.known ? shape.radius : 128;
     int ceilingDistance = 0;
     int floorDistance = 0;
@@ -586,6 +613,248 @@ MovementProbe probeMovement(
     }
     result.reachable = equivalentTargetPose
         && remaining <= tolerance * tolerance;
+    return result;
+}
+
+bool engineLineKeepsSupport(
+    int startX, int startY, int startSector, int startSupportZ,
+    const SupportRef &startSupport, int targetX, int targetY,
+    bool crouched)
+{
+    if (!gMe || !gMe->pSprite || !inRange(startSector, 0, numsectors))
+        return false;
+    const int dx = targetX - startX;
+    const int dy = targetY - startY;
+    const int length = int(std::sqrt(double(int64_t(dx) * dx
+                                            + int64_t(dy) * dy)));
+    const PlayerCollisionShape shape = collisionShapeForPosture(crouched);
+    const int radius = shape.known ? shape.radius
+        : (gMe->pSprite->clipdist << 2);
+    const int samples = std::max(1, (length + radius - 1) / radius);
+    int16_t sampleSector = int16_t(startSector);
+    int supportZ = startSupportZ;
+    if (supportKind(startSupport) == kSupportSpriteFloor
+        && inRange(supportIndex(startSupport), 0, kMaxSprites)
+        && (xvel[supportIndex(startSupport)] != 0
+            || yvel[supportIndex(startSupport)] != 0
+            || zvel[supportIndex(startSupport)] != 0))
+        return false;
+    int previousX = startX;
+    int previousY = startY;
+    const int footOffset = shape.known ? shape.footOffset
+        : llmapper::capability::playerFootOffset();
+    for (int step = 1; step <= samples; ++step)
+    {
+        const int x = startX + int(int64_t(dx) * step / samples);
+        const int y = startY + int(int64_t(dy) * step / samples);
+        int16_t targetSector = sampleSector;
+        updatesectorz(x, y, supportZ - footOffset, &targetSector);
+        if (!inRange(int(targetSector), 0, numsectors))
+            return false;
+        const MovementProbe movement = probeMovement(
+            previousX, previousY, supportZ - footOffset,
+            sampleSector, x, y, targetSector,
+            std::max(1, radius / 4), crouched);
+        if (!movement.reachable)
+            return false;
+        sampleSector = int16_t(movement.sector);
+        int ceilingZ = 0, ceilingHit = 0, floorZ = 0, floorHit = 0;
+        engineGetZRangeIgnoringActor(
+            x, y, supportZ - 1, sampleSector,
+            &ceilingZ, &ceilingHit, &floorZ, &floorHit,
+            radius + 16, CLIPMASK0,
+            PARALLAXCLIP_CEILING | PARALLAXCLIP_FLOOR);
+        const int requiredClearance = crouched
+            ? playerCrouchClearance() : playerStandingClearance();
+        if (floorZ - ceilingZ < requiredClearance
+            || std::abs(floorZ - supportZ)
+                > llmapper::capability::playerStepHeight())
+            return false;
+        if ((floorHit & 0xc000) == 0xc000)
+        {
+            const int nextSupportId = floorHit & 0x3fff;
+            if (inRange(nextSupportId, 0, kMaxSprites)
+                && (xvel[nextSupportId] != 0
+                    || yvel[nextSupportId] != 0
+                    || zvel[nextSupportId] != 0))
+                return false;
+        }
+        supportZ = floorZ;
+        previousX = x;
+        previousY = y;
+    }
+    return true;
+}
+
+std::vector<PortalTraversalWitness> enginePortalTraversalWitnesses(
+    const EngineBoundaryObservation &portal)
+{
+    std::vector<PortalTraversalWitness> result;
+    if (!gMe || !gMe->pSprite
+        || !inRange(portal.from, 0, numsectors)
+        || !inRange(portal.to, 0, numsectors))
+        return result;
+
+    const int dx = portal.x2 - portal.x1;
+    const int dy = portal.y2 - portal.y1;
+    const int length = int(std::sqrt(double(int64_t(dx) * dx
+                                            + int64_t(dy) * dy)));
+    const PlayerCollisionShape standingShape = collisionShapeForPosture(false);
+    const int radius = standingShape.known ? standingShape.radius
+        : (gMe->pSprite->clipdist << 2);
+    if (length < radius * 2)
+        return result;
+
+    // A boundary is an interval. Probe actor-centre bands across the whole
+    // usable interval, at spacing derived from the collision hull rather
+    // than from a map/grid resolution. The order starts at the middle for a
+    // fast common-case witness and expands toward both ends. Failure of every
+    // probe remains UNKNOWN; this routine returns positive evidence only.
+    const int first = radius;
+    const int last = length - radius;
+    const int middle = (first + last) / 2;
+    // Resolve which wall-normal points into the source region using a point
+    // well away from the shared partition. Near the wall, thin/overlapping
+    // Build containers can report both sides as inside; accepting the first
+    // such answer swaps source and target and makes an executor walk back to
+    // the approach pose. Once established, direction is independent of the
+    // shallow inset refinement needed by thin transit regions.
+    int sourceDirection = 0;
+    const int directionDepth = std::max(512, radius * 3);
+    const int middleX = portal.x1 + int(int64_t(dx) * middle / length);
+    const int middleY = portal.y1 + int(int64_t(dy) * middle / length);
+    const int deepNormalX = int(int64_t(-dy) * directionDepth / length);
+    const int deepNormalY = int(int64_t(dx) * directionDepth / length);
+    const bool plusInSource = inside(
+        middleX + deepNormalX, middleY + deepNormalY, portal.from) == 1;
+    const bool minusInSource = inside(
+        middleX - deepNormalX, middleY - deepNormalY, portal.from) == 1;
+    if (plusInSource != minusInSource)
+        sourceDirection = plusInSource ? 1 : -1;
+    else
+    {
+        const bool plusInTarget = inside(
+            middleX + deepNormalX, middleY + deepNormalY, portal.to) == 1;
+        const bool minusInTarget = inside(
+            middleX - deepNormalX, middleY - deepNormalY, portal.to) == 1;
+        if (plusInTarget != minusInTarget)
+            sourceDirection = plusInTarget ? -1 : 1;
+    }
+    std::vector<int> offsets;
+    offsets.push_back(middle);
+    for (int distance = radius; middle - distance >= first
+         || middle + distance <= last; distance += radius)
+    {
+        if (middle - distance >= first)
+            offsets.push_back(middle - distance);
+        if (middle + distance <= last)
+            offsets.push_back(middle + distance);
+    }
+    if (std::find(offsets.begin(), offsets.end(), first) == offsets.end())
+        offsets.push_back(first);
+    if (std::find(offsets.begin(), offsets.end(), last) == offsets.end())
+        offsets.push_back(last);
+
+    auto appendAt = [&](int along, int normalDirection, int inset) {
+        const int onX = portal.x1 + int(int64_t(dx) * along / length);
+        const int onY = portal.y1 + int(int64_t(dy) * along / length);
+        const int normalX = int(int64_t(-dy) * inset / length);
+        const int normalY = int(int64_t(dx) * inset / length);
+        const int sourceX = onX + normalDirection * normalX;
+        const int sourceY = onY + normalDirection * normalY;
+        const int targetX = onX - normalDirection * normalX;
+        const int targetY = onY - normalDirection * normalY;
+        if (inside(sourceX, sourceY, portal.from) != 1
+            || inside(targetX, targetY, portal.to) != 1)
+            return;
+
+        auto probePosture = [&](bool crouched) {
+            const int clearance = crouched
+                ? playerCrouchClearance() : playerStandingClearance();
+            const std::vector<StandableSurface> sources = standableSurfacesAt(
+                portal.from, sourceX, sourceY, radius + 16, clearance);
+            const std::vector<StandableSurface> targets = standableSurfacesAt(
+                portal.to, targetX, targetY, radius + 16, clearance);
+            for (const StandableSurface &source : sources)
+            {
+                if (!enginePlayerPoseFits(portal.from, sourceX, sourceY,
+                                          source.z, crouched))
+                    continue;
+                for (const StandableSurface &target : targets)
+                {
+                    if (std::abs(target.z - source.z)
+                            > llmapper::capability::playerStepHeight()
+                        || !enginePlayerPoseFits(portal.to, targetX, targetY,
+                                                 target.z, crouched))
+                        continue;
+                    const int footOffset = crouched
+                        && gObservedCrouchShape.known
+                        ? gObservedCrouchShape.footOffset
+                        : llmapper::capability::playerFootOffset();
+                    const MovementProbe movement = probeMovement(
+                        sourceX, sourceY, source.z - footOffset,
+                        portal.from, targetX, targetY, portal.to,
+                        std::max(64, radius / 2), crouched);
+                    if (!movement.reachable
+                        || !engineLineKeepsSupport(
+                            sourceX, sourceY, portal.from, source.z,
+                            source.support, targetX, targetY, crouched))
+                        continue;
+                    const bool duplicate = std::any_of(
+                        result.begin(), result.end(),
+                        [&](const PortalTraversalWitness &known) {
+                            return known.sourceSupport == source.support
+                                && known.targetSupport == target.support
+                                && known.crouched == crouched;
+                        });
+                    if (duplicate)
+                        continue;
+                    PortalTraversalWitness witness;
+                    witness.sourceX = sourceX;
+                    witness.sourceY = sourceY;
+                    witness.sourceZ = source.z;
+                    witness.sourceSector = portal.from;
+                    witness.sourceSupport = source.support;
+                    witness.targetX = targetX;
+                    witness.targetY = targetY;
+                    witness.targetZ = target.z;
+                    witness.targetSector = portal.to;
+                    witness.targetSupport = target.support;
+                    witness.crouched = crouched;
+                    result.push_back(witness);
+                }
+            }
+        };
+        probePosture(false);
+        if (gObservedCrouchShape.known
+            && playerCrouchClearance() < playerStandingClearance())
+            probePosture(true);
+    };
+
+    for (int along : offsets)
+    {
+        // Thin Build transit containers may be narrower than the actor's
+        // hull even though ClipMove carries the hull continuously across
+        // them. Refine the normal depth toward the actual partition instead
+        // of requiring one magic inset pose in every container.
+        const int insets[] = {
+            radius + 64,
+            radius,
+            std::max(1, radius / 2),
+            std::max(1, radius / 4),
+            1,
+        };
+        for (int inset : insets)
+        {
+            if (sourceDirection != 0)
+                appendAt(along, sourceDirection, inset);
+            else
+            {
+                appendAt(along, 1, inset);
+                appendAt(along, -1, inset);
+            }
+        }
+    }
     return result;
 }
 // Blood does not use q16look as a geometric weapon pitch. ProcessInput
@@ -1447,9 +1716,7 @@ static int bodyRadiusOf()
         return false;
     int32_t resolvedX = x;
     int32_t resolvedY = y;
-    const PlayerCollisionShape liveShape = livePlayerCollisionShape();
-    const PlayerCollisionShape &shape = crouched && gObservedCrouchShape.known
-        ? gObservedCrouchShape : liveShape;
+    const PlayerCollisionShape shape = collisionShapeForPosture(crouched);
     if (!shape.known)
         return false;
     const int originZ = supportZ - shape.footOffset;
@@ -1618,6 +1885,45 @@ static void appendUnique(std::vector<int> &values, int value)
 {
     if (std::find(values.begin(), values.end(), value) == values.end())
         values.push_back(value);
+}
+
+std::vector<EngineBoundaryObservation> engineTopologyBoundaries(int sectorId)
+{
+    std::vector<EngineBoundaryObservation> result;
+    if (!inRange(sectorId, 0, numsectors))
+        return result;
+    const sectortype &owner = sector[sectorId];
+    result.reserve(owner.wallnum);
+    for (int offset = 0; offset < owner.wallnum; ++offset)
+    {
+        const int wallId = owner.wallptr + offset;
+        if (!inRange(wallId, 0, numwalls)
+            || !inRange(wall[wallId].point2, 0, numwalls)
+            || !inRange(wall[wallId].nextsector, 0, numsectors))
+            continue;
+        const walltype &start = wall[wallId];
+        const walltype &end = wall[start.point2];
+        EngineBoundaryObservation boundary;
+        boundary.wall = wallId;
+        boundary.from = sectorId;
+        boundary.to = start.nextsector;
+        boundary.x1 = start.x;
+        boundary.y1 = start.y;
+        boundary.x2 = end.x;
+        boundary.y2 = end.y;
+        boundary.x = (start.x + end.x) / 2;
+        boundary.y = (start.y + end.y) / 2;
+        boundary.z = getflorzofslope(
+            sectorId, boundary.x, boundary.y);
+        boundary.openingWidth = int(std::sqrt(double(
+            distance2(start.x, start.y, end.x, end.y))));
+        // This query deliberately says nothing about actor feasibility. It is
+        // the lossless Build superset which remains true whether or not any
+        // later sampled pose or local probe finds a crossing witness.
+        boundary.capability = kTraversalUnknown;
+        result.push_back(boundary);
+    }
+    return result;
 }
 Observation observeWorld()
 {
@@ -1897,7 +2203,7 @@ Observation observeWorld()
                 : portal.crouchable ? kTraversalCrouchable
                 : portal.jumpable ? kTraversalJumpable
                 : portal.dropSafe ? kTraversalDropSafe
-                : kTraversalCurrentlyUnavailable;
+                : kTraversalUnknown;
             if (wallRecord.extra > 0 && wallRecord.extra < kMaxXWalls)
             {
                 const XWALL &extra = xwall[wallRecord.extra];
@@ -1934,24 +2240,22 @@ Observation observeWorld()
                     portal.capability = kTraversalCurrentlyUnavailable;
                 }
             }
+            const std::vector<PortalTraversalWitness> spanWitnesses =
+                enginePortalTraversalWitnesses(portal);
             // A solid sprite standing in a doorway shuts it as surely as a
             // closed door does, and the wall geometry says nothing about it.
             // Without this a barricaded opening read as walkable, and the bot
             // shouldered it until the objective budget ran out instead of
             // treating it as an obstacle with something to be done about it.
-            if (portal.traversable)
+            if (portal.traversable && spanWitnesses.empty())
             {
                 const int radius = gMe && gMe->pSprite
                     ? (gMe->pSprite->clipdist << 2) : 128;
-                // Sample across the opening rather than only its midpoint.
-                // A barricade often covers part of a doorway and leaves a
-                // gap at one end; judging the whole boundary by its centre
-                // either shuts a passable door or waves the bot at a solid
-                // one.  Where a clear stretch exists, aim at the middle of
-                // that stretch instead of at the middle of the wall.
+                // Finite samples may discover concrete sprite affordances,
+                // but they cannot decide a continuous portal interval. A
+                // missing span witness remains UNKNOWN, even when every
+                // sampled point happens to touch a blocker.
                 const int samples = 9;
-                int clearFirst = -1;
-                int clearLast = -1;
                 int obstruction = -1;
                 std::vector<int> operableObstructions;
                 for (int step = 0; step < samples; ++step)
@@ -1973,27 +2277,11 @@ Observation observeWorld()
                             appendUnique(operableObstructions, hit);
                         continue;
                     }
-                    if (clearFirst < 0)
-                        clearFirst = step;
-                    clearLast = step;
-                }
-                if (clearFirst >= 0 && obstruction >= 0)
-                {
-                    const int middle = (clearFirst + clearLast) / 2;
-                    portal.x = portal.x1
-                        + int(int64_t(portal.x2 - portal.x1) * middle / (samples - 1));
-                    portal.y = portal.y1
-                        + int(int64_t(portal.y2 - portal.y1) * middle / (samples - 1));
-                    obstruction = -1;
                 }
                 if (obstruction >= 0)
                 {
-                    portal.walkable = false;
-                    portal.jumpable = false;
-                    portal.crouchable = false;
-                    portal.dropSafe = false;
-                    portal.traversable = false;
-                    portal.capability = kTraversalCurrentlyUnavailable;
+                    // This names an observed obstruction and its possible
+                    // action; it does not assert coverage of the portal.
                     portal.blockedBySprite = true;
                     portal.blockerSprite = obstruction;
                     // Blocked, but not necessarily hopeless: a barricade the
@@ -2044,6 +2332,40 @@ Observation observeWorld()
                     }
                 }
             }
+            // Midpoint geometry and the fixed obstruction scan above are
+            // discovery accelerators. A positive full-span engine witness is
+            // the traversal authority and may legitimately recover a clear
+            // band at either end of a partially blocked opening.
+            if (!spanWitnesses.empty())
+            {
+                const PortalTraversalWitness &witness =
+                    spanWitnesses.front();
+                portal.x = (witness.sourceX + witness.targetX) / 2;
+                portal.y = (witness.sourceY + witness.targetY) / 2;
+                portal.fromFloorZ = witness.sourceZ;
+                portal.toFloorZ = witness.targetZ;
+                portal.floorZ = witness.targetZ;
+                portal.floorDelta = witness.targetZ - witness.sourceZ;
+                portal.walkable = !witness.crouched;
+                portal.crouchable = witness.crouched;
+                portal.jumpable = false;
+                portal.dropSafe = false;
+                portal.traversable = true;
+                portal.capability = witness.crouched
+                    ? kTraversalCrouchable : kTraversalWalkable;
+                portal.blockedBySprite = false;
+                portal.blockerSprite = -1;
+                portal.witnessValid = true;
+                portal.witnessSourceX = witness.sourceX;
+                portal.witnessSourceY = witness.sourceY;
+                portal.witnessSourceZ = witness.sourceZ;
+                portal.witnessSourceSupport = witness.sourceSupport;
+                portal.witnessTargetX = witness.targetX;
+                portal.witnessTargetY = witness.targetY;
+                portal.witnessTargetZ = witness.targetZ;
+                portal.witnessTargetSupport = witness.targetSupport;
+                portal.witnessCrouched = witness.crouched;
+            }
             if (sector[portal.from].extra > 0 && sector[portal.from].extra < kMaxXSectors)
                 portal.sectorPushCurrent = xsector[sector[portal.from].extra].Push != 0;
             // This is construction state only. The concrete candidates below
@@ -2054,7 +2376,14 @@ Observation observeWorld()
                 || portal.sectorPushCurrent || portal.shootable;
             if (!portal.traversable && !portalHasInteraction)
             {
-                portal.capability = kTraversalCurrentlyUnavailable;
+                const bool concreteBlock =
+                    (wallRecord.cstat & CSTAT_WALL_BLOCK)
+                    || (inRange(wallRecord.nextwall, 0, numwalls)
+                        && (wall[wallRecord.nextwall].cstat
+                            & CSTAT_WALL_BLOCK));
+                portal.capability = concreteBlock
+                    ? kTraversalCurrentlyUnavailable
+                    : kTraversalUnknown;
             }
             if (portal.shootable)
             {

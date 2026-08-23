@@ -205,12 +205,12 @@ static void testNavGraph()
     addLink(cells[0], 2, kNavWalk, -1, NavWaypoint(25, 50));
     addLink(cells[2], 0, kNavWalk, -1, NavWaypoint(25, 50));
     std::vector<NavRouteStep> route;
-    expect(planNavRoute(cells, 0, 2, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 2, route)
                && route.size() >= 1,
            "nav_same_sector_concave_route");
 
     route.clear();
-    expect(planNavRoute(cells, 0, 0, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 0, route)
                && route.empty(),
            "nav_same_pose_route_is_empty");
 
@@ -227,7 +227,7 @@ static void testNavGraph()
     addLink(cells[1], 3, kNavWalk, 5);
     addLink(cells[0], 2, kNavWalk, 6);
     addLink(cells[2], 3, kNavWalk, 7);
-    expect(planNavRoute(cells, 0, 3, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 3, route)
                && route.size() == 2
                && route[0].toCell == 2
                && route[1].toCell == 3,
@@ -247,11 +247,11 @@ static void testNavGraph()
     addLink(cells[1], 3, kNavWalk, 9);
     addLink(cells[0], 2, kNavWalk, 10);
     addLink(cells[2], 3, kNavWalk, 11);
-    expect(planNavRoute(cells, 0, 3, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 3, route)
                && route.size() == 2 && route[0].toCell == 2,
            "nav_prefers_clear_supported_route_over_tight_corner");
     cells[0].links.resize(1);
-    expect(planNavRoute(cells, 0, 3, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 3, route)
                && route.size() == 2 && route[0].toCell == 1,
            "nav_narrow_route_remains_reachable_when_only_option");
 
@@ -263,7 +263,7 @@ static void testNavGraph()
     addLink(cells[1], 0, kNavStep, 20, NavWaypoint(100, 0));
     addLink(cells[1], 2, kNavWalk, 4, NavWaypoint(300, 0));
     addLink(cells[2], 1, kNavWalk, 5, NavWaypoint(300, 0));
-    expect(planNavRoute(cells, 0, 2, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 2, route)
                && route.size() == 2
                && route[0].mode == kNavStep
                && route[0].boundary == 19
@@ -280,7 +280,7 @@ static void testNavGraph()
     addLink(cells[1], 0, kNavStep);
     addLink(cells[1], 2, kNavStep);
     addLink(cells[2], 1, kNavStep);
-    expect(planNavRoute(cells, 0, 2, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 2, route)
                && route.size() == 2
                && route[0].mode == kNavStep
                && route[1].mode == kNavStep,
@@ -291,11 +291,11 @@ static void testNavGraph()
     cells.push_back(makeCell(1, 2, 0, -100));
     addLink(cells[0], 1, kNavJump, 8, NavWaypoint(0, -50));
     addLink(cells[1], 0, kNavDrop, 9, NavWaypoint(0, -50));
-    expect(planNavRoute(cells, 0, 1, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 1, route)
                && route.size() == 1
                && route[0].mode == kNavJump,
            "nav_route_contains_jump");
-    expect(planNavRoute(cells, 1, 0, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 1, 0, route)
                && route.size() == 1
                && route[0].mode == kNavDrop,
            "nav_directed_jump_drop_asymmetry");
@@ -306,10 +306,10 @@ static void testNavGraph()
     jumped.toPose = 1;
     jumped.mode = kNavJump;
     blocked.record(jumped, 1, 0);
-    expect(!planNavRoute(cells, 0, 1, blocked, 1, route),
-           "nav_failed_edge_excluded");
-    expect(planNavRoute(cells, 0, 1, blocked, 2, route),
-           "nav_failed_edge_reappears_on_geometry_change");
+    expect(blocked.tried(jumped, 1)
+               && planNavRoute(cells, 0, 1, route)
+               && route.size() == 1,
+           "nav_execution_failure_does_not_delete_certified_edge");
 
     cells.clear();
     cells.push_back(makeCell(0, 1, 0, 0, 0));
@@ -321,7 +321,7 @@ static void testNavGraph()
     addLink(cells[0], 2, kNavJump);
     addLink(cells[0], 1, kNavJump);
     addLink(cells[1], 2, kNavJump);
-    expect(planNavRoute(cells, 0, 2, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 2, route)
                && route.size() == 2
                && route[0].toCell == 1
                && route[1].toCell == 2,
@@ -338,7 +338,7 @@ static void testNavGraph()
     addLink(cells[0], 2, kNavJump);
     addLink(cells[0], 1, kNavWalk);
     addLink(cells[1], 2, kNavJump);
-    expect(planNavRoute(cells, 0, 2, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 2, route)
                && route.size() == 2
                && route[0].toCell == 1
                && route[1].toCell == 2,
@@ -353,7 +353,7 @@ static void testNavGraph()
     addLink(cells[0], 5, kNavJump, 30, NavWaypoint(250, -100));
     for (int i = 0; i < 5; ++i)
         addLink(cells[i], i + 1, kNavWalk);
-    expect(planNavRoute(cells, 0, 5, AttemptLedger(), 1, route)
+    expect(planNavRoute(cells, 0, 5, route)
                && route.size() == 5
                && route[0].mode == kNavWalk
                && route[4].targetRegion == 2,
@@ -367,16 +367,10 @@ static void testNavGraph()
     addLink(cells[0], 2, kNavWalk, 2, NavWaypoint(50, 50));
     addLink(cells[1], 0, kNavWalk, 1, NavWaypoint(50, 0));
     addLink(cells[2], 0, kNavWalk, 2, NavWaypoint(50, 50));
-    AttemptLedger walked;
-    AttemptSubject shut(kAttemptTraverse, 1);
-    shut.fromPose = 0;
-    shut.toPose = 1;
-    shut.mode = kNavWalk;
-    walked.record(shut, 9, 0);
-    expect(planNavRoute(cells, 0, 2, walked, 9, route)
+    expect(planNavRoute(cells, 0, 2, route)
                && route.size() == 1
                && route[0].boundary == 2,
-           "nav_failed_edge_reroutes_to_alternative");
+           "nav_route_selects_shorter_certified_alternative");
 
     // A sector id is not a support component.  Stacked/ROR geometry can
     // report two cells in the same Build sector while no physical route
@@ -388,14 +382,12 @@ static void testNavGraph()
     addLink(cells[0], 1, kNavWalk, 40);
     addLink(cells[1], 0, kNavWalk, 41);
     std::vector<char> reachable;
-    markReachableNavCells(cells, 0, AttemptLedger(), 1,
-                          reachable);
+    markReachableNavCells(cells, 0, reachable);
     expect(reachable[0] && reachable[1] && !reachable[2],
            "same_sector_disconnected_support_not_actionable");
 
     addLink(cells[1], 2, kNavJump, 42);
-    markReachableNavCells(cells, 0, AttemptLedger(), 1,
-                          reachable);
+    markReachableNavCells(cells, 0, reachable);
     expect(reachable[2],
            "support_transition_rearms_disconnected_approach");
 
@@ -405,17 +397,16 @@ static void testNavGraph()
     leapt.toPose = 2;
     leapt.mode = kNavJump;
     missed.record(leapt, 1, 0);
-    markReachableNavCells(cells, 0, missed, 1, reachable);
-    expect(!reachable[2],
-           "failed_support_transition_does_not_mark_far_pose_reachable");
+    markReachableNavCells(cells, 0, reachable);
+    expect(missed.tried(leapt, 1) && reachable[2],
+           "execution_failure_does_not_change_physical_reachability");
 
     // Overlapping layers remain distinct until an engine-certified physical
     // transition is published by the adapter.
     cells.clear();
     cells.push_back(makeCell(0, 90, 0, 0, -12288));
     cells.push_back(makeCell(1, 65, 1024, 0, 28672));
-    markReachableNavCells(cells, 1, AttemptLedger(), 1,
-                          reachable);
+    markReachableNavCells(cells, 1, reachable);
     expect(reachable[1] && !reachable[0],
            "overlapping_layers_do_not_connect_by_xy_alone");
     NavLink certified;
@@ -428,8 +419,7 @@ static void testNavGraph()
     certified.hasAirAngle = true;
     cells[1].links.push_back(certified);
     std::vector<NavRouteStep> translatedRoute;
-    expect(planNavRoute(cells, 1, 0, AttemptLedger(), 1,
-                        translatedRoute)
+    expect(planNavRoute(cells, 1, 0, translatedRoute)
                && translatedRoute.size() == 1
                && translatedRoute[0].boundary == BoundaryId()
                && translatedRoute[0].transition == 17
@@ -439,8 +429,7 @@ static void testNavGraph()
                && translatedRoute[0].hasAirAngle
                && translatedRoute[0].airAngle == 777,
            "engine_certified_route_preserves_execution_evidence");
-    markReachableNavCells(cells, 1, AttemptLedger(), 1,
-                          reachable);
+    markReachableNavCells(cells, 1, reachable);
     expect(reachable[0],
            "engine_certified_transition_is_reachable");
 
@@ -634,6 +623,7 @@ static void testDeferredEffectPrerequisites()
     crack.hops = 0;
     crack.local = true;
     crack.ready = true;
+    crack.spatial = Opportunity::kSpatialProvenPassable;
     crack.requiredEffects = kEffectExplosive;
 
     Opportunity exploration;
@@ -643,6 +633,7 @@ static void testDeferredEffectPrerequisites()
     exploration.destination = 3;
     exploration.hops = 1;
     exploration.local = false;
+    exploration.spatial = Opportunity::kSpatialProvenPassable;
 
     std::vector<Opportunity> ledger;
     ledger.push_back(crack);
@@ -677,6 +668,8 @@ static void testConservedExplorationLedger()
     deferred.destination = 3;
     deferred.depth = 4;
     deferred.hops = -1;
+    deferred.approach = deferred.pose;
+    deferred.spatial = Opportunity::kSpatialUnknown;
 
     std::vector<Opportunity> ledger(1, deferred);
     WorkSelection selection = selectWork(ledger, 0);
@@ -684,8 +677,8 @@ static void testConservedExplorationLedger()
            "temporarily_unreachable_opportunity_is_deferred_not_actionable");
     ledger[0].hops = 3;
     selection = selectWork(ledger, 0);
-    expect(selection.work == deferred.id,
-           "unresolved_opportunity_survives_temporary_unreachability");
+    expect(!selection,
+           "unresolved_topology_is_knowledge_not_an_operation");
 
     Opportunity deadEnd;
     deadEnd.kind = kOpportunityFrontier;
@@ -694,10 +687,13 @@ static void testConservedExplorationLedger()
     deadEnd.destination = 9;
     deadEnd.depth = 9;
     deadEnd.hops = -1;
+    deadEnd.approach = deadEnd.pose;
+    deadEnd.spatial = Opportunity::kSpatialUnknown;
     Opportunity older = deferred;
     older.id = WorkId(kWorkBoundary, 3003, 2, 3);
     older.depth = 2;
     older.hops = 7;
+    older.spatial = Opportunity::kSpatialProvenPassable;
     ledger.clear();
     ledger.push_back(deadEnd);
     ledger.push_back(older);
@@ -711,17 +707,22 @@ static void testConservedExplorationLedger()
     expect(selection.work == older.id,
            "long_successful_backtracking_is_not_a_stall");
 
-    // The caller rejects one stale/uncommittable candidate by annotating only
-    // that ledger entry unreachable for the current selection pass.
+    // A reachable source does not manufacture an executable crossing.  The
+    // topology fact remains UNKNOWN until the physical layer publishes an
+    // engine-backed execution domain.
     ledger[0].hops = 1;
     ledger[0].depth = 10;
     selection = selectWork(ledger, 0);
+    expect(selection.work == older.id,
+           "unknown_topology_does_not_become_a_fictitious_operation");
+    ledger[0].spatial = Opportunity::kSpatialProvenPassable;
+    selection = selectWork(ledger, 0);
     expect(selection.work == deadEnd.id,
-           "highest_ranked_candidate_selected_before_commit_validation");
-    ledger[0].hops = -1;
+           "engine_backed_domain_makes_topology_executable");
+    ledger[0].spatial = Opportunity::kSpatialCurrentlyBlocked;
     selection = selectWork(ledger, 0);
     expect(selection.work == older.id,
-           "next_mission_selected_after_uncommittable_candidate");
+           "concrete_blocker_evidence_defers_only_named_operation");
 
     // Progress epochs are independent: a later loop cannot erase conserved
     // work merely because an earlier loop happened before real progress.
@@ -737,11 +738,13 @@ static void testConservedExplorationLedger()
     coverage.pose = 4;
     coverage.destination = 4;
     coverage.hops = -1;
+    coverage.spatial = Opportunity::kSpatialUnknown;
     ledger.assign(1, coverage);
     selection = selectWork(ledger, 0);
     expect(!selection,
            "failed_coverage_navigation_does_not_claim_observation");
     ledger[0].hops = 0;
+    ledger[0].spatial = Opportunity::kSpatialProvenPassable;
     selection = selectWork(ledger, 0);
     expect(selection.work == coverage.id,
            "failed_coverage_viewpoint_remains_reconsiderable");
@@ -757,6 +760,7 @@ static void testConservedExplorationLedger()
     keyedInteraction.local = true;
     keyedInteraction.hops = 0;
     keyedInteraction.ready = true;
+    keyedInteraction.spatial = Opportunity::kSpatialProvenPassable;
     keyedInteraction.requiredKey = 1;
     Opportunity unrelatedFrontier;
     unrelatedFrontier.kind = kOpportunityFrontier;
@@ -766,6 +770,7 @@ static void testConservedExplorationLedger()
     unrelatedFrontier.local = true;
     unrelatedFrontier.depth = 20;
     unrelatedFrontier.hops = 0;
+    unrelatedFrontier.spatial = Opportunity::kSpatialProvenPassable;
     ledger.clear();
     ledger.push_back(unrelatedFrontier);
     ledger.push_back(keyedInteraction);
@@ -782,6 +787,7 @@ static void testConservedExplorationLedger()
     enabledCoverage.hops = 1;
     enabledCoverage.local = true;
     enabledCoverage.continuation = true;
+    enabledCoverage.spatial = Opportunity::kSpatialProvenPassable;
     keyedInteraction.requiredKey = 0;
     ledger.clear();
     ledger.push_back(enabledCoverage);
@@ -796,6 +802,7 @@ static void testConservedExplorationLedger()
     incidentalPickup.hops = 0;
     incidentalPickup.local = true;
     incidentalPickup.ready = true;
+    incidentalPickup.spatial = Opportunity::kSpatialProvenPassable;
     ledger.clear();
     ledger.push_back(incidentalPickup);
     ledger.push_back(enabledCoverage);
@@ -809,6 +816,7 @@ static void testConservedExplorationLedger()
     blockedBoundary.hops = 0;
     blockedBoundary.local = true;
     blockedBoundary.ready = true;
+    blockedBoundary.spatial = Opportunity::kSpatialProvenPassable;
     ledger[0] = blockedBoundary;
     selection = selectWork(ledger, 0);
     expect(selection.work == enabledCoverage.id,
@@ -832,6 +840,7 @@ static void testOneWayOpportunityPreference()
     trap.hops = 0;
     trap.local = true;
     trap.oneWayRisk = 1;
+    trap.spatial = Opportunity::kSpatialProvenPassable;
 
     Opportunity remoteTrigger;
     remoteTrigger.kind = kOpportunityInteraction;
@@ -840,6 +849,7 @@ static void testOneWayOpportunityPreference()
     remoteTrigger.hops = 0;
     remoteTrigger.local = true;
     remoteTrigger.ready = true;
+    remoteTrigger.spatial = Opportunity::kSpatialProvenPassable;
 
     std::vector<Opportunity> ledger;
     ledger.push_back(trap);

@@ -740,6 +740,18 @@ inline int workIdHash(const WorkId &work)
 
 struct Opportunity
 {
+    enum SpatialKnowledge
+    {
+        // Coarse topology exposes the possibility, but no engine-backed
+        // actor transition has been established yet.  In particular this is
+        // the result of a sampled-graph miss.
+        kSpatialUnknown,
+        // A concrete pose/transition chain has been accepted by the engine.
+        kSpatialProvenPassable,
+        // Concrete current-world evidence rejects the named operation.  This
+        // is dependency-scoped evidence, never absence from an approximation.
+        kSpatialCurrentlyBlocked,
+    };
     WorkId id;
     OpportunityKind kind;
     PoseId pose;                 // where the actor must stand to act
@@ -749,19 +761,20 @@ struct Opportunity
     int requiredKey;   // 0 when no key is involved
     unsigned requiredEffects; // abstract effects, independent of their satisfier
     int depth;         // retained for telemetry; never used for selection
-    int hops;          // route distance from the bot right now, -1 unreachable
+    int hops;          // known route distance; -1 means no positive route witness
     int descent;       // height given up by taking it, 0 when level or upward
     int oneWayRisk;    // 0 reversible/unknown-safe, >0 known loss of optionality
     bool local;        // physically in the player's current reachable region
     bool continuation;// observes space newly enabled by a causal world change
     bool ready;        // actor currently has a valid pose for the task
     bool requiresOccupancy; // player must occupy the pose; seeing its surface is insufficient
+    SpatialKnowledge spatial;
     Opportunity()
         : id(), kind(kOpportunityFrontier), pose(), destination(), approach(), transition(),
           requiredKey(0), requiredEffects(kEffectNone), depth(0), hops(-1),
           descent(0), oneWayRisk(0),
           local(false), continuation(false), ready(false),
-          requiresOccupancy(false)
+          requiresOccupancy(false), spatial(kSpatialUnknown)
     {
     }
 };
@@ -832,22 +845,6 @@ inline bool traversableMode(NavEdgeMode mode)
 inline bool walkMode(NavEdgeMode mode)
 {
     return mode == kNavWalk || mode == kNavStep;
-}
-
-// Is this concrete transition known to have failed under the evidence that
-// still holds?  Only unset fields in the RECORD are wildcards; treating an
-// unset field in the QUERY as one meant a record naming a single boundary
-// matched every boundary-less local link -- that is, the whole mesh -- and the
-// bot lost the ability to cross its own room.
-inline bool traversalBlocked(const AttemptLedger &ledger, PoseId fromCell,
-                             PoseId toCell, BoundaryId boundary,
-                             NavEdgeMode mode, int geometrySignature)
-{
-    AttemptSubject query(kAttemptTraverse, boundary);
-    query.fromPose = fromCell;
-    query.toPose = toCell;
-    query.mode = mode;
-    return ledger.tried(query, geometrySignature);
 }
 
 inline TraversalResult classifyTraversal(int floorDelta, int clearance,
@@ -950,15 +947,11 @@ void assignWalkAreas(std::vector<NavCell> &cells);
 // Mark the poses physically reachable in the current geometry. Region
 // membership alone is not proof that an approach pose can be reached.
 void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
-                           const AttemptLedger &attempts,
-                           int geometrySignature,
                            std::vector<char> &reachable);
 
 bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
-                  PoseId targetCell,
-                  const AttemptLedger &attempts,
-                  int geometrySignature,
-                  std::vector<NavRouteStep> &outRoute);
+                   PoseId targetCell,
+                   std::vector<NavRouteStep> &outRoute);
 
 
 
