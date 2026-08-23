@@ -30,6 +30,7 @@ int main()
     assert(movement.strafe == -350);
     assert(movement.q16turn == fix16_from_int(17));
     assert(movement.q16mlook == fix16_from_int(-3));
+    assert(movement.syncFlags.run);
     assert(!movement.buttonFlags.byte && !movement.keyFlags.word);
 
     const GINPUT jump = llmapper::commandToInput(

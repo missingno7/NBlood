@@ -36,6 +36,10 @@ inline GINPUT commandToInput(const PhysicalCommand &command)
     switch (command.type)
     {
     case PhysicalCommandType::Move:
+        // MOVE is ordinary purposeful locomotion. Blood owns the actual
+        // posture-dependent running speed and acceleration; the bot only
+        // requests the same run control a player would hold.
+        input.syncFlags.run = 1;
         input.forward = int16_t(std::max(-kMaxMoveInput,
             std::min(kMaxMoveInput, int(command.forward))));
         input.strafe = int16_t(std::max(-kMaxMoveInput,
