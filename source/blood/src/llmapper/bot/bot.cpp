@@ -2455,6 +2455,116 @@ struct LLMapperBot::Impl
         llmapper::markReachableNavCells(navCells, ledgerStartCell,
                                         attemptLedger, 0,
                                         reachableNavCells);
+
+        // A physical transition is persistent world knowledge, distinct from
+        // both the affordance that may unblock it and the current ability to
+        // traverse it.  Project every observed-but-unentered transition from
+        // the monotonic boundary graph into the one work ledger.  Previously
+        // the kernel still had kOpportunityFrontier, but production never
+        // created one: walking away from a visible onward portal therefore
+        // erased the only representation of that unexplored possibility.
+        //
+        // `knownGraph` is the engine-observed transition authority.  This
+        // projection owns no availability state: a concrete reachable source
+        // pose and current AttemptLedger evidence derive executability here.
+        std::set<llmapper::WorkId> projectedBoundaries;
+        for (const auto &source : knownGraph)
+        {
+            for (const EngineBoundaryObservation &portal : source.second)
+            {
+                if (portal.wall < 0 || portal.from < 0 || portal.to < 0
+                    || visitedSectors.count(portal.to))
+                    continue;
+                const llmapper::WorkId id(llmapper::kWorkBoundary,
+                                          portal.wall, portal.from, portal.to);
+                if (!projectedBoundaries.insert(id).second)
+                    continue;
+
+                int approach = -1;
+                int64_t bestDistance = INT64_MAX;
+                for (const NavCell &cell : navCells)
+                {
+                    if (!cell.exists || cell.region != portal.from
+                        || !inRange(cell.id, 0, int(reachableNavCells.size()))
+                        || !reachableNavCells[size_t(cell.id)])
+                        continue;
+                    // A sector-level height comparison only says that a
+                    // doorway could fit a player. It does not say that this
+                    // particular support can reach it: a bridge and the pit
+                    // below it share a sector, while only one is a physical
+                    // source pose. The local nav link is the lazy execution
+                    // domain for this transition and has already been
+                    // certified with engine ClipMove/GetZRange.
+                    const bool crossesFromThisPose = std::any_of(
+                        cell.links.begin(), cell.links.end(),
+                        [this, &portal](const NavLink &link)
+                        {
+                            return link.boundary == portal.wall
+                                && inRange(link.target, 0, int(navCells.size()))
+                                && navCells[size_t(link.target)].region == portal.to
+                                && llmapper::traversableMode(link.mode);
+                        });
+                    if (!crossesFromThisPose)
+                        continue;
+                    const int64_t distance = distance2(cell.center.x, cell.center.y,
+                                                       portal.x, portal.y);
+                    if (distance < bestDistance)
+                    {
+                        bestDistance = distance;
+                        approach = cell.id;
+                    }
+                }
+
+                if (approach < 0)
+                    continue;
+                llmapper::Opportunity opportunity;
+                // A closed wall is not yet a semantic action.  It may be a
+                // solid wall, or it may conceal an affordance that must be
+                // discovered by ActionScan; projecting it as investigation
+                // work would turn every raw portal into a fictitious action.
+                // Only engine-certified physical traversal becomes a
+                // persistent frontier here.  Known affordances remain the
+                // sole source of interaction work.
+                if (!(portal.traversable || portal.jumpable))
+                    continue;
+                opportunity.kind = llmapper::kOpportunityFrontier;
+                opportunity.id = id;
+                opportunity.pose = approach;
+                opportunity.approach = approach;
+                opportunity.destination = portal.to;
+                opportunity.transition = portal.wall;
+                opportunity.depth = sectorDepth(portal.from);
+                opportunity.descent = std::max(0, portal.floorDelta);
+                opportunity.local = true;
+                opportunity.ready = true;
+                opportunity.hops = 0;
+                if (approach != ledgerStartCell)
+                {
+                    std::vector<NavRouteStep> route;
+                    if (llmapper::planNavRoute(navCells, ledgerStartCell, approach,
+                                                attemptLedger, 0, route))
+                    {
+                        opportunity.hops = int(route.size());
+                        opportunity.oneWayRisk = routeOneWayRisk(
+                            ledgerStartCell, approach);
+                    }
+                    else
+                    {
+                        opportunity.hops = -1;
+                        opportunity.local = false;
+                        opportunity.ready = false;
+                    }
+                }
+                if (edgeFailed(portal.wall))
+                {
+                    opportunity.hops = -1;
+                    opportunity.local = false;
+                    opportunity.ready = false;
+                }
+                ledger.push_back(opportunity);
+            }
+        }
+
         for (auto &entry : interactions)
         {
             AffordanceKnowledge &memory = entry.second;
@@ -10149,7 +10259,18 @@ struct LLMapperBot::Impl
         }
 
         // Collision supports contribute arbitrary XYZ landing poses.
-        // Nothing in the semantic graph identifies the underlying sprite.
+        // Query their execution domain only in directions where another
+        // known actor pose/support actually exists.  The former unconditional
+        // sixteen-ray compass ring eagerly materialized hundreds of poses in
+        // sprite-floor scenes before any transition needed them.  Direction
+        // bins only memoize equivalent engine queries; GetZRange remains the
+        // authority for the concrete endpoint and the transition replay below
+        // remains the authority for connectivity.
+        std::vector<LocalWaypoint> supportDomainTargets;
+        supportDomainTargets.reserve(cache.poses.size() + 16);
+        std::vector<std::pair<int, LocalWaypoint> > collisionSupports;
+        for (const SupportPose &pose : cache.poses)
+            supportDomainTargets.push_back(LocalWaypoint(pose.x, pose.y));
         for (int spriteId = headspritesect[sectorId]; spriteId >= 0;
              spriteId = nextspritesect[spriteId])
         {
@@ -10157,6 +10278,14 @@ struct LLMapperBot::Impl
             if ((gMe && gMe->pSprite && spriteId == gMe->pSprite->index)
                 || !(record.cstat & CSTAT_SPRITE_BLOCK))
                 continue;
+            const LocalWaypoint center(record.x, record.y);
+            collisionSupports.push_back(std::make_pair(spriteId, center));
+            supportDomainTargets.push_back(center);
+        }
+        for (const auto &support : collisionSupports)
+        {
+            const int spriteId = support.first;
+            const LocalWaypoint &center = support.second;
             const SupportRef wanted = engineSupport(
                 kSupportSpriteFloor, spriteId);
             auto appendWanted = [&](int x, int y) {
@@ -10173,17 +10302,27 @@ struct LLMapperBot::Impl
                 surface.z = surfaceZ;
                 return appendPose(x, y, surface, false, false, false);
             };
-            if (!appendWanted(record.x, record.y))
+            if (!appendWanted(center.x, center.y))
                 continue;
-            for (int direction = 0; direction < 16; ++direction)
+            std::set<int> domainDirections;
+            for (const LocalWaypoint &target : supportDomainTargets)
             {
-                const int angle = direction * 128;
+                const int dx = target.x - center.x;
+                const int dy = target.y - center.y;
+                if (dx == 0 && dy == 0)
+                    continue;
+                domainDirections.insert(
+                    ((getangle(dx, dy) + 64) & 2047) >> 7);
+            }
+            for (int direction : domainDirections)
+            {
+                const int angle = direction << 7;
                 int last = 0;
                 for (int distance = 64; distance <= 4096; distance += 64)
                 {
-                    const int x = record.x
+                    const int x = center.x
                         + mulscale30(distance, Cos(angle));
-                    const int y = record.y
+                    const int y = center.y
                         + mulscale30(distance, Sin(angle));
                     int surfaceZ = 0;
                     if (!engineSupportZAt(wanted, x, y, surfaceZ)
@@ -10194,9 +10333,9 @@ struct LLMapperBot::Impl
                     last = distance;
                 }
                 if (last > 0)
-                    appendWanted(record.x
+                    appendWanted(center.x
                         + mulscale30(last, Cos(angle)),
-                                 record.y
+                                 center.y
                         + mulscale30(last, Sin(angle)));
             }
         }
@@ -10542,22 +10681,24 @@ struct LLMapperBot::Impl
         return signature;
     }
 
-    void expandVisibleNavChunk(std::set<int> &regions)
+    void extendObservedNavChunk(std::set<int> &regions)
     {
-        // Passive perception is a full lookaround. Starting with the
-        // occupied/remembered chunk, test only immediate geometric
-        // neighbours and continue through neighbours that contribute at
-        // least one engine-visible standable pose. This discovers a visible
-        // chain of pillar/support layers without entering the damaging space
-        // below, while an occlusion stops the scan naturally. Region IDs are
-        // adapter traversal keys only; the published model contains poses.
+        // A region which has actually been observed may expose a landing on
+        // the other side of one of its container boundaries even when that
+        // boundary is not itself a WALK portal (a gap/jump is the ordinary
+        // example).  Use Build adjacency only to enumerate that one bounded
+        // set of candidate containers; the engine-derived poses and the
+        // transition replay below remain the authority for whether any
+        // physical connection exists.  Never recurse from those speculative
+        // candidates.  The former recursive walk turned raw nextsector
+        // metadata into topology knowledge and instantiated an entire map
+        // component from one observation, multiplying sprite support poses
+        // into tens of thousands of transition probes.
         std::set<PhysicalPoseKey> nextChunkFrontiers;
-        std::deque<int> pending(regions.begin(), regions.end());
+        const std::vector<int> observedChunk(regions.begin(), regions.end());
         std::set<int> tested = regions;
-        while (!pending.empty())
+        for (int current : observedChunk)
         {
-            const int current = pending.front();
-            pending.pop_front();
             if (!inRange(current, 0, numsectors))
                 continue;
             const sectortype &record = sector[current];
@@ -10614,7 +10755,6 @@ struct LLMapperBot::Impl
                     continue;
                 }
                 regions.insert(neighbour);
-                pending.push_back(neighbour);
             }
         }
         if (nextChunkFrontiers != visibleChunkFrontierPoses)
@@ -10733,7 +10873,7 @@ struct LLMapperBot::Impl
             return;
         }
         navActiveRegions = activeNavSectors();
-        expandVisibleNavChunk(navActiveRegions);
+        extendObservedNavChunk(navActiveRegions);
         const int pose = navPoseSignature(navActiveRegions);
         const bool activeGeometryMoving = !navCells.empty()
             && geometryMoving(navActiveRegions);
@@ -10765,7 +10905,7 @@ struct LLMapperBot::Impl
         // the far side of a boundary nobody has looked through stays known as
         // a boundary without owing a detailed interior.  Inside a
         // materialized region the decomposition is observer-independent.
-        // activeNavSectors/expandVisibleNavChunk already form the bounded,
+        // activeNavSectors/extendObservedNavChunk already form the bounded,
         // observation-authorized chunk. Materialize that chunk here under
         // the one topology/motion authority. The former fallback did this
         // from sectorHasStandableSpace() while the ledger was being built,
