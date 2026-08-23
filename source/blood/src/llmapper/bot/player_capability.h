@@ -320,6 +320,19 @@ struct MotionState
     int zvel = 0;
 };
 
+// The part of MoveDude's post-contact response selected by the engine-owned
+// floor hit.  Most ground uses ordinary dude drag.  A face-sprite floor adds
+// radial velocity and returns before that drag; underwater sectors also
+// return before ground drag.  The observer derives this from Blood objects so
+// the motion equation itself need not interpret sprite/sector arrays.
+struct GroundContactMotion
+{
+    bool radialSpriteResponse = false;
+    bool skipGroundDrag = false;
+    int supportX = 0;
+    int supportY = 0;
+};
+
 // XSPRITE::height as MoveDude recomputes it: measured from the sprite's
 // bottom, not its origin.
 inline int airborneHeight(const MotionState &state, int floorZ, int footOffset)
@@ -327,9 +340,9 @@ inline int airborneHeight(const MotionState &state, int floorZ, int footOffset)
     return ClipLow(floorZ - (state.z + footOffset), 0) >> 8;
 }
 
-inline void stepPlayerMotion(MotionState &state, int forwardInput, int angle,
-                             int floorZ, int frontAccel, int footOffset,
-                             const AirDrag &air)
+inline void beginPlayerMotionFrame(MotionState &state, int forwardInput,
+                                   int angle, int floorZ, int directionalAccel,
+                                   int footOffset, const AirDrag &air)
 {
     // ProcessInput: acceleration, scaled down the further off the floor the
     // player is, and gone entirely once fully airborne.
@@ -339,7 +352,7 @@ inline void stepPlayerMotion(MotionState &state, int forwardInput, int angle,
         int speed = 0x10000;
         if (height > 0)
             speed -= divscale16(height, kDudeAirborneHeight);
-        int forward = mulscale8(frontAccel, forwardInput);
+        int forward = mulscale8(directionalAccel, forwardInput);
         if (height)
             forward = mulscale16(forward, speed);
         state.xvel += mulscale30(forward, Cos(angle));
@@ -360,6 +373,16 @@ inline void stepPlayerMotion(MotionState &state, int forwardInput, int angle,
     state.y += state.yvel >> 12;
     if (state.zvel)
         state.z += state.zvel >> 8;
+}
+
+inline void finishPlayerMotionFrame(
+    MotionState &state, int floorZ, int footOffset,
+    const GroundContactMotion &ground = GroundContactMotion())
+{
+    // MoveDude asks GetZRange after horizontal motion and the velocity-driven
+    // vertical move.  The caller supplies that fresh engine observation;
+    // choosing contact response from the preceding frame is incorrect at a
+    // support boundary.
     if (state.z + footOffset < floorZ)
     {
         state.z += ((kDudeGravity * 4) / 2) >> 8;
@@ -379,6 +402,17 @@ inline void stepPlayerMotion(MotionState &state, int forwardInput, int angle,
     // recomputed after the vertical step.
     if (state.xvel || state.yvel)
     {
+        if (ground.radialSpriteResponse)
+        {
+            // MoveDude: mulscale2(4, origin-support) and an immediate
+            // return, including while GetZRange still names the sprite below
+            // an airborne body.
+            state.xvel += mulscale2(4, state.x - ground.supportX);
+            state.yvel += mulscale2(4, state.y - ground.supportY);
+            return;
+        }
+        if (ground.skipGroundDrag)
+            return;
         const int settled = airborneHeight(state, floorZ, footOffset);
         if (settled < kDudeAirborneHeight)
         {
@@ -391,6 +425,16 @@ inline void stepPlayerMotion(MotionState &state, int forwardInput, int angle,
                 state.xvel = state.yvel = 0;
         }
     }
+}
+
+inline void stepPlayerMotion(MotionState &state, int forwardInput, int angle,
+                             int floorZ, int directionalAccel, int footOffset,
+                             const AirDrag &air,
+                             const GroundContactMotion &ground = GroundContactMotion())
+{
+    beginPlayerMotionFrame(state, forwardInput, angle, floorZ, directionalAccel,
+                           footOffset, air);
+    finishPlayerMotionFrame(state, floorZ, footOffset, ground);
 }
 
 // Top running speed in world units per frame, where the posture's

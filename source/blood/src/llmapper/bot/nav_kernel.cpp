@@ -461,7 +461,7 @@ void assignWalkAreas(std::vector<NavCell> &cells)
     int nextArea = 0;
     for (size_t i = 0; i < cells.size(); ++i)
     {
-        if (cells[i].walkArea >= 0)
+        if (cells[i].walkArea >= 0 || !cells[i].exists)
             continue;
         std::deque<int> queue;
         queue.push_back(int(i));
@@ -475,7 +475,8 @@ void assignWalkAreas(std::vector<NavCell> &cells)
             {
                 if (!walkMode(links[l].mode) || links[l].condition.enabled)
                     continue;
-                if (links[l].target < 0 || links[l].target >= int(cells.size()))
+                if (links[l].target < 0 || links[l].target >= int(cells.size())
+                    || !cells[size_t(links[l].target)].exists)
                     continue;
                 if (cells[size_t(links[l].target)].walkArea < 0)
                 {
@@ -489,12 +490,13 @@ void assignWalkAreas(std::vector<NavCell> &cells)
 }
 
 void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
-                           const std::vector<NavEdgeFailure> &failures,
+                           const AttemptLedger &attempts,
                            int geometrySignature,
                            std::vector<char> &reachable)
 {
     reachable.assign(cells.size(), 0);
-    if (startCell < 0 || startCell >= int(cells.size()))
+    if (startCell < 0 || startCell >= int(cells.size())
+        || !cells[size_t(startCell)].exists)
         return;
     std::deque<int> queue;
     reachable[size_t(startCell)] = 1;
@@ -511,77 +513,15 @@ void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
             // physically reachable in the world state being ranked now.
             if (!traversableMode(link.mode) || link.condition.enabled
                 || link.target < 0 || link.target >= int(cells.size())
+                || !cells[size_t(link.target)].exists
                 || reachable[size_t(link.target)]
-                || edgeFailedAny(failures, current, link.target, link.boundary,
-                                 link.mode, geometrySignature))
+                || traversalBlocked(attempts, current, link.target, link.boundary,
+                                    link.mode, geometrySignature))
                 continue;
             reachable[size_t(link.target)] = 1;
             queue.push_back(link.target);
         }
     }
-}
-
-int linkTranslatedNavLayers(std::vector<NavCell> &cells, RegionId upperRegion,
-                            SupportId upperSupport, RegionId lowerRegion,
-                            SupportId lowerSupport, int deltaX, int deltaY,
-                            int maximumError, TransitionId transition)
-{
-    const int64_t maximumError2 = int64_t(maximumError) * maximumError;
-    int linked = 0;
-    auto addLink = [&](PoseId from, PoseId to, NavEdgeMode mode,
-                       const NavWaypoint &gateway) {
-        if (from < 0 || to < 0 || from >= int(cells.size())
-            || to >= int(cells.size()) || from == to)
-            return false;
-        for (const NavLink &link : cells[size_t(from)].links)
-            if (link.target == to && link.transition == transition)
-                return false;
-        NavLink link;
-        link.target = to;
-        link.mode = mode;
-        link.gateway = gateway;
-        link.hasGateway = true;
-        link.transition = transition;
-        cells[size_t(from)].links.push_back(link);
-        return true;
-    };
-
-    for (const NavCell &upper : cells)
-    {
-        if (upper.region != upperRegion || upper.support != upperSupport)
-            continue;
-        const int wantedX = upper.center.x + deltaX;
-        const int wantedY = upper.center.y + deltaY;
-        int lowerId = -1;
-        int64_t bestDistance = maximumError2 + 1;
-        for (const NavCell &lower : cells)
-        {
-            if (lower.region != lowerRegion || lower.support != lowerSupport)
-                continue;
-            const int64_t candidate = int64_t(lower.center.x - wantedX)
-                    * (lower.center.x - wantedX)
-                + int64_t(lower.center.y - wantedY)
-                    * (lower.center.y - wantedY);
-            if (candidate < bestDistance)
-            {
-                bestDistance = candidate;
-                lowerId = lower.id;
-            }
-        }
-        if (lowerId < 0 || lowerId >= int(cells.size()))
-            continue;
-        const NavCell &lower = cells[size_t(lowerId)];
-        // A translated-layer link connects two coordinate-space projections. The
-        // player walks through its source pose and the engine translates the
-        // body to the receiving layer; no ballistic capability is involved.
-        // Labelling this DROP/JUMP handed a remote translated coordinate to
-        // the jump executor and invented a flight across ordinary geometry.
-        if (addLink(upper.id, lower.id, kNavWalk, upper.center))
-            ++linked;
-        if (addLink(lower.id, upper.id, kNavWalk, lower.center))
-            ++linked;
-    }
-    return linked;
 }
 
 static const NavLink *findLink(const NavCell &cell, PoseId target,
@@ -611,7 +551,7 @@ static bool conditionSatisfied(const NavCondition &condition,
 
 bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
                   PoseId targetCell,
-                  const std::vector<NavEdgeFailure> &failures,
+                  const AttemptLedger &attempts,
                   int geometrySignature,
                   std::vector<NavRouteStep> &outRoute)
 {
@@ -672,10 +612,11 @@ bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
             // interaction-aware planner below to establish its condition.
             if (link.condition.enabled)
                 continue;
-            if (link.target < 0 || link.target >= int(cells.size()))
+            if (link.target < 0 || link.target >= int(cells.size())
+                || !cells[size_t(link.target)].exists)
                 continue;
-            if (edgeFailedAny(failures, current, link.target, link.boundary, link.mode,
-                              geometrySignature))
+            if (traversalBlocked(attempts, current, link.target, link.boundary,
+                                 link.mode, geometrySignature))
                 continue;
             // A graph link is a concrete movement between two poses.  Count
             // its physical span, not merely one abstract hop: otherwise two
@@ -789,6 +730,8 @@ bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
             step.airFrames = link->airFrames;
             step.launchVelocity = link->launchVelocity;
             step.hasAirControl = link->hasAirControl;
+            step.airAngle = link->airAngle;
+            step.hasAirAngle = link->hasAirAngle;
         }
         outRoute.push_back(step);
     }
@@ -813,45 +756,6 @@ std::vector<LearnedEffect> CausalGraph::effectsEstablishing(
     return result;
 }
 
-int deriveDynamicAffordances(const StatefulGeometry &geometry,
-                             int requiredClearance)
-{
-    int result = kAffordanceNone;
-    bool anyPassable = false;
-    bool anyBlocked = false;
-    bool endpointsSafe = geometry.poses.size() >= 2;
-    std::set<int> firstConnections;
-    bool differentConnections = false;
-    for (size_t i = 0; i < geometry.poses.size(); ++i)
-    {
-        const StablePose &pose = geometry.poses[i];
-        const bool passable = pose.occupiable && pose.clearance >= requiredClearance;
-        anyPassable = anyPassable || passable;
-        anyBlocked = anyBlocked || !passable;
-        endpointsSafe = endpointsSafe && passable;
-        const std::set<int> connections(pose.connectedSurfaces.begin(),
-                                        pose.connectedSurfaces.end());
-        if (i == 0)
-            firstConnections = connections;
-        else if (connections != firstConnections)
-            differentConnections = true;
-    }
-    if (anyPassable && anyBlocked)
-        result |= kAffordanceEnablePassage;
-
-    bool sweepSafe = endpointsSafe;
-    for (size_t i = 0; i < geometry.sweepClearances.size(); ++i)
-        if (geometry.sweepClearances[i] < requiredClearance)
-            sweepSafe = false;
-    if (geometry.crush && geometry.sweepClearances.empty())
-        sweepSafe = false;
-
-    if (geometry.carriesSupport && sweepSafe && differentConnections)
-        result |= kAffordanceTransportSupportedPlayer;
-    if (!sweepSafe)
-        result |= kAffordanceUnsafeSweptOccupancy;
-    return result;
-}
 
 NavLink makeConditionalTraversal(PoseId target, NavEdgeMode mode,
                                  StateVariableId variable, int state,
@@ -880,7 +784,7 @@ static bool findAvailableRoute(const std::vector<NavCell> &cells, int start,
     route.cells.clear();
     route.links.clear();
     if (start < 0 || goal < 0 || start >= int(cells.size())
-        || goal >= int(cells.size()))
+        || goal >= int(cells.size()) || !cells[size_t(start)].exists)
         return false;
     std::deque<int> queue;
     std::vector<int> parent(cells.size(), -1);
@@ -899,6 +803,7 @@ static bool findAvailableRoute(const std::vector<NavCell> &cells, int start,
             if (!traversableMode(link.mode)
                 || !conditionSatisfied(link.condition, states)
                 || link.target < 0 || link.target >= int(cells.size())
+                || !cells[size_t(link.target)].exists
                 || seen[size_t(link.target)])
                 continue;
             seen[size_t(link.target)] = 1;
@@ -997,13 +902,15 @@ static bool planDynamicRouteRecursive(
                 const LearnedEffect &effect = effects[e];
                 const Affordance *affordance =
                     causality.affordanceById(effect.affordance);
-                if (!affordance || !affordance->actionPose
-                    || affordance->actionPose >= int(cells.size()))
+                if (!affordance || !affordance->executionDomain.selected
+                    || affordance->executionDomain.selected >= int(cells.size()))
                     continue;
                 resolving.insert(key);
                 std::map<StateVariableId, int> candidateStates = states;
                 std::vector<PlanOperation> candidatePlan = plan;
-                if (!planDynamicRouteRecursive(cells, start, affordance->actionPose,
+                if (!planDynamicRouteRecursive(
+                                               cells, start,
+                                               affordance->executionDomain.selected,
                                                candidateStates, causality, resolving,
                                                candidatePlan, stats, depth + 1))
                 {
@@ -1013,18 +920,18 @@ static bool planDynamicRouteRecursive(
 
                 PlanOperation activate;
                 activate.kind = kPlanActivate;
-                activate.fromCell = affordance->actionPose;
-                activate.toCell = affordance->actionPose;
+                activate.fromCell = affordance->executionDomain.selected;
+                activate.toCell = affordance->executionDomain.selected;
                 activate.affordance = affordance->id;
-                activate.action = effect.action;
+                activate.action = affordance->action;
                 activate.variable = effect.variable;
                 activate.state = effect.state;
                 candidatePlan.push_back(activate);
 
                 PlanOperation wait;
                 wait.kind = kPlanWaitForTransition;
-                wait.fromCell = affordance->actionPose;
-                wait.toCell = affordance->actionPose;
+                wait.fromCell = affordance->executionDomain.selected;
+                wait.toCell = affordance->executionDomain.selected;
                 wait.variable = effect.variable;
                 wait.state = effect.state;
                 candidatePlan.push_back(wait);
@@ -1032,7 +939,10 @@ static bool planDynamicRouteRecursive(
                 candidateStates[effect.variable] = effect.state;
                 ++stats.prerequisiteExpansions;
                 stats.variablesConsidered.insert(effect.variable);
-                if (planDynamicRouteRecursive(cells, affordance->actionPose, goal,
+                if (planDynamicRouteRecursive(
+                                              cells,
+                                              affordance->executionDomain.selected,
+                                              goal,
                                               candidateStates, causality, resolving,
                                               candidatePlan, stats, depth + 1))
                 {
@@ -1069,273 +979,9 @@ bool planDynamicRoute(const std::vector<NavCell> &cells, PoseId startCell,
     return result;
 }
 
-static bool crossingFailed(const std::vector<NavEdgeFailure> &failures,
-                           BoundaryId boundary, int geometrySignature)
-{
-    for (size_t i = 0; i < failures.size(); ++i)
-    {
-        const NavEdgeFailure &failure = failures[i];
-        if (!failure.boundary)
-            continue;
-        if (failure.geometrySignature != 0 && geometrySignature != 0
-            && failure.geometrySignature != geometrySignature)
-            continue;
-        if (failure.boundary == boundary)
-            return true;
-    }
-    return false;
-}
 
-std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
-    const std::vector<VisibilityCell> &cells, int mergeRadius,
-    int gainRadius, int approachRadius, int maximumRise)
-{
-    std::map<int, size_t> byId;
-    for (size_t i = 0; i < cells.size(); ++i)
-        byId[cells[i].id] = i;
 
-    std::vector<VisibilityFrontier> candidates;
-    const int64_t gainRadius2 = int64_t(gainRadius) * gainRadius;
-    for (size_t i = 0; i < cells.size(); ++i)
-    {
-        const VisibilityCell &cell = cells[i];
-        if (cell.observed)
-            continue;
-        bool bordersKnownSpace = false;
-        int approachCell = -1;
-        for (size_t n = 0; n < cell.neighbors.size(); ++n)
-        {
-            std::map<int, size_t>::const_iterator neighbor =
-                byId.find(cell.neighbors[n]);
-            if (neighbor != byId.end() && cells[neighbor->second].observed)
-            {
-                bordersKnownSpace = true;
-                if (approachCell < 0 || cells[neighbor->second].reachable)
-                    approachCell = cells[neighbor->second].id;
-                if (cells[neighbor->second].reachable)
-                    break;
-            }
-        }
-        if (!bordersKnownSpace)
-            continue;
 
-        // A raised support may be visible without yet having a
-        // traversal edge to the floor below it. The missing prerequisite is
-        // a valid takeoff/inspection pose, not proof that the surface is
-        // impossible. Use the nearest observed reachable physical pose as
-        // the boundary approach; execution can then discover the jump/link.
-        if (!cell.reachable)
-        {
-            if (approachCell >= 0)
-            {
-                const VisibilityCell &neighbor = cells[byId.find(approachCell)->second];
-                if (neighbor.reachable && neighbor.z - cell.z > maximumRise)
-                    approachCell = -1;
-            }
-            const int64_t approachRadius2 = int64_t(approachRadius)
-                * approachRadius;
-            int64_t bestApproachDistance2 = approachRadius2 + 1;
-            for (size_t j = 0; j < cells.size(); ++j)
-            {
-                const VisibilityCell &known = cells[j];
-                if (!known.observed || !known.reachable)
-                    continue;
-                const int rise = known.z - cell.z;
-                if (rise > maximumRise)
-                    continue;
-                const int64_t dx = int64_t(known.x) - cell.x;
-                const int64_t dy = int64_t(known.y) - cell.y;
-                const int64_t distance2 = dx * dx + dy * dy;
-                if (distance2 < bestApproachDistance2)
-                {
-                    bestApproachDistance2 = distance2;
-                    approachCell = known.id;
-                }
-            }
-        }
-
-        VisibilityFrontier frontier;
-        frontier.cell = cell.id;
-        frontier.approachCell = approachCell;
-        frontier.reachable = cell.reachable;
-        for (size_t j = 0; j < cells.size(); ++j)
-        {
-            const VisibilityCell &unknown = cells[j];
-            if (unknown.observed || unknown.area != cell.area)
-                continue;
-            const int64_t dx = int64_t(unknown.x) - cell.x;
-            const int64_t dy = int64_t(unknown.y) - cell.y;
-            if (dx * dx + dy * dy <= gainRadius2)
-                ++frontier.informationGain;
-        }
-        candidates.push_back(frontier);
-    }
-
-    std::sort(candidates.begin(), candidates.end(),
-              [&cells, &byId](const VisibilityFrontier &a,
-                              const VisibilityFrontier &b)
-              {
-                  const VisibilityCell &aCell = cells[byId.find(a.cell)->second];
-                  const VisibilityCell &bCell = cells[byId.find(b.cell)->second];
-                  const std::map<int, size_t>::const_iterator aApproachIndex =
-                      byId.find(a.approachCell);
-                  const std::map<int, size_t>::const_iterator bApproachIndex =
-                      byId.find(b.approachCell);
-                  const int64_t aDistance2 = aApproachIndex == byId.end()
-                      ? INT64_MAX
-                      : (int64_t(aCell.x) - cells[aApproachIndex->second].x)
-                            * (int64_t(aCell.x) - cells[aApproachIndex->second].x)
-                        + (int64_t(aCell.y) - cells[aApproachIndex->second].y)
-                            * (int64_t(aCell.y) - cells[aApproachIndex->second].y);
-                  const int64_t bDistance2 = bApproachIndex == byId.end()
-                      ? INT64_MAX
-                      : (int64_t(bCell.x) - cells[bApproachIndex->second].x)
-                            * (int64_t(bCell.x) - cells[bApproachIndex->second].x)
-                        + (int64_t(bCell.y) - cells[bApproachIndex->second].y)
-                            * (int64_t(bCell.y) - cells[bApproachIndex->second].y);
-                  if (aDistance2 != bDistance2)
-                      return aDistance2 < bDistance2;
-                  if (a.informationGain != b.informationGain)
-                      return a.informationGain > b.informationGain;
-                  return a.cell < b.cell;
-              });
-
-    std::vector<VisibilityFrontier> result;
-    const int64_t mergeRadius2 = int64_t(mergeRadius) * mergeRadius;
-    for (size_t i = 0; i < candidates.size(); ++i)
-    {
-        std::map<int, size_t>::const_iterator candidateIndex =
-            byId.find(candidates[i].cell);
-        if (candidateIndex == byId.end())
-            continue;
-        const VisibilityCell &candidate = cells[candidateIndex->second];
-        bool merged = false;
-        for (size_t j = 0; j < result.size(); ++j)
-        {
-            std::map<int, size_t>::const_iterator selectedIndex =
-                byId.find(result[j].cell);
-            if (selectedIndex == byId.end())
-                continue;
-            const VisibilityCell &selected = cells[selectedIndex->second];
-            if (selected.area != candidate.area
-                || result[j].reachable != candidates[i].reachable)
-                continue;
-            const int64_t dx = int64_t(selected.x) - candidate.x;
-            const int64_t dy = int64_t(selected.y) - candidate.y;
-            if (dx * dx + dy * dy <= mergeRadius2)
-            {
-                merged = true;
-                break;
-            }
-        }
-        if (!merged)
-            result.push_back(candidates[i]);
-    }
-    return result;
-}
-
-std::vector<DerivedFrontier> deriveFrontiers(
-    const std::vector<RegionId> &visitedRegions,
-    const std::vector<Boundary> &boundaries,
-    const std::vector<InvestigateRecord> &investigated,
-    const std::vector<NavEdgeFailure> &failedCrossings)
-{
-    std::set<RegionId> visited(visitedRegions.begin(), visitedRegions.end());
-    std::map<RegionId, DerivedFrontier> openByDest;
-    std::map<RegionId, DerivedFrontier> blockedByDest;
-    for (size_t i = 0; i < boundaries.size(); ++i)
-    {
-        const Boundary &boundary = boundaries[i];
-        if (visited.find(boundary.source) == visited.end())
-            continue;
-        if (visited.find(boundary.destination) != visited.end())
-            continue;
-        const bool open = (boundary.traversable || boundary.jumpable)
-            && !crossingFailed(failedCrossings, boundary.id,
-                               boundary.geometrySignature);
-        if (open)
-        {
-            DerivedFrontier &frontier = openByDest[boundary.destination];
-            frontier.destination = boundary.destination;
-            frontier.kind = kFrontierOpen;
-            frontier.candidates.push_back(boundary);
-            continue;
-        }
-        if (investigatedNow(investigated, boundary.id, boundary.source,
-                            boundary.destination,
-                            boundary.geometrySignature))
-            continue;
-        DerivedFrontier &frontier = blockedByDest[boundary.destination];
-        frontier.destination = boundary.destination;
-        frontier.kind = kFrontierBlocked;
-        frontier.candidates.push_back(boundary);
-    }
-    std::vector<DerivedFrontier> result;
-    for (std::map<RegionId, DerivedFrontier>::iterator it = openByDest.begin();
-         it != openByDest.end(); ++it)
-        result.push_back(it->second);
-    for (std::map<RegionId, DerivedFrontier>::iterator it = blockedByDest.begin();
-         it != blockedByDest.end(); ++it)
-    {
-        if (openByDest.find(it->first) != openByDest.end())
-            continue;
-        result.push_back(it->second);
-    }
-    return result;
-}
-
-int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
-                        RegionId currentRegion, const int *hops, int hopCount)
-{
-    int bestOpenLocal = -1;
-    int bestOpenRemote = -1;
-    int bestOpenHops = 0x7fffffff;
-    int bestBlockedLocal = -1;
-    int bestBlockedRemote = -1;
-    int bestBlockedHops = 0x7fffffff;
-    for (size_t i = 0; i < frontiers.size(); ++i)
-    {
-        const DerivedFrontier &frontier = frontiers[i];
-        bool local = false;
-        for (size_t c = 0; c < frontier.candidates.size(); ++c)
-        {
-            if (frontier.candidates[c].source == currentRegion)
-            {
-                local = true;
-                break;
-            }
-        }
-        const int hop = (frontier.destination >= 0 && frontier.destination < hopCount)
-            ? hops[frontier.destination] : -1;
-        if (frontier.kind == kFrontierOpen)
-        {
-            if (local && bestOpenLocal < 0)
-                bestOpenLocal = int(i);
-            else if (!local && hop >= 0 && hop < bestOpenHops)
-            {
-                bestOpenHops = hop;
-                bestOpenRemote = int(i);
-            }
-        }
-        else if (frontier.kind == kFrontierBlocked)
-        {
-            if (local && bestBlockedLocal < 0)
-                bestBlockedLocal = int(i);
-            else if (!local && hop >= 0 && hop < bestBlockedHops)
-            {
-                bestBlockedHops = hop;
-                bestBlockedRemote = int(i);
-            }
-        }
-    }
-    if (bestOpenLocal >= 0)
-        return bestOpenLocal;
-    if (bestOpenRemote >= 0)
-        return bestOpenRemote;
-    if (bestBlockedLocal >= 0)
-        return bestBlockedLocal;
-    return bestBlockedRemote;
-}
 
 static const char *workReason(const Opportunity &work)
 {
@@ -1374,20 +1020,29 @@ static bool isDiscoveredTask(const Opportunity &opportunity)
         && opportunity.kind != kOpportunityCoverage;
 }
 
+static bool isExecutableGoalOperation(const Opportunity &opportunity)
+{
+    return opportunity.kind == kOpportunityInteraction
+        || opportunity.kind == kOpportunityExit;
+}
+
 static int workClass(const Opportunity &opportunity)
 {
-    // A world-changing action and the newly enabled physical continuation
-    // form one causal plan. Once that successor is executable, retain plan
-    // ownership until it is consumed; an unrelated pickup discovered before
-    // the action must not make the actor turn away from the opening it just
-    // created.
+    // Current plan ownership is authoritative.  A physical successor marked
+    // as a continuation is the next operation of the action which just
+    // changed the world, not generic exploration.  Letting any other ready
+    // interaction outrank it discards that operation sequence at exactly the
+    // moment a newly executable crossing appears.  Once the successor is
+    // occupied, ordinary executable goal work becomes authoritative again.
     if (opportunity.continuation)
-        return -1;
+        return 0;
+    if (isExecutableGoalOperation(opportunity) && opportunity.ready)
+        return 1;
     if (isDiscoveredTask(opportunity) && opportunity.ready)
-        return 0; // executable at the actor's present pose/component
+        return 2;
     if (!isDiscoveredTask(opportunity))
-        return 1; // explore to discover work or a missing route/prerequisite
-    return 2;     // remembered task, deferred on reaching a valid pose
+        return 3;
+    return 4;
 }
 
 static bool betterWork(const Opportunity &candidate, const Opportunity &best)

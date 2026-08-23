@@ -740,6 +740,7 @@ blood_game_proper := NBlood
 blood_game_objs := \
 	blood.cpp \
 	llmapper/bot/bot.cpp \
+	llmapper/bot/world_observer.cpp \
 	llmapper/bot/nav_kernel.cpp \
 	actor.cpp \
 	ai.cpp \

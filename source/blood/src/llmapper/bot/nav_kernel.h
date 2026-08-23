@@ -214,6 +214,8 @@ struct NavLink
     int airFrames;
     int launchVelocity;
     bool hasAirControl;
+    int airAngle;
+    bool hasAirAngle;
     // Revalidate this edge whenever live collision/topology changes. This is
     // independent of adapter provenance: a physical transition may cross
     // several engine partitions and have no single boundary owner.
@@ -223,7 +225,7 @@ struct NavLink
           takeoff(), hasTakeoff(false), condition(), transition(),
           airControl(0), airControlAfter(0), airControlSwitchFrame(0),
           airFrames(0), launchVelocity(0),
-          hasAirControl(false), dynamic(false)
+          hasAirControl(false), airAngle(0), hasAirAngle(false), dynamic(false)
     {
     }
 };
@@ -243,11 +245,16 @@ struct NavCell
     int clearance;
     int walkArea;
     bool inMotion;
-    // True when this pose exists in current engine collision.  A mechanism
-    // may also contribute hypothetical stable endpoint cells for conditional
-    // planning; those must never be mistaken for a presently occupiable
-    // interaction stance.
-    bool live;
+    // The pose is part of the current physical world.  A pose is retired
+    // (exists = false) only when the geometry that carried it actually
+    // changed.  Its identity, and every fact recorded against that identity,
+    // survive the retirement: a retired pose is a remembered place that is
+    // no longer there, not a forgotten one.
+    bool exists;
+    // The pose has been inside the actor's line of sight at least once.
+    // Physical geometry is observer-independent, so this only annotates a
+    // pose.  It never decides whether the pose belongs to the topology.
+    bool observed;
     // The support pose exists only with the crouched player collision hull.
     // This is occupancy state, not a property of an engine partition.
     bool crouchOnly;
@@ -258,8 +265,8 @@ struct NavCell
     std::vector<NavLink> links;
     NavCell()
         : id(), region(), z(0), support(), center(),
-          clearance(INT32_MAX), walkArea(-1), inMotion(false), live(true),
-          crouchOnly(false), informationFrontier(false)
+          clearance(INT32_MAX), walkArea(-1), inMotion(false), exists(false),
+          observed(false), crouchOnly(false), informationFrontier(false)
     {
     }
 };
@@ -289,6 +296,8 @@ struct NavRouteStep
     int airFrames;
     int launchVelocity;
     bool hasAirControl;
+    int airAngle;
+    bool hasAirAngle;
     NavRouteStep()
         : fromCell(), toCell(), gateway(), hasGateway(false), takeoff(),
           hasTakeoff(false), destination(), mode(kNavWalk), boundary(),
@@ -296,43 +305,53 @@ struct NavRouteStep
           sourceZ(0), targetZ(0), sourceSupport(), targetSupport(), condition(),
           transition(), airControl(0), airControlAfter(0),
           airControlSwitchFrame(0), airFrames(0), launchVelocity(0),
-          hasAirControl(false)
+          hasAirControl(false), airAngle(0), hasAirAngle(false)
     {
     }
 };
 
 // Stable poses and their physical consequences.  The flags are derived from
 // occupancy/clearance/connectivity; they are not mapper object classes.
-struct StablePose
+
+
+
+struct Preconditions
 {
-    int state;
-    int supportZ;
-    int clearance;
-    bool occupiable;
-    std::vector<int> connectedSurfaces;
-    StablePose() : state(0), supportZ(0), clearance(0), occupiable(false) {}
+    int key;
+    unsigned effects;
+    NavCondition state;
+    Preconditions() : key(0), effects(kEffectNone), state() {}
 };
 
-enum DynamicAffordance
+enum ExecutionDomainKind
 {
-    kAffordanceNone = 0,
-    kAffordanceEnablePassage = 1 << 0,
-    kAffordanceTransportSupportedPlayer = 1 << 1,
-    kAffordanceUnsafeSweptOccupancy = 1 << 2,
+    kExecutionUseScan,
+    kExecutionMeleeReach,
+    kExecutionLineOfEffect,
+    kExecutionContact,
 };
 
-struct StatefulGeometry
+// A lazy answer to "where can this action be executed?". `selected` is a
+// derived witness, not persistent semantic truth; the other fields name the
+// dependencies which validate that witness.
+struct ExecutionDomain
 {
-    StateVariableId stateVariable;
-    ObjectId object;
-    SupportId support;
-    std::vector<StablePose> poses;
-    std::vector<int> sweepClearances;
-    bool crush;
-    bool carriesSupport;
-    StatefulGeometry()
-        : stateVariable(), object(), support(), poses(), sweepClearances(), crush(false),
-          carriesSupport(false)
+    ExecutionDomainKind kind;
+    PoseId selected;
+    int topologyRevision;
+    int stateSignature;
+    int startArea;
+    SupportId startSupport;
+    int hops;
+    int angle;
+    int look;
+    int targetTopZ;
+    int targetBottomZ;
+    bool crouch;
+    ExecutionDomain()
+        : kind(kExecutionUseScan), selected(), topologyRevision(-1),
+          stateSignature(0), startArea(-1), startSupport(), hops(-1),
+          angle(0), look(0), targetTopZ(0), targetBottomZ(0), crouch(false)
     {
     }
 };
@@ -341,13 +360,14 @@ struct Affordance
 {
     AffordanceId id;
     ObjectId target;
-    PoseId actionPose;
+    ActionKind action;
+    Preconditions preconditions;
+    ExecutionDomain executionDomain;
     int command;
     bool destructible;
-    std::vector<ActionKind> actions;
     Affordance()
-        : id(), target(), actionPose(), command(0),
-          destructible(false), actions()
+        : id(), target(), action(kActionUse), preconditions(),
+          executionDomain(), command(0), destructible(false)
     {
     }
 };
@@ -406,21 +426,164 @@ struct DynamicPlanStats
     DynamicPlanStats() : routeSearches(0), prerequisiteExpansions(0) {}
 };
 
-struct NavEdgeFailure
+// What the actor tried and how it went.
+//
+// One store answers every "I tried this and it did not work" question, and it
+// does so without collapsing them into one shapeless record.  An attempt names
+// exactly four things: which operation was attempted, against which semantic
+// subject, under which world evidence the outcome holds, and what the outcome
+// was.  Keeping those four separate is what makes a single store sufficient --
+// the stores this replaces each hard-coded one particular combination of them
+// and could therefore answer only one shape of question.
+enum AttemptOperation
 {
-    PoseId fromCell;
-    PoseId toCell;
-    BoundaryId boundary;
-    // kNavBlocked is the wildcard used when the attempted transition was an
-    // observed boundary and its concrete graph mode may be re-derived.
-    NavEdgeMode mode;
-    int geometrySignature;
-    int attempts;
-    NavEdgeFailure()
-        : fromCell(), toCell(), boundary(), mode(kNavWalk), geometrySignature(0),
-          attempts(0)
+    kAttemptTraverse,     // move between two poses, possibly across a boundary
+    kAttemptActivate,     // execute an affordance on a target surface
+    kAttemptApproach,     // reach a pose from which an affordance is executable
+    kAttemptInvestigate,  // look through a boundary to resolve what lies beyond
+};
+
+// Which thing in the world the attempt was made against.  Unset fields are
+// wildcards *in the record*, never in the query: a record naming no subject at
+// all would match everything and is refused.
+struct AttemptSubject
+{
+    AttemptOperation operation;
+    int subject;      // boundary, affordance identity, or -1 for a pure pose pair
+    PoseId fromPose;  // physical context of a traversal
+    PoseId toPose;
+    int context;      // region the attempt was made from, -1 when irrelevant
+    NavEdgeMode mode; // kNavBlocked matches any traversal mode
+
+    AttemptSubject()
+        : operation(kAttemptTraverse), subject(-1), fromPose(), toPose(),
+          context(-1), mode(kNavBlocked)
     {
     }
+    AttemptSubject(AttemptOperation aOperation, int aSubject,
+                   int aContext = -1)
+        : operation(aOperation), subject(aSubject), fromPose(), toPose(),
+          context(aContext), mode(kNavBlocked)
+    {
+    }
+};
+
+struct Attempt
+{
+    AttemptSubject subject;
+    // The world revision under which this outcome is true.  When the evidence
+    // no longer matches, the record is simply not consulted -- outcomes expire
+    // by becoming irrelevant rather than by being swept up.
+    int evidence;
+    int attempts;
+    int tick;
+    Attempt() : subject(), evidence(0), attempts(0), tick(-1) {}
+};
+
+inline bool attemptMatches(const Attempt &record, const AttemptSubject &query,
+                           int evidence)
+{
+    if (record.subject.operation != query.operation)
+        return false;
+    // A record that identifies nothing describes nothing and must never block.
+    if (record.subject.subject < 0 && !record.subject.fromPose
+        && !record.subject.toPose)
+        return false;
+    if (evidence != 0 && record.evidence != 0 && record.evidence != evidence)
+        return false;
+    if (record.subject.subject >= 0 && record.subject.subject != query.subject)
+        return false;
+    if (record.subject.fromPose >= 0 && record.subject.fromPose != query.fromPose)
+        return false;
+    if (record.subject.toPose >= 0 && record.subject.toPose != query.toPose)
+        return false;
+    if (record.subject.context >= 0 && record.subject.context != query.context)
+        return false;
+    if (record.subject.mode != kNavBlocked && record.subject.mode != query.mode)
+        return false;
+    return true;
+}
+
+// The sole authority on attempt history.  Nothing else in the bot may keep a
+// private retry map.
+class AttemptLedger
+{
+public:
+    // Count one attempt against this subject under this evidence.  Returns the
+    // running total, so callers can report it without reading back.
+    int record(const AttemptSubject &subject, int evidence, int tick)
+    {
+        for (size_t i = 0; i < records_.size(); ++i)
+        {
+            Attempt &known = records_[i];
+            if (known.subject.operation != subject.operation
+                || known.subject.subject != subject.subject
+                || known.subject.fromPose != subject.fromPose
+                || known.subject.toPose != subject.toPose
+                || known.subject.context != subject.context
+                || known.subject.mode != subject.mode
+                || known.evidence != evidence)
+                continue;
+            ++known.attempts;
+            known.tick = tick;
+            return known.attempts;
+        }
+        Attempt fresh;
+        fresh.subject = subject;
+        fresh.evidence = evidence;
+        fresh.attempts = 1;
+        fresh.tick = tick;
+        records_.push_back(fresh);
+        return 1;
+    }
+
+    int attempts(const AttemptSubject &query, int evidence) const
+    {
+        int total = 0;
+        for (size_t i = 0; i < records_.size(); ++i)
+            if (attemptMatches(records_[i], query, evidence))
+                total += records_[i].attempts;
+        return total;
+    }
+
+    bool tried(const AttemptSubject &query, int evidence) const
+    {
+        return attempts(query, evidence) > 0;
+    }
+
+    // Withdraw everything recorded against one subject, whatever the evidence.
+    // Used when the world changed in a way that makes past outcomes moot.
+    void forget(AttemptOperation operation, int subject)
+    {
+        size_t out = 0;
+        for (size_t i = 0; i < records_.size(); ++i)
+        {
+            if (records_[i].subject.operation == operation
+                && records_[i].subject.subject == subject)
+                continue;
+            records_[out++] = records_[i];
+        }
+        records_.resize(out);
+    }
+
+    template <typename Predicate>
+    void forgetIf(Predicate drop)
+    {
+        size_t out = 0;
+        for (size_t i = 0; i < records_.size(); ++i)
+        {
+            if (drop(records_[i]))
+                continue;
+            records_[out++] = records_[i];
+        }
+        records_.resize(out);
+    }
+
+    size_t size() const { return records_.size(); }
+    const std::vector<Attempt> &records() const { return records_; }
+
+private:
+    std::vector<Attempt> records_;
 };
 
 struct Boundary
@@ -438,36 +601,12 @@ struct Boundary
     }
 };
 
-struct DerivedFrontier
-{
-    RegionId destination;
-    FrontierKind kind;
-    std::vector<Boundary> candidates;
-    DerivedFrontier() : destination(), kind(kFrontierOpen) {}
-};
 
 // Semantic exploration samples contain no engine-container identity.
 // `partition` exists only so representation-invariance tests can prove that
 // changing adapter tessellation cannot change the derived work.
 // Physical routing remains in NavCell/NavLink; this projection answers only
 // whether a reachable visibility boundary is worth investigating.
-struct VisibilityCell
-{
-    int id;
-    int x;
-    int y;
-    int z;
-    int area;
-    int partition;
-    bool observed;
-    bool reachable;
-    std::vector<int> neighbors;
-    VisibilityCell()
-        : id(-1), x(0), y(0), z(0), area(-1), partition(-1), observed(false),
-          reachable(false)
-    {
-    }
-};
 
 struct VisibilityFrontier
 {
@@ -481,14 +620,6 @@ struct VisibilityFrontier
           requiresOccupancy(false) {}
 };
 
-struct InvestigateRecord
-{
-    BoundaryId boundary;
-    RegionId source;
-    RegionId destination;
-    int geometrySignature;
-    InvestigateRecord() : boundary(), source(), destination(), geometrySignature(0) {}
-};
 
 struct CombatSituation
 {
@@ -703,42 +834,20 @@ inline bool walkMode(NavEdgeMode mode)
     return mode == kNavWalk || mode == kNavStep;
 }
 
-inline bool edgeFailed(const NavEdgeFailure &failure, PoseId fromCell, PoseId toCell,
-                       BoundaryId boundary, NavEdgeMode mode, int geometrySignature)
+// Is this concrete transition known to have failed under the evidence that
+// still holds?  Only unset fields in the RECORD are wildcards; treating an
+// unset field in the QUERY as one meant a record naming a single boundary
+// matched every boundary-less local link -- that is, the whole mesh -- and the
+// bot lost the ability to cross its own room.
+inline bool traversalBlocked(const AttemptLedger &ledger, PoseId fromCell,
+                             PoseId toCell, BoundaryId boundary,
+                             NavEdgeMode mode, int geometrySignature)
 {
-    // Unset fields act as wildcards, so a record that identifies no boundary and
-    // no cells would match every link and erase the whole mesh.  Such a
-    // record describes nothing and must never block anything.
-    if (!failure.boundary && !failure.fromCell && !failure.toCell)
-        return false;
-    if (geometrySignature != 0 && failure.geometrySignature != 0
-        && failure.geometrySignature != geometrySignature)
-        return false;
-    // Only unset fields in the RECORD are wildcards.  Treating an unset
-    // field in the QUERY as a wildcard too meant a record naming one boundary
-    // matched every boundary-less local link -- that is, the whole
-    // navigation mesh -- and the bot lost the ability to cross its own room.
-    if (failure.boundary && failure.boundary != boundary)
-        return false;
-    if (failure.fromCell >= 0 && failure.fromCell != fromCell)
-        return false;
-    if (failure.toCell >= 0 && failure.toCell != toCell)
-        return false;
-    if (failure.mode != kNavBlocked && failure.mode != mode)
-        return false;
-    return true;
-}
-
-inline bool edgeFailedAny(const std::vector<NavEdgeFailure> &failures, PoseId fromCell,
-                          PoseId toCell, BoundaryId boundary, NavEdgeMode mode,
-                          int geometrySignature)
-{
-    for (size_t i = 0; i < failures.size(); ++i)
-    {
-        if (edgeFailed(failures[i], fromCell, toCell, boundary, mode, geometrySignature))
-            return true;
-    }
-    return false;
+    AttemptSubject query(kAttemptTraverse, boundary);
+    query.fromPose = fromCell;
+    query.toPose = toCell;
+    query.mode = mode;
+    return ledger.tried(query, geometrySignature);
 }
 
 inline TraversalResult classifyTraversal(int floorDelta, int clearance,
@@ -824,8 +933,6 @@ inline NavEdgeMode modeFromTraversal(TraversalResult result)
     }
 }
 
-int deriveDynamicAffordances(const StatefulGeometry &geometry,
-                             int requiredClearance);
 
 NavLink makeConditionalTraversal(PoseId target, NavEdgeMode mode,
                                  StateVariableId variable, int state,
@@ -843,36 +950,18 @@ void assignWalkAreas(std::vector<NavCell> &cells);
 // Mark the poses physically reachable in the current geometry. Region
 // membership alone is not proof that an approach pose can be reached.
 void markReachableNavCells(const std::vector<NavCell> &cells, PoseId startCell,
-                           const std::vector<NavEdgeFailure> &failures,
+                           const AttemptLedger &attempts,
                            int geometrySignature,
                            std::vector<char> &reachable);
 
-// Connect two otherwise independent region-local layers through an
-// adapter-observed translation; mere XY overlap never creates an edge.
-int linkTranslatedNavLayers(std::vector<NavCell> &cells, RegionId upperRegion,
-                            SupportId upperSupport, RegionId lowerRegion,
-                            SupportId lowerSupport, int deltaX, int deltaY,
-                            int maximumError, TransitionId transition);
-
 bool planNavRoute(const std::vector<NavCell> &cells, PoseId startCell,
                   PoseId targetCell,
-                  const std::vector<NavEdgeFailure> &failures,
+                  const AttemptLedger &attempts,
                   int geometrySignature,
                   std::vector<NavRouteStep> &outRoute);
 
-std::vector<DerivedFrontier> deriveFrontiers(
-    const std::vector<RegionId> &visitedRegions,
-    const std::vector<Boundary> &boundaries,
-    const std::vector<InvestigateRecord> &investigated,
-    const std::vector<NavEdgeFailure> &failedCrossings);
 
-int selectFrontierIndex(const std::vector<DerivedFrontier> &frontiers,
-                        RegionId currentRegion, const int *hops, int hopCount);
 
-std::vector<VisibilityFrontier> deriveVisibilityFrontiers(
-    const std::vector<VisibilityCell> &cells, int mergeRadius,
-    int gainRadius, int approachRadius = 0x7fffffff,
-    int maximumRise = 0x7fffffff);
 
 const char *navEdgeModeName(NavEdgeMode mode);
 const char *traversalResultName(TraversalResult result);
@@ -880,18 +969,5 @@ const char *combatTacticName(CombatTactic tactic);
 
 CombatDecision chooseCombatTactic(const CombatSituation &situation);
 
-inline bool investigatedNow(const std::vector<InvestigateRecord> &records,
-                            BoundaryId boundary, RegionId source,
-                            RegionId destination, int geometrySignature)
-{
-    for (size_t i = 0; i < records.size(); ++i)
-    {
-        if (records[i].boundary == boundary && records[i].source == source
-            && records[i].destination == destination
-            && records[i].geometrySignature == geometrySignature)
-            return true;
-    }
-    return false;
-}
 
 } // namespace llmapper
