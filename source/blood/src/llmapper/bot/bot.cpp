@@ -43,6 +43,7 @@ namespace {
 constexpr int kUseRange = 1024;
 constexpr int kWaypointTolerance = 160;
 constexpr int kPhysicalWitnessTolerance = 48;
+constexpr int kSupportPoseTolerance = 256;
 int gPhysicalProbeCount = 0;
 
 bool validSector(int sectorId)
@@ -115,12 +116,15 @@ struct Pose
     int y = 0;
     int z = 0;
     int sector = -1;
+    int supportZ = 0;
 
     bool samePlace(const Pose &other, int tolerance = kWaypointTolerance) const
     {
         return sector == other.sector
             && distanceSquared(x, y, other.x, other.y)
-                <= int64_t(tolerance) * tolerance;
+                <= int64_t(tolerance) * tolerance
+            && std::abs(supportZ - other.supportZ)
+                <= kSupportPoseTolerance;
     }
 };
 
@@ -141,7 +145,8 @@ bool engineLineHasContinuousSupport(const Pose &from, const Pose &to,
     const int samples = std::max(1,
         (length + std::max(1, body.radius) - 1) / std::max(1, body.radius));
     int16_t sectorId = int16_t(from.sector);
-    int supportZ = from.z + body.footOffset;
+    int supportZ = from.supportZ;
+    int supportDirection = 0;
     spritetype *actor = gMe->pSprite;
     const int savedCstat = actor->cstat;
     actor->cstat &= ~257;
@@ -164,16 +169,27 @@ bool engineLineHasContinuousSupport(const Pose &from, const Pose &to,
             body.radius + 16, CLIPMASK0,
             PARALLAXCLIP_CEILING | PARALLAXCLIP_FLOOR);
         if (floorZ - ceilingZ
-                < body.ceilingDistance + body.floorDistance
-            || std::abs(floorZ - supportZ) > 1024)
+                < body.ceilingDistance + body.floorDistance)
         {
             actor->cstat = int16_t(savedCstat);
             return false;
         }
+        const int supportDelta = floorZ - supportZ;
+        const int direction = supportDelta > kSupportPoseTolerance ? 1
+            : supportDelta < -kSupportPoseTolerance ? -1 : 0;
+        if (direction && supportDirection && direction != supportDirection)
+        {
+            actor->cstat = int16_t(savedCstat);
+            return false;
+        }
+        if (direction)
+            supportDirection = direction;
         supportZ = floorZ;
     }
     actor->cstat = int16_t(savedCstat);
-    return sectorId == to.sector || inside(to.x, to.y, sectorId) == 1;
+    return (sectorId == to.sector || inside(to.x, to.y, sectorId) == 1)
+        && std::abs(supportZ - to.supportZ)
+            <= kSupportPoseTolerance;
 }
 
 LineProbe engineWalkLine(const Pose &from, const Pose &to, int tolerance)
@@ -192,14 +208,14 @@ LineProbe engineWalkLine(const Pose &from, const Pose &to, int tolerance)
 
     int x = from.x;
     int y = from.y;
-    int z = from.z;
+    int z = from.supportZ - body.footOffset;
     int sectorId = from.sector;
     result.hit = int(ClipMove(
         &x, &y, &z, &sectorId, to.x - from.x, to.y - from.y,
         body.radius, body.ceilingDistance, body.floorDistance, CLIPMASK0));
     actor->cstat = int16_t(savedCstat);
 
-    result.end = { x, y, z, sectorId };
+    result.end = { x, y, z, sectorId, from.supportZ };
     result.reached = validSector(sectorId)
         && distanceSquared(x, y, to.x, to.y)
             <= int64_t(tolerance) * tolerance
@@ -246,6 +262,7 @@ Pose poseOnEngineSupport(int sectorId, int x, int y)
         return result;
     }
     result.z = floorZ - body.footOffset;
+    result.supportZ = floorZ;
     return result;
 }
 
@@ -372,9 +389,6 @@ bool portalWitness(int wallId, int fromSector, Pose &source, Pose &target)
                     continue;
                 source = poseOnEngineSupport(fromSector, sourceX, sourceY);
                 target = poseOnEngineSupport(toSector, targetX, targetY);
-                if (std::abs((target.z + body.footOffset)
-                             - (source.z + body.footOffset)) > 1024)
-                    continue;
                 if (engineWalkLine(source, target,
                                    std::max(48, body.radius / 2)).reached)
                     return true;
@@ -519,6 +533,30 @@ struct Interaction
     int requiredKey = 0;
 };
 
+using MovingObject = std::pair<int, int>;
+
+std::set<MovingObject> movingWorldObjects()
+{
+    std::set<MovingObject> result;
+    for (int i = 0; i < numsectors; ++i)
+        if (sector[i].extra > 0 && sector[i].extra < kMaxXSectors
+            && xsector[sector[i].extra].busy != 0
+            && xsector[sector[i].extra].busy != 65536)
+            result.insert({ 6, i });
+    for (int i = 0; i < numwalls; ++i)
+        if (wall[i].extra > 0 && wall[i].extra < kMaxXWalls
+            && xwall[wall[i].extra].busy != 0
+            && xwall[wall[i].extra].busy != 65536)
+            result.insert({ 0, i });
+    for (int i = 0; i < kMaxSprites; ++i)
+        if (validSprite(i) && sprite[i].extra > 0
+            && sprite[i].extra < kMaxXSprites
+            && xsprite[sprite[i].extra].busy != 0
+            && xsprite[sprite[i].extra].busy != 65536)
+            result.insert({ 3, i });
+    return result;
+}
+
 bool playerHasKey(int key)
 {
     return key <= 0 || (gMe && key < int(sizeof(gMe->hasKey))
@@ -533,6 +571,33 @@ bool interactionMatches(const Interaction &interaction,
     if (interaction.key.kind == InteractionKind::Sector)
         return hit == 6 && target == interaction.key.id;
     return hit == 3 && target == interaction.key.id;
+}
+
+bool interactionPreconditionsSatisfied(const Interaction &interaction)
+{
+    if (!playerHasKey(interaction.requiredKey))
+        return false;
+    if (interaction.key.kind == InteractionKind::Wall)
+    {
+        if (!validWall(interaction.key.id))
+            return false;
+        const int extra = wall[interaction.key.id].extra;
+        return extra > 0 && extra < kMaxXWalls
+            && !xwall[extra].locked && !xwall[extra].isTriggered;
+    }
+    if (interaction.key.kind == InteractionKind::Sector)
+    {
+        if (!validSector(interaction.key.id))
+            return false;
+        const int extra = sector[interaction.key.id].extra;
+        return extra > 0 && extra < kMaxXSectors
+            && !xsector[extra].locked && !xsector[extra].isTriggered;
+    }
+    if (!validSprite(interaction.key.id))
+        return false;
+    const int extra = sprite[interaction.key.id].extra;
+    return extra > 0 && extra < kMaxXSprites
+        && !xsprite[extra].locked && !xsprite[extra].isTriggered;
 }
 
 int lookForTarget(int eyeZ, int targetZ, int horizontal)
@@ -558,7 +623,8 @@ bool previewUseFromPose(const Interaction &interaction, const Pose &pose,
 
     actor->x = pose.x;
     actor->y = pose.y;
-    actor->z = pose.z;
+    const BodyShape body = liveBodyShape();
+    actor->z = pose.supportZ - body.footOffset;
     actor->sectnum = int16_t(pose.sector);
     actor->ang = int16_t(angle);
     gMe->q16ang = fix16_from_int(angle);
@@ -566,7 +632,7 @@ bool previewUseFromPose(const Interaction &interaction, const Pose &pose,
     gMe->q16horiz = fix16_from_float(
         100.f * tanf(float(look) * 3.14159265358979323846f / 1024.f));
     gMe->slope = (-fix16_to_int(gMe->q16horiz)) << 7;
-    gMe->zView = pose.z
+    gMe->zView = actor->z
         - gMe->pPosture[gMe->lifeMode][gMe->posture].eyeAboveZ;
     int target = -1;
     int extra = -1;
@@ -670,7 +736,7 @@ bool findUsePose(const Interaction &interaction, int approachSector,
     {
         const int angle = getangle(
             interaction.x - candidate.x, interaction.y - candidate.y);
-        const int eyeZ = candidate.z
+        const int eyeZ = candidate.supportZ - liveBodyShape().footOffset
             - gMe->pPosture[gMe->lifeMode][gMe->posture].eyeAboveZ;
         const int look = lookForTarget(eyeZ, interaction.targetZ,
             distanceTo(candidate.x, candidate.y,
@@ -750,6 +816,8 @@ struct LLMapperBot::Impl
     bool actionWorldChanged = false;
     bool physicalStateInProgressReported = false;
     uint64_t actionWorldBefore = 0;
+    std::set<MovingObject> actionMotionBefore;
+    std::set<MovingObject> actionMovingEffects;
     int topologyBuilds = 0;
     int localSearches = 0;
 
@@ -796,7 +864,9 @@ struct LLMapperBot::Impl
 
     Pose playerPose() const
     {
-        return { player.x, player.y, player.z, player.sector };
+        const BodyShape body = liveBodyShape();
+        return { player.x, player.y, player.z, player.sector,
+                 player.z + body.footOffset };
     }
 
     uint64_t worldSignature() const
@@ -832,48 +902,7 @@ struct LLMapperBot::Impl
 
     bool worldStateInProgress() const
     {
-        for (int i = 0; i < numsectors; ++i)
-            if (sector[i].extra > 0 && sector[i].extra < kMaxXSectors
-                && xsector[sector[i].extra].busy != 0
-                && xsector[sector[i].extra].busy != 65536)
-                return true;
-        for (int i = 0; i < numwalls; ++i)
-            if (wall[i].extra > 0 && wall[i].extra < kMaxXWalls
-                && xwall[wall[i].extra].busy != 0
-                && xwall[wall[i].extra].busy != 65536)
-                return true;
-        for (int i = 0; i < kMaxSprites; ++i)
-            if (validSprite(i) && sprite[i].extra > 0
-                && sprite[i].extra < kMaxXSprites
-                && xsprite[sprite[i].extra].busy != 0
-                && xsprite[sprite[i].extra].busy != 65536)
-                return true;
-        return false;
-    }
-
-    bool interactionStateInProgress(const Interaction &interaction) const
-    {
-        if (interaction.key.kind == InteractionKind::Wall)
-        {
-            if (!validWall(interaction.key.id))
-                return false;
-            const int extra = wall[interaction.key.id].extra;
-            return extra > 0 && extra < kMaxXWalls
-                && xwall[extra].busy != 0 && xwall[extra].busy != 65536;
-        }
-        if (interaction.key.kind == InteractionKind::Sector)
-        {
-            if (!validSector(interaction.key.id))
-                return false;
-            const int extra = sector[interaction.key.id].extra;
-            return extra > 0 && extra < kMaxXSectors
-                && xsector[extra].busy != 0 && xsector[extra].busy != 65536;
-        }
-        if (!validSprite(interaction.key.id))
-            return false;
-        const int extra = sprite[interaction.key.id].extra;
-        return extra > 0 && extra < kMaxXSprites
-            && xsprite[extra].busy != 0 && xsprite[extra].busy != 65536;
+        return !movingWorldObjects().empty();
     }
 
     void observe()
@@ -1015,12 +1044,27 @@ struct LLMapperBot::Impl
             if (!actionWorldChanged)
                 event("world_changed", "source=accepted_use");
             actionWorldChanged = true;
+            const std::set<MovingObject> moving = movingWorldObjects();
+            for (const MovingObject &object : moving)
+                if (!actionMotionBefore.count(object))
+                    actionMovingEffects.insert(object);
+        }
+        bool effectInProgress = false;
+        if (waitingForActionWorldChange && actionWorldChanged)
+        {
+            const std::set<MovingObject> moving = movingWorldObjects();
+            for (const MovingObject &object : actionMovingEffects)
+                if (moving.count(object))
+                {
+                    effectInProgress = true;
+                    break;
+                }
         }
         if (waitingForActionWorldChange && actionWorldChanged
-            && !interactionStateInProgress(activeWork.interaction))
+            && !effectInProgress)
         {
             waitingForActionWorldChange = false;
-            event("action_state_settled", "source=engine_busy");
+            event("action_state_settled", "source=observed_effects");
         }
     }
 
@@ -1117,7 +1161,7 @@ struct LLMapperBot::Impl
         {
             const Interaction &interaction = entry.second;
             if (resolvedInteractions.count(interaction.key)
-                || !playerHasKey(interaction.requiredKey))
+                || !interactionPreconditionsSatisfied(interaction))
                 continue;
             bool routedDomainFound = false;
             Work bestDomainWork;
@@ -1305,6 +1349,8 @@ struct LLMapperBot::Impl
         if (interactionMatches(activeWork.interaction, hit, target))
         {
             actionWorldBefore = worldSignature();
+            actionMotionBefore = movingWorldObjects();
+            actionMovingEffects.clear();
             return llmapper::commandToInput(
                 { llmapper::PhysicalCommandType::Use });
         }
@@ -1328,7 +1374,8 @@ struct LLMapperBot::Impl
             activeWork.interaction.y - player.y);
         const int eyeAbove =
             gMe->pPosture[gMe->lifeMode][gMe->posture].eyeAboveZ;
-        const int plannedEyeZ = activeWork.destination.z - eyeAbove;
+        const int plannedEyeZ = activeWork.destination.supportZ
+            - liveBodyShape().footOffset - eyeAbove;
         const int plannedBaseLook = lookForTarget(
             plannedEyeZ, activeWork.interaction.targetZ,
             distanceTo(activeWork.destination.x, activeWork.destination.y,
@@ -1546,11 +1593,29 @@ void LLMapperBot::OnActionResolved(int hit, int target, int, bool accepted,
     std::snprintf(detail, sizeof(detail),
         "hit=%d target=%d accepted=%d", hit, target, accepted ? 1 : 0);
     m_impl->event("use_resolved", detail);
-    if (!interactionMatches(m_impl->activeWork.interaction, hit, target)
-        || !accepted)
+    if (!interactionMatches(m_impl->activeWork.interaction, hit, target))
     {
         m_impl->result = "MODEL_CONTRADICTION";
-        m_impl->failureReason = "engine rejected a previewed USE action";
+        m_impl->failureReason = "engine resolved USE to a different target";
+        m_impl->event("model_contradiction", m_impl->failureReason.c_str());
+        gQuitGame = true;
+        return;
+    }
+    if (!accepted)
+    {
+        // The execution ray was valid, but a semantic state precondition may
+        // have changed since planning (for example, an object became locked).
+        // Preserve the affordance and replan from the observed state. An
+        // unexplained rejection remains a model contradiction.
+        if (!interactionPreconditionsSatisfied(m_impl->activeWork.interaction))
+        {
+            m_impl->event("action_precondition_unsatisfied",
+                          "source=engine_state");
+            m_impl->hasActiveWork = false;
+            return;
+        }
+        m_impl->result = "MODEL_CONTRADICTION";
+        m_impl->failureReason = "engine rejected an executable USE action";
         m_impl->event("model_contradiction", m_impl->failureReason.c_str());
         gQuitGame = true;
         return;

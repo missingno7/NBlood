@@ -1885,12 +1885,13 @@ void ProcessInput(PLAYER *pPlayer)
                     viewSetMessage("It's locked");
                     sndStartSample(3062, 255, 2, 0);
                 }
-                if (!key || pPlayer->hasKey[key])
+                if (!pXSector->locked && !pXSector->isTriggered
+                    && (!key || pPlayer->hasKey[key]))
                 {
                     accepted = true;
                     trTriggerSector(a2, pXSector, kCmdSpritePush, pPlayer->nSprite);
                 }
-                else if (pPlayer == gMe)
+                else if (key && !pPlayer->hasKey[key] && pPlayer == gMe)
                 {
                     viewSetMessage("That requires a key.");
                     sndStartSample(3063, 255, 2, 0);
@@ -1906,12 +1907,13 @@ void ProcessInput(PLAYER *pPlayer)
                 viewSetMessage("It's locked");
                 sndStartSample(3062, 255, 2, 0);
             }
-            if (!key || pPlayer->hasKey[key])
+            if (!pXWall->locked && !pXWall->isTriggered
+                && (!key || pPlayer->hasKey[key]))
             {
                 accepted = true;
                 trTriggerWall(a2, pXWall, kCmdWallPush, pPlayer->nSprite);
             }
-            else if (pPlayer == gMe)
+            else if (key && !pPlayer->hasKey[key] && pPlayer == gMe)
             {
                 viewSetMessage("That requires a key.");
                 sndStartSample(3063, 255, 2, 0);
@@ -1924,12 +1926,13 @@ void ProcessInput(PLAYER *pPlayer)
             key = pXSprite->key;
             if (pXSprite->locked && pPlayer == gMe && pXSprite->lockMsg)
                 trTextOver(pXSprite->lockMsg);
-            if (!key || pPlayer->hasKey[key])
+            if (!pXSprite->locked && !pXSprite->isTriggered
+                && (!key || pPlayer->hasKey[key]))
             {
                 accepted = true;
                 trTriggerSprite(a2, pXSprite, kCmdSpritePush, pPlayer->nSprite);
             }
-            else if (pPlayer == gMe)
+            else if (key && !pPlayer->hasKey[key] && pPlayer == gMe)
             {
                 viewSetMessage("That requires a key.");
                 sndStartSample(3063, 255, 2, 0);
