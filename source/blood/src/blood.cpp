@@ -1276,6 +1276,7 @@ SWITCH switches[] = {
     { "bot_demo", 50, 1 },
     { "bot_realtime", 51, 0 },
     { "bot_visible", 52, 0 },
+    { "bot_debug", 54, 0 },
     { "playback_speed", 53, 1 },
     { NULL, 0, 0 }
 };
@@ -1635,6 +1636,9 @@ void ParseOptions(void)
             break;
         case 52:
             gLLMapperBot.SetVisible(true);
+            break;
+        case 54:
+            gLLMapperBot.SetDebugOverlay(true);
             break;
         case 53:
             if (OptArgc < 1)
@@ -2009,6 +2013,17 @@ RESTART:
                     gInput = {};
                     do
                     {
+                        // One decision per game tick. This loop runs as many
+                        // ticks as real time has fallen behind by, and giving
+                        // all of them the same decision applies one steering
+                        // choice several times over: a different bot at every
+                        // frame rate, and a different bot again whenever the
+                        // frame rate moves. Asking here makes the rate the
+                        // bot thinks at the rate the game acts at, which is
+                        // what it already is when the game runs flat out.
+                        if (gLLMapperBot.Enabled() && gGameStarted
+                            && gInputMode == INPUT_MODE_0)
+                            gNetInput = gLLMapperBot.GetInput();
                         netGetInput();
                         gNetFifoClock += kTicsPerFrame;
                         while (gNetFifoHead[myconnectindex]-gNetFifoTail > gBufferJitter && !gStartNewGame && !gQuitGame)

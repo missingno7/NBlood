@@ -154,13 +154,9 @@ void ctrlGetInput(void)
 {
     if (gLLMapperBot.Enabled() && gGameStarted && gInputMode == INPUT_MODE_0)
     {
-        // In realtime visible mode, the render loop can call ctrlGetInput
-        // before the next network tick is due. Preserve the pending bot input
-        // instead of replacing a one-frame jump/use pulse with a later idle
-        // decision before netGetInput() consumes it.
-        if (!gLLMapperBot.Fast() && totalclock < gNetFifoClock)
-            return;
-        gInput = gLLMapperBot.GetInput();
+        // The bot is asked once per game tick, beside netGetInput, and not
+        // here: this runs once per drawn frame, which is a different rate
+        // and not a constant one.
         return;
     }
 

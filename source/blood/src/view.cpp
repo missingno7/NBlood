@@ -3877,6 +3877,12 @@ RORHACK:
         sub_5571C(1);
         int nSpriteSortCnt = spritesortcnt;
         renderDrawMasks();
+        // Drawn from the exact camera handed to the renderer, so the overlay
+        // is a view of the bot's own world model rather than a second guess
+        // at where the player is.
+        gLLMapperBot.DrawDebugOverlay(
+            cX, cY, cZ, cA,
+            q16horiz + fix16_from_int(defaultHoriz) + deliriumPitchI);
         spritesortcnt = nSpriteSortCnt;
         sub_5571C(0);
         sub_557C4(cX, cY, gInterpolate);

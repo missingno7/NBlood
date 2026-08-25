@@ -8,19 +8,6 @@
 #include "fix16.h"
 #include "../../controls.h"
 
-struct LLMapperPlayerState
-{
-    int x = 0;
-    int y = 0;
-    int z = 0;
-    int sector = -1;
-    int angle = 0;
-    int horizon = 0;
-    bool onGround = false;
-    bool crouched = false;
-    bool alive = false;
-};
-
 class LLMapperBot
 {
 public:
@@ -31,6 +18,10 @@ public:
     void ConfigureTimeout(int seconds);
     void SetFast(bool fast);
     void SetVisible(bool visible);
+    // Paint the semantic world into the game view. Independent of the bot:
+    // it is for looking at the model while a person plays the level.
+    void SetDebugOverlay(bool debug);
+    bool DebugOverlay() const { return m_debug; }
 
     bool Enabled() const { return m_enabled; }
     bool Fast() const { return m_fast; }
@@ -42,6 +33,8 @@ public:
     void OnLevelExit(int exitType);
     void Finish(const char *reason = nullptr);
     void DrawStatus();
+    void DrawDebugOverlay(int cameraX, int cameraY, int cameraZ,
+                          fix16_t cameraAngle, fix16_t cameraHorizon);
 
 private:
     LLMapperBot(const LLMapperBot &) = delete;
@@ -52,6 +45,7 @@ private:
     bool m_enabled;
     bool m_fast;
     bool m_visible;
+    bool m_debug;
 };
 
 extern LLMapperBot gLLMapperBot;

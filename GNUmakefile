@@ -740,6 +740,20 @@ blood_game_proper := NBlood
 blood_game_objs := \
 	blood.cpp \
 	llmapper/bot/bot.cpp \
+	llmapper/bot/semantic/semantic_world.cpp \
+	llmapper/bot/semantic/geometry.cpp \
+	llmapper/bot/terrain/terrain_model.cpp \
+	llmapper/bot/traversal/traversal_model.cpp \
+	llmapper/bot/nav/local_path.cpp \
+	llmapper/bot/planner/bot_planner.cpp \
+	llmapper/bot/exec/bot_executor.cpp \
+	llmapper/bot/blood/blood_physics.cpp \
+	llmapper/bot/blood/blood_terrain.cpp \
+	llmapper/bot/blood/caleb_physics.cpp \
+	llmapper/bot/blood/blood_interactions.cpp \
+	llmapper/bot/blood/blood_world_adapter.cpp \
+	llmapper/bot/debug/bot_debug.cpp \
+	llmapper/bot/debug/bot_overlay.cpp \
 	actor.cpp \
 	ai.cpp \
 	aibat.cpp \
