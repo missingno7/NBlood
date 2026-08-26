@@ -582,6 +582,29 @@ void subtractCollinear(const std::vector<Segment> &in,
     }
 }
 
+bool touches(const Polygon &shape, const Vec2 &at, int distance)
+{
+    if (pointInPolygon(shape, at))
+        return true;
+    const int64_t reach = int64_t(distance) * distance;
+    auto meetsLoop = [&](const Loop &loop) {
+        for (size_t i = 0; i < loop.size(); ++i)
+        {
+            const Vec2 &a = loop[i];
+            const Vec2 &b = loop[(i + 1) % loop.size()];
+            if (pointSegmentDistanceSquared(at, a, b) <= reach)
+                return true;
+        }
+        return false;
+    };
+    if (meetsLoop(shape.outer))
+        return true;
+    for (const Loop &hole : shape.holes)
+        if (meetsLoop(hole))
+            return true;
+    return false;
+}
+
 bool loopsOverlap(const Loop &left, const Loop &right)
 {
     for (const Vec2 &point : left)

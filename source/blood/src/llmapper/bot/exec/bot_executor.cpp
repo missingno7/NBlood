@@ -22,9 +22,13 @@ void Executor::begin(const planner::Decision &decision,
     m_affordance = decision.affordance;
     m_option = decision.option;
     m_relation = decision.relation;
+    m_leaveAtOnce = decision.leaveAtOnce;
+    m_escapeTo = decision.escapeTo;
+    m_acted = false;
     m_waypoint = kNoId;
     m_block = Block::None;
     m_route.clear();
+    m_through.clear();
     m_via.clear();
     m_index = 0;
     m_legKnown = false;
@@ -53,6 +57,7 @@ void Executor::clear()
     m_relation = kNoId;
     m_waypoint = kNoId;
     m_route.clear();
+    m_through.clear();
     m_via.clear();
     m_index = 0;
 }
@@ -140,17 +145,32 @@ bool Executor::follow(const SemanticWorld &world,
                       const traversal::TraversalModel &traversal)
 {
     const RegionId here = world.actor().region;
+    const size_t piece = traversal.actorPlace();
     m_rerouted = false;
     size_t standing = m_route.size();
+    // Which visit to this region the body is on, said in pieces of free
+    // space rather than in region ids. A route across a ring-shaped ledge
+    // and back along a bridge enters the same region at both ends; matching
+    // on the region alone picks the later one and the walk starts at the far
+    // end of a crossing it has not made.
     for (size_t index = m_route.size(); index-- > 0;)
-        if (m_route[index] == here)
+        if (m_route[index] == here
+            && (index >= m_through.size() || m_through[index] == piece))
         {
             standing = index;
             break;
         }
     if (standing == m_route.size())
+        for (size_t index = m_route.size(); index-- > 0;)
+            if (m_route[index] == here)
+            {
+                standing = index;
+                break;
+            }
+    if (standing == m_route.size())
     {
         m_route.clear();
+        m_through.clear();
         m_via.clear();
         m_index = 0;
         m_rerouted = true;
@@ -160,8 +180,9 @@ bool Executor::follow(const SemanticWorld &world,
         // width, and arriving in the wrong one is arriving nowhere.
         const bool found = m_intent == planner::Intent::ExecuteAffordance
             ? traversal.optionRoute(here, m_affordance, m_option,
-                                    m_route, m_via)
-            : traversal.route(here, m_destination, m_route, m_via);
+                                    m_route, m_via, &m_through)
+            : traversal.route(here, m_destination, m_route, m_via,
+                              &m_through);
         if (!found || m_via.empty())
             return false;
         standing = 0;
@@ -188,6 +209,7 @@ bool Executor::steerInside(const SemanticWorld &world,
 {
     // The same walls the derivation used, so the executor cannot decide a
     // route exists where the model decided it does not.
+    m_radiusUsed = radius;
     traversal.openingsFor(world, region.id, m_openings);
     const nav::LocalMap &map = traversal.navigator().mapFor(region,
                                                             m_openings,
@@ -209,12 +231,29 @@ bool Executor::steerInside(const SemanticWorld &world,
         m_failure.openings = m_openings.size();
         return false;
     }
-    // The first leg, and only the first leg. The path is derived afresh from
-    // where the body actually is, so its first point is by construction the
-    // next place worth being; skipping ahead to a later one on the grounds
-    // that this one is nearby is how a body ends up driving at a point on
-    // the far side of the corner it has not rounded yet.
-    size_t step = 0;
+    // The furthest point on the route the body can already see.
+    //
+    // Taking the first one instead is right in spirit and wrong in practice.
+    // The route is worked out afresh from wherever the body is, and the graph
+    // connects that position to every node it can see, so the first hop is
+    // routinely a node ten or twenty units away -- one it is already
+    // standing on top of. Driving at a point ten units off at walking pace
+    // overshoots it by thirty, and the next tick works out the same route
+    // and drives back. In a room the body sails past and the next route no
+    // longer mentions it; in a corridor there is nowhere to sail to, and it
+    // rocks back and forth on the spot until the goal is given up on. Twelve
+    // units short of a waypoint, for twenty-four thousand ticks.
+    //
+    // Seeing a point means the straight leg to it clears every wall by the
+    // body's own width, which is the same test the route was built out of --
+    // so skipping to it cannot cut a corner the route was going round. It is
+    // the same route, minus the hops that were never going to move anything.
+    size_t step = m_path.size();
+    while (step-- > 0)
+        if (map.clearBetween(from, m_path[step]))
+            break;
+    if (step >= m_path.size())
+        step = 0;
     while (step < m_path.size() && m_path[step] == from)
         ++step;
     if (step >= m_path.size())
@@ -226,7 +265,22 @@ bool Executor::steerInside(const SemanticWorld &world,
     // Nothing left between the body and the opening: this leg is the
     // crossing itself, so drive it the way it was verified -- at the place
     // on the far side the body was left standing, not at the doorway.
-    if (beyond && step + 1 == m_path.size())
+    // Aim past the opening only once the body is at it.
+    //
+    // Driving at a point on the boundary stops the body on the line, so the
+    // far side is what to drive at -- but only when the doorway is the next
+    // thing, not while it is still most of a room away. The route to the
+    // opening was checked and stays inside this space; the straight line to
+    // a point beyond it was not, and from far enough back it cuts the corner
+    // and leaves through somewhere else entirely. On AGTST8 that is a walk
+    // out over the pit and a fall to the bottom of it, from a route that was
+    // perfectly good right up to the last substitution.
+    //
+    // Near enough is within the body's own width of the opening: that is
+    // exactly when aiming at the opening would stop the body short of going
+    // through it.
+    if (beyond && step + 1 == m_path.size()
+        && semantic::planarDistance(from, m_path[step]) <= m_radiusUsed * 2)
         m_aim = *beyond;
     command.move = true;
     command.moveToward = { m_aim.x, m_aim.y,
@@ -276,8 +330,8 @@ Outcome Executor::tick(const SemanticWorld &world,
         // twenty ticks early, once, is enough to send it somewhere else
         // entirely and never come back.
         if (affordance && affordance->attempts > m_attemptsAtStart)
-            return affordance->settling ? Outcome::WorldChanged
-                                        : Outcome::Succeeded;
+            return affordance->settling || world.settling()
+                ? Outcome::WorldChanged : Outcome::Succeeded;
         // The planner's preconditions are not re-derived here. These say
         // that the world has since changed under the goal, which is a fact
         // about the world and not a second opinion about it, so each one
@@ -305,13 +359,21 @@ Outcome Executor::tick(const SemanticWorld &world,
             m_block = Block::OptionGone;
             return Outcome::TargetUnavailable;
         }
+        // Found by where it is on the ground, not by how high it is.
+        //
+        // A stance on a piece of geometry that moves goes up and down with
+        // it, and acting on such a thing is the very thing that moves it --
+        // so matching the height means the stance a goal set out for is
+        // never there when it arrives, and the goal is abandoned by its own
+        // success. The spot you stand on a lift is the same spot at every
+        // height the lift has.
         bool stillThere = false;
         for (size_t option = 0; option < affordance->domain.size(); ++option)
             if (affordance->domain[option].at.x == m_optionAt.x
-                && affordance->domain[option].at.y == m_optionAt.y
-                && affordance->domain[option].at.z == m_optionAt.z)
+                && affordance->domain[option].at.y == m_optionAt.y)
             {
                 m_option = uint32_t(option);
+                m_optionAt = affordance->domain[option].at;
                 stillThere = true;
                 break;
             }
@@ -460,6 +522,18 @@ Outcome Executor::tick(const SemanticWorld &world,
         return Outcome::Running;
     }
 
+    // Done, and this was a stance that is not somewhere to still be. Go
+    // where the derivation said there was still somewhere to be, and keep
+    // going until the world has finished answering.
+    if (m_acted && m_leaveAtOnce)
+    {
+        if (semantic::planarDistance(position, m_escapeTo) > profile.radius
+            && steerInside(world, traversal, *here, position, m_escapeTo,
+                           profile.radius, command))
+            return Outcome::Running;
+        m_leaveAtOnce = false;
+    }
+
     // In the right space; now the act itself, which happens from a pose the
     // world accepts it from and not from the middle of the room.
     const semantic::Vec3 &at = affordance->domain[m_option].at;
@@ -494,6 +568,7 @@ Outcome Executor::tick(const SemanticWorld &world,
         command.address = m_affordance;
         command.option = m_option;
         command.act = true;
+        m_acted = true;
         return Outcome::Running;
     }
     // Collecting is done by being there. Keep closing on it until the world

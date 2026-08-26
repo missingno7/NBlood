@@ -1,5 +1,7 @@
 #include "bot_debug.h"
 
+#include "triggers.h"
+
 #include <cstdio>
 
 #include "../../../blood.h"
@@ -8,6 +10,34 @@
 #include "../../../player.h"
 
 namespace botdebug {
+
+// Is the sector the body is standing in one the engine is animating right
+// now, or does it neighbour one? Read straight off gBusy.
+static int busyHere()
+{
+    if (!gMe || !gMe->pSprite)
+        return -1;
+    const int here = gMe->pSprite->sectnum;
+    if (!bloodmap::validSector(here))
+        return -1;
+    for (int index = 0; index < gBusyCount; ++index)
+        if (gBusy[index].at0 == here)
+            return 1;
+    const int first = sector[here].wallptr;
+    for (int offset = 0; offset < sector[here].wallnum; ++offset)
+    {
+        const int wallId = first + offset;
+        if (!bloodmap::validWall(wallId))
+            continue;
+        const int behind = wall[wallId].nextsector;
+        if (!bloodmap::validSector(behind))
+            continue;
+        for (int index = 0; index < gBusyCount; ++index)
+            if (gBusy[index].at0 == behind)
+                return 2;
+    }
+    return gBusyCount > 0 ? 0 : -2;
+}
 
 const char *containerName(int tag)
 {
@@ -41,9 +71,9 @@ void describeRegion(const bloodmap::WorldAdapter &adapter,
         used += size_t(std::snprintf(sprites + used, sizeof(sprites) - used,
             i ? ",%d" : "%d", provenance.sprites[i]));
     std::snprintf(out, size,
-        "region=%u corners=%d holes=%d barriers=%d blood_sectors=[%s] "
-        "blood_sprites=[%s]",
-        unsigned(id), provenance.vertices, provenance.holes,
+        "region=%u mover=%d corners=%d holes=%d barriers=%d "
+        "blood_sectors=[%s] blood_sprites=[%s]",
+        unsigned(id), provenance.mover, provenance.vertices, provenance.holes,
         provenance.barriers, sectors, sprites);
 }
 
@@ -135,14 +165,16 @@ void sampleTrajectory(FILE *out, int gameTime, int tick, const GINPUT &issued)
         "\"z\":%d,\"sector\":%d,\"angle\":%d,\"look\":%d,"
         "\"on_ground\":%d,\"crouched\":%d,\"forward\":%d,"
         "\"strafe\":%d,\"turn\":%d,\"jump\":%d,\"use\":%d,"
-        "\"health\":%d}\n",
+        "\"health\":%d,\"xvel\":%d,\"yvel\":%d,"
+        "\"busy\":%d}\n",
         gameTime, tick, gMe->pSprite->x, gMe->pSprite->y, gMe->pSprite->z,
         int(gMe->pSprite->sectnum), int(gMe->pSprite->ang),
         fix16_to_int(gMe->q16look), gMe->pXSprite->height == 0 ? 1 : 0,
         gMe->posture == kPostureCrouch ? 1 : 0, int(issued.forward),
         int(issued.strafe), fix16_to_int(issued.q16turn),
         issued.buttonFlags.jump ? 1 : 0, issued.keyFlags.action ? 1 : 0,
-        int(gMe->pXSprite->health));
+        int(gMe->pXSprite->health), int(xvel[gMe->pSprite->index]),
+        int(yvel[gMe->pSprite->index]), busyHere());
     std::fflush(out);
 }
 

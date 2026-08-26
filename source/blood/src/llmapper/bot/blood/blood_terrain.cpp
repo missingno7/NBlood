@@ -307,6 +307,21 @@ bool obstructedSpan(int spriteId, const semantic::Vec2 &from,
 // be a trigger.
 uint64_t moverOf(int sectorId)
 {
+    return moverTagOf(sectorId);
+}
+
+} // namespace
+
+bool movesInThePlane(int sectorType)
+{
+    return sectorType == kSectorSlide || sectorType == kSectorSlideMarked
+        || sectorType == kSectorRotate || sectorType == kSectorRotateMarked;
+}
+
+uint64_t moverTagOf(int sectorId)
+{
+    if (!validSector(sectorId))
+        return 0;
     if (sector[sectorId].extra <= 0)
         return 0;
     switch (sector[sectorId].type)
@@ -326,8 +341,8 @@ uint64_t moverOf(int sectorId)
     }
 }
 
+namespace {
 } // namespace
-
 
 void extractTerrain(TerrainSnapshot &out)
 {

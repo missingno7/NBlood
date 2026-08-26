@@ -29,6 +29,7 @@ namespace bloodmap {
 // path can reach these.
 struct RegionProvenance
 {
+    int mover = -1;   // the stateful geometry this space is made of, or -1
     std::vector<int> sectors;
     std::vector<int> sprites;
     int vertices = 0;
@@ -215,6 +216,47 @@ private:
     std::map<InteractionKey, semantic::AffordanceId> m_actionIndex;
     std::set<int> m_pendingSectors;
     std::vector<RejectedSpace> m_rejected;
+    // Engine handles for stateful geometry, interned so that nothing above
+    // this layer ever sees an engine index. Position in the vector is the
+    // GeometryId; the value is whatever the mapper used to name the thing
+    // that moves (for Blood, the xsector/xsprite handle, which the engine
+    // keeps pointing at the same mechanism however far its walls travel).
+    std::vector<uint64_t> m_geometry;
+    // Which channel each piece of stateful geometry answers on, so an act
+    // can be matched to what it works without anyone pressing it.
+    std::map<uint64_t, int> m_listening;
+    // Where each piece of stateful geometry was along its travel a tick ago,
+    // so that "still going" can be read the same way it is read for anything
+    // else: it is not where it was.
+    std::map<uint64_t, int> m_geometryWas;
+    void readWiring();
+public:
+    // Which channel a piece of stateful geometry answers on, or -1.
+    // Diagnostic: it is how two controls for one thing can be told from two
+    // controls for two things.
+    int listensOn(semantic::GeometryId id) const
+    {
+        if (size_t(id) >= m_geometry.size())
+            return -1;
+        auto found = m_listening.find(m_geometry[size_t(id)]);
+        return found == m_listening.end() ? -1 : found->second;
+    }
+private:
+    semantic::GeometryId internGeometry(uint64_t stateTag);
+public:
+    // The engine handle a GeometryId was interned from. For the physics
+    // layer, which has to put the engine into a configuration to ask about
+    // it. Nothing above these two layers may call it.
+    uint64_t geometryTag(semantic::GeometryId id) const
+    {
+        return size_t(id) < m_geometry.size() ? m_geometry[size_t(id)] : 0;
+    }
+private:
+    void readConfigurations(uint64_t stateTag,
+                            semantic::StatefulGeometry &out) const;
+    // Which stateful geometry, if any, is holding a body up at this pose.
+    semantic::GeometryId geometryUnder(const PhysicalPose &pose) const;
+
     // Where the round of working out execution stances got to.
     size_t m_domainCursor = 0;
     semantic::RegionId m_actorRegion = semantic::kNoId;

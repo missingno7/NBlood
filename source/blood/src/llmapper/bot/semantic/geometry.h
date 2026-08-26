@@ -146,6 +146,12 @@ void subtractCollinear(const std::vector<Segment> &in,
 
 // Whether two footprints cover any common ground.
 bool loopsOverlap(const Loop &left, const Loop &right);
+// Is this point inside that shape, or within this distance of its edge?
+//
+// Pure geometry. What the distance means -- a width, a tolerance -- is the
+// caller's business and is deliberately not this layer's: a point test alone
+// is a different question, and which one is wanted depends on who is asking.
+bool touches(const Polygon &shape, const Vec2 &at, int distance);
 
 // Whether a segment runs into a footprint at all.
 bool segmentCrossesLoop(const Vec2 &from, const Vec2 &to, const Loop &loop);

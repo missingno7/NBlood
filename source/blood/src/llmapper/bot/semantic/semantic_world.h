@@ -18,6 +18,22 @@ namespace semantic {
 using RegionId = uint32_t;
 using RelationId = uint32_t;
 using AffordanceId = uint32_t;
+// A piece of world geometry that can be in more than one configuration, kept
+// apart from the space that geometry currently makes.
+//
+// A Region is space in one configuration; when geometry moves, the space it
+// makes may legitimately be decomposed differently and get a different
+// RegionId. What must survive the motion is the *thing that moved*, because
+// that is what a body stands on while it carries it, and what a route means
+// when it says "when this is in that configuration". So this identity is
+// separate from RegionId on purpose, and neither is derived from the other.
+//
+// It is opaque above this line. It is interned from whatever the engine uses
+// to keep track of the mechanism, and nothing outside the adapter that
+// interns it may assume what that was. Nothing here means door, or lift, or
+// bridge: those are words for what a configuration happens to connect, and
+// they are read off the connectivity, never written into it.
+using GeometryId = uint32_t;
 
 constexpr uint32_t kNoId = 0xFFFFFFFFu;
 
@@ -80,6 +96,11 @@ struct Region
     // the plane below says what the floor *is*, and a body standing next to
     // a step is held up by the step, not by the plane it is standing beside.
     std::vector<uint64_t> supports;
+    // The stateful geometry this space is made of, when it is made of any.
+    // Static ground has none. Two Regions with the same one are two
+    // configurations of the same physical thing -- possibly at once, if a
+    // configuration decomposes into more spaces than another did.
+    GeometryId mover = kNoId;
     Plane support;
     Plane ceiling;
     Hazard hazard;
@@ -220,6 +241,31 @@ struct Affordance
     // same entry -- only that acting on this changed that. It is what makes
     // "the way is shut and something can be done about it" answerable for a
     // switch across the room as well as for a curtain in the doorway.
+    // Stateful geometry this act was seen to move. Observed, never
+    // declared: the act is done, and whatever changed configuration while it
+    // settled is what it moves. Nothing here knows what the geometry is for.
+    std::vector<GeometryId> moves;
+    // Stateful geometry this act addresses, according to the world's own
+    // wiring rather than according to having done it.
+    //
+    // This is the same kind of fact as "this wall borders that space": the
+    // world holds it, the mapper reads it, and nothing above knows what it
+    // was read from. It is what lets an act be understood before it has ever
+    // been done -- which is the difference between finding out what a switch
+    // does by pressing it and knowing beforehand that two switches work the
+    // same thing.
+    std::vector<GeometryId> commands;
+    // Ways this act was tried against and left shut, with what was standing
+    // in each at the time. An experiment already run: doing it again with
+    // the same thing in the way, in the same state, asks the same question
+    // and gets the same answer.
+    struct Fruitless
+    {
+        RelationId way = kNoId;
+        AffordanceId blocking = kNoId;
+        uint64_t blockingState = 0;
+    };
+    std::vector<Fruitless> triedInVain;
     std::vector<RelationId> affects;
     // How each of those ways stood when this thing was last acted on.
     // Parallel to `affects`.
@@ -235,10 +281,56 @@ struct Affordance
     bool triedAtKnown = false;
 };
 
+// One configuration a piece of stateful geometry can rest in.
+//
+// Deliberately not named. It is a support height and a ceiling height and
+// nothing else: which of them is "open", "shut", "up" or "down" is not a
+// property of the configuration, it is a property of what the connectivity
+// derived in that configuration turns out to be, and it is read off there.
+struct GeometryConfiguration
+{
+    int supportZ = 0;
+    int ceilingZ = 0;
+    // How far this configuration displaces the thing from the first one.
+    //
+    // A discriminator and a thing to read in a trace, not a description of
+    // the shape: something that turns is not described by an offset, and
+    // nothing may reconstruct an outline from this. What the space actually
+    // is in a configuration is a question for whoever can put the world into
+    // it and look.
+    Vec2 shift;
+};
+
+// A piece of geometry that rests in more than one configuration.
+struct StatefulGeometry
+{
+    GeometryId id = kNoId;
+    // Which configuration it is resting in, or is heading for. An index into
+    // `configurations`, never a flag: nothing here assumes there are two.
+    uint32_t state = 0;
+    bool moving = false;   // between configurations right now
+    std::vector<GeometryConfiguration> configurations;
+    // Whether the configurations above say anything different from each
+    // other.
+    //
+    // A configuration is a support height and a ceiling height, so something
+    // that moves in the plane -- sliding, turning, running along a path --
+    // comes back with the same numbers at both ends. That is not a thing
+    // with one configuration; it is a thing whose configurations this model
+    // does not describe, and the two must not be confused. Nothing may read
+    // "I cannot tell these apart" as "moving it changes nothing".
+    bool configurationsDiffer = false;
+};
+
 struct ActorState
 {
     Vec3 position;
     RegionId region = kNoId;
+    // Which stateful geometry is holding the body up, if any. This is the
+    // fact that survives the geometry moving: the Region underfoot may be
+    // re-derived into something with a different id, and the body is still
+    // standing on the same thing, and is carried by it.
+    GeometryId supportedBy = kNoId;
     bool alive = false;
 };
 
@@ -247,6 +339,7 @@ struct WorldDelta
     std::vector<Region> regions;
     std::vector<SpatialRelation> relations;
     std::vector<Affordance> affordances;
+    std::vector<StatefulGeometry> geometry;
     ActorState actor;
     bool changed = false;
     bool settling = false;
@@ -266,7 +359,15 @@ public:
     void apply(const WorldDelta &delta);
 
     const ActorState &actor() const { return m_actor; }
-    bool settling() const { return m_settling; }
+    // Is the world still answering?
+    //
+    // Its own motion, plus the tick on which an act was made. Blood resolves
+    // a use within the tick it happens, so what an act set in motion is not
+    // visible until the next one -- and an act judged on the tick it was
+    // made is judged before the world has said anything. That is how an act
+    // gets called finished, the planner moves on, and whatever the act
+    // actually moved is then credited to whatever was being done next.
+    bool settling() const { return m_settling || m_attemptFresh; }
     bool establishing() const { return m_establishing; }
     uint64_t revision() const { return m_revision; }
 
@@ -274,6 +375,18 @@ public:
     const std::vector<SpatialRelation> &relations() const
     {
         return m_relations;
+    }
+    // Every piece of geometry that rests in more than one configuration.
+    const std::vector<StatefulGeometry> &geometry() const
+    {
+        return m_geometry;
+    }
+    const StatefulGeometry *geometryOf(GeometryId id) const
+    {
+        for (const StatefulGeometry &piece : m_geometry)
+            if (piece.id == id)
+                return &piece;
+        return nullptr;
     }
     const std::vector<Affordance> &affordances() const
     {
@@ -306,6 +419,38 @@ public:
     // through. Told from outside, because whether a way can be gone through
     // is a question about a body and this layer does not have one.
     void noteAffects(AffordanceId thing, RelationId way);
+    // Acting on this thing was seen to change that geometry's configuration.
+    void noteMoves(AffordanceId thing, GeometryId geometry);
+    // This act was done to open that way, and the way is still shut.
+    void noteFruitless(AffordanceId thing, RelationId way,
+                       uint64_t blockingState);
+    // Is doing it again a different experiment from the last one?
+    bool worthTryingFor(AffordanceId thing, RelationId way,
+                        uint64_t blockingState) const;
+    // How the thing standing in this way stands right now, as one number.
+    // Told from outside, because what a blocker's state is belongs to
+    // whichever layer can see the engine.
+    uint64_t blockerState(RelationId way) const
+    {
+        return way != kNoId && size_t(way) < m_blockerState.size()
+            ? m_blockerState[size_t(way)] : 0;
+    }
+    void noteBlockerState(RelationId way, uint64_t state)
+    {
+        if (way == kNoId)
+            return;
+        if (m_blockerState.size() <= size_t(way))
+            m_blockerState.resize(size_t(way) + 1, 0);
+        m_blockerState[size_t(way)] = state;
+    }
+    bool moves(AffordanceId thing, GeometryId geometry) const;
+    // Everything that is known to move that geometry: what has been seen to,
+    // and what the world says addresses it.
+    bool works(AffordanceId thing, GeometryId geometry) const;
+    // Has anything that works this geometry already been done? An act whose
+    // effect is already known is not an experiment, whatever its own count
+    // of attempts says.
+    bool effectKnown(AffordanceId thing) const;
     // Whether acting on this thing has ever been seen to change this way.
     bool affects(AffordanceId thing, RelationId way) const;
     // Is acting on this thing worth doing for this way?
@@ -329,8 +474,11 @@ private:
     std::vector<Region> m_regions;
     std::vector<SpatialRelation> m_relations;
     std::vector<Affordance> m_affordances;
+    std::vector<StatefulGeometry> m_geometry;
+    std::vector<uint64_t> m_blockerState;
     ActorState m_actor;
     bool m_settling = false;
+    bool m_attemptFresh = false;
     // Everything about a way that acting on something could change.
     uint64_t stateOf(const SpatialRelation &relation) const;
     // What every way looked like when the open attempt began.

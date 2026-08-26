@@ -95,6 +95,9 @@ public:
     // came from. Diagnostic only.
     const semantic::Vec2 &aim() const { return m_aim; }
     size_t legs() const { return m_path.size(); }
+    // The steering points as they stand, for reading a stuck leg back.
+    const std::vector<semantic::Vec2> &path() const { return m_path; }
+    int remaining() const { return m_remaining; }
 
     const LocalFailure &lastFailure() const { return m_failure; }
 
@@ -147,6 +150,7 @@ private:
     semantic::Vec2 m_legLast;
     size_t m_legsLeft = 0;
     int m_remaining = 0;
+    int m_radiusUsed = 0;
     bool m_legKnown = false;
     int m_legClosest = 0;
     int m_legBest = 0;
@@ -159,7 +163,15 @@ private:
     semantic::Vec3 m_optionAt;
     bool m_optionKnown = false;
     size_t m_domainAtStart = 0;
+    bool m_leaveAtOnce = false;
+    bool m_acted = false;
+    semantic::Vec2 m_escapeTo;
     std::vector<semantic::RegionId> m_route;
+    // The same route as pieces of free space. A Region can be more than one
+    // piece and a route can pass through the same Region twice; without
+    // this, arriving in that Region cannot be told from arriving in it the
+    // second time, and the walk skips everything in between.
+    std::vector<size_t> m_through;
     std::vector<semantic::RelationId> m_via;
     std::vector<semantic::Segment> m_openings;
     std::vector<semantic::Vec2> m_path;

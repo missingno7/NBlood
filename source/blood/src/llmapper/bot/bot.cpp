@@ -16,6 +16,8 @@
 #include <chrono>
 
 #include <cstdio>
+#include <set>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -65,7 +67,12 @@ struct LLMapperBot::Impl
     bloodmap::AdapterCounters work;
     int lastTrajectoryFrame = -1;
     bool stallReported = false;
-    bool reportedBody = false;
+    uint64_t reportedBody = 0;
+    std::set<semantic::GeometryId> reportedGeometry;
+    std::set<semantic::RelationId> reportedCondition;
+    std::set<semantic::AffordanceId> reportedCommands;
+    std::set<semantic::GeometryId> reportedWiring;
+    std::string lastSealing;
     semantic::RegionId reportedWaypoint = semantic::kNoId;
     semantic::Vec2 reportedAim;
     std::vector<uint64_t> reportedAffordances;
@@ -81,6 +88,17 @@ struct LLMapperBot::Impl
             "{\"type\":\"event\",\"game_time\":%d,\"tick\":%d,"
             "\"event\":\"%s\",\"detail\":\"%s\"}\n",
             gameTime(), gFrame * kTicsPerFrame, name, detail ? detail : "");
+    }
+
+    // The physics layer has to be able to put a piece of geometry into a
+    // configuration to ask about it, and only the adapter knows which engine
+    // handle each GeometryId came from.
+    void connectGeometry()
+    {
+        physics.resolveGeometryWith(
+            [this](semantic::GeometryId id) {
+                return adapter.geometryTag(id);
+            });
     }
 
     void openFiles()
@@ -110,14 +128,16 @@ struct LLMapperBot::Impl
             "reason=%s known_regions=%d reachable=%d uncrossed_gateways=%d "
             "unentered_regions=%d uninspected_gateways=%d affordances=%d "
             "unreachable=%d attempted_without_change=%d "
-            "possible_but_unexecutable=%d",
+            "possible_but_unexecutable=%d reconfig=%d/%d/%d/%d",
             planner::stallName(diagnosis.reason), diagnosis.knownRegions,
             diagnosis.reachableRegions, diagnosis.uncrossedGateways,
             diagnosis.unenteredRegions, diagnosis.uninspectedGateways,
             diagnosis.knownAffordances,
             diagnosis.affordancesUnreachable,
             diagnosis.affordancesAttemptedInertly,
-            diagnosis.possibleButUnexecutable);
+            diagnosis.possibleButUnexecutable,
+            diagnosis.reconfigureLooked, diagnosis.reconfigureWouldOpen,
+            diagnosis.reconfigureNoMover, diagnosis.reconfigureOffered);
         event("no_known_action", detail);
         result = "NO_KNOWN_ACTION";
         failureReason = "the model offers nothing further";
@@ -230,10 +250,18 @@ struct LLMapperBot::Impl
         char detail[288];
         for (const semantic::Affordance &affordance : world.affordances())
         {
+            // Where it can be done from is part of what changed about it.
+            // Counting only how many stances there are misses a lift whose
+            // stances moved from one floor to another without changing in
+            // number, which is exactly what a lift does.
+            uint64_t where = 0;
+            for (const semantic::ExecutionOption &option : affordance.domain)
+                where = where * 1315423911u + uint64_t(option.region) + 1;
             const uint64_t state = (uint64_t(affordance.exists) << 40)
                 | (uint64_t(affordance.executable) << 41)
                 | (uint64_t(affordance.observed) << 42)
-                | uint64_t(affordance.domain.size());
+                | uint64_t(affordance.domain.size())
+                | (where << 43);
             if (size_t(affordance.id) < reportedAffordances.size()
                 && reportedAffordances[size_t(affordance.id)] == state)
                 continue;
@@ -242,15 +270,73 @@ struct LLMapperBot::Impl
             reportedAffordances[size_t(affordance.id)] = state;
             botdebug::describeAffordance(adapter, affordance.id, provenance,
                                          sizeof(provenance));
+            char spots[120] = "none";
+            {
+                // Region and piece of free space together. Which region an
+                // act can be done from does not say whether the body can
+                // get to it: a region is not always one piece.
+                std::set<std::pair<unsigned, unsigned>> regions;
+                for (size_t option = 0; option < affordance.domain.size();
+                     ++option)
+                    regions.insert({
+                        unsigned(affordance.domain[option].region),
+                        unsigned(traversal.placeOfOption(affordance.id,
+                                                     uint32_t(option))) });
+                int said = 0;
+                for (const auto &where : regions)
+                {
+                    if (said >= int(sizeof(spots)) - 12)
+                        break;
+                    said += std::snprintf(spots + said,
+                        sizeof(spots) - size_t(said),
+                        said ? ",r%u@%u" : "r%u@%u", where.first,
+                        where.second);
+                }
+            }
+            // Why each stance is or is not somewhere the body can be sent:
+            // 0 placed, 1 never asked, 2 no room to stand, 3 no piece of
+            // free space found for it.
+            char verdicts[48];
+            {
+                int tally[4] = { 0, 0, 0, 0 };
+                for (size_t option = 0; option < affordance.domain.size();
+                     ++option)
+                {
+                    const int said = traversal.optionVerdict(affordance.id,
+                                                             uint32_t(option));
+                    if (said >= 0 && said < 4)
+                        ++tally[said];
+                }
+                std::snprintf(verdicts, sizeof(verdicts),
+                    "%d/%d/%d/%d", tally[0], tally[1], tally[2], tally[3]);
+            }
+            // How many stances leave the body somewhere to be once what
+            // the act commands has arrived: remain/escape/unknown/unsafe.
+            char lives[48];
+            {
+                int tally[4] = { 0, 0, 0, 0 };
+                for (size_t option = 0; option < affordance.domain.size();
+                     ++option)
+                {
+                    const int said = int(traversal.survivalOf(affordance.id,
+                                                          uint32_t(option)));
+                    if (said >= 0 && said < 4)
+                        ++tally[said];
+                }
+                std::snprintf(lives, sizeof(lives), "%d/%d/%d/%d",
+                    tally[0], tally[1], tally[2], tally[3]);
+            }
             std::snprintf(detail, sizeof(detail),
                 "%s kind=%s exists=%d observed=%d executable=%d "
-                "from_regions=%u first=%d at=(%d,%d,%d)",
+                "why=%s lives=%s from_regions=%u first=%d in=[%s] at=(%d,%d,%d)",
                 provenance, semantic::actionName(affordance.action),
                 affordance.exists ? 1 : 0,
                 affordance.observed ? 1 : 0, affordance.executable ? 1 : 0,
+                verdicts, lives,
                 unsigned(affordance.domain.size()),
                 affordance.domain.empty()
                     ? -1 : int(affordance.domain.front().region),
+                spots,
                 affordance.domain.empty() ? 0 : affordance.domain.front().at.x,
                 affordance.domain.empty() ? 0 : affordance.domain.front().at.y,
                 affordance.domain.empty()
@@ -375,6 +461,14 @@ struct LLMapperBot::Impl
         return out;
     }
     std::vector<char> crossableAtAttempt;
+    semantic::RelationId aimedAtWay = semantic::kNoId;
+    uint64_t blockerAtAttempt = 0;
+    bool movingAtAttempt = false;
+    int attemptFrame = 0;
+    std::map<semantic::GeometryId, int> setOffAt;
+    std::set<semantic::GeometryId> wasTravelling;
+    std::vector<std::tuple<semantic::GeometryId, uint32_t, bool>>
+        configurationAtAttempt;
 
     int lastGroundFlags = -2;
     bool reportedEdge = false;
@@ -397,6 +491,75 @@ struct LLMapperBot::Impl
         std::snprintf(detail, sizeof(detail),
             "reachable=%u of %d regions", unsigned(reachable.size()), live);
         event("known_world", detail);
+        {
+            // Where one Region came out as more than one piece of free
+            // space, and which piece each way out of it belongs to. A route
+            // that walks into a region and then cannot cross the way it went
+            // there for is a disagreement about exactly this.
+            for (const semantic::Region &region : world.regions())
+            {
+                if (!region.exists)
+                    continue;
+                std::vector<size_t> pieces;
+                traversal.placesOf(region.id, pieces);
+                if (pieces.size() < 2)
+                    continue;
+                int said = std::snprintf(detail, sizeof(detail),
+                    "region=%u pieces=%u ways=", unsigned(region.id),
+                    unsigned(pieces.size()));
+                for (const semantic::SpatialRelation &way : world.relations())
+                {
+                    if (!way.exists || way.from != region.id
+                        || said >= int(sizeof(detail)) - 16)
+                        continue;
+                    size_t leaves = 0;
+                    size_t arrives = 0;
+                    if (!traversal.placesAcross(way.id, leaves, arrives))
+                        continue;
+                    said += std::snprintf(detail + said,
+                        sizeof(detail) - size_t(said), "%u@%u->%u,",
+                        unsigned(way.id), unsigned(leaves),
+                        unsigned(arrives));
+                }
+                event("place_split", detail);
+            }
+            // Which regions keep having their free space thrown away.
+            std::vector<std::pair<int, int>> churn;
+            for (const nav::Navigator::Entry &entry
+                     : traversal.navigatorFor().entries())
+                churn.push_back({ entry.rebuilds, int(entry.id) });
+            std::sort(churn.rbegin(), churn.rend());
+            for (size_t i = 0; i < churn.size() && i < 10; ++i)
+            {
+                if (churn[i].first < 2)
+                    break;
+                std::snprintf(detail, sizeof(detail),
+                    "region=%d rebuilds=%d", churn[i].second, churn[i].first);
+                event("map_churn", detail);
+            }
+        }
+        // Every way out of the room the body is actually in, and what this
+        // layer decided about each. When the answer is "nowhere to go", this
+        // is the list that has to explain it.
+        for (const semantic::SpatialRelation &way : world.relations())
+        {
+            if (!way.exists || way.id == semantic::kNoId
+                || way.from != world.actor().region)
+                continue;
+            const traversal::TraversalModel::Verdict said =
+                traversal.verdictFor(way.id, traversal::Mode::Walk);
+            std::snprintf(detail, sizeof(detail),
+                "relation=%u to=%u width=%d blocked=%d valid=%d exists=%d"
+                " walk=%d executable=%d refused=%d leaves=%d arrives=%d"
+                " from_stances=%d to_stances=%d routed=%d",
+                unsigned(way.id), unsigned(way.to), way.gateway.width(),
+                way.blocked ? 1 : 0, said.valid ? 1 : 0,
+                said.exists ? 1 : 0, said.possible ? 1 : 0,
+                said.executable ? 1 : 0, said.refused ? 1 : 0,
+                said.leaves, said.arrives, int(said.from), int(said.to),
+                said.routed ? 1 : 0);
+            event("way_out_audit", detail);
+        }
         for (const semantic::SpatialRelation &way : world.relations())
         {
             if (!way.exists || way.id == semantic::kNoId)
@@ -591,6 +754,37 @@ struct LLMapperBot::Impl
                           chosen.why, detail);
             event("goal_chosen", labelled);
         }
+        if (!chosen.diagnosis.plan.empty())
+        {
+            char steps[224];
+            int said = std::snprintf(steps, sizeof(steps), "from=%d on=%d ",
+                world.actor().region == semantic::kNoId
+                    ? -1 : int(world.actor().region),
+                world.actor().supportedBy == semantic::kNoId
+                    ? -1 : int(world.actor().supportedBy));
+            for (const semantic::StatefulGeometry &piece : world.geometry())
+            {
+                if (said >= int(sizeof(steps)) - 24)
+                    break;
+                said += std::snprintf(steps + said,
+                    sizeof(steps) - size_t(said), "G%u=%u%s ",
+                    unsigned(piece.id), piece.state,
+                    piece.moving ? "*" : "");
+            }
+            for (const traversal::TraversalModel::PlanStep &step
+                     : chosen.diagnosis.plan)
+            {
+                if (said >= int(sizeof(steps)) - 28)
+                    break;
+                said += step.act
+                    ? std::snprintf(steps + said, sizeof(steps) - size_t(said),
+                        "| act %u@r%u ", unsigned(step.affordance),
+                        unsigned(step.region))
+                    : std::snprintf(steps + said, sizeof(steps) - size_t(said),
+                        "| walk %u ", unsigned(step.crossing));
+            }
+            event("plan", steps);
+        }
     }
 
     // What one decision costs the game. The bot runs on the game's own
@@ -730,10 +924,99 @@ struct LLMapperBot::Impl
             event("action_delivered", provenance);
             world.beginAttempt(delta.resolvedAffordance, possibilities());
             crossableAtAttempt = crossableNow();
+            attemptFrame = gFrame;
+            // Was anything it works still travelling when this was asked?
+            //
+            // These doors do not accept a use until they have finished, so a
+            // press made a tick too early is a press the world drops. What
+            // came of it is not "this act does nothing" -- it is that the
+            // act was never made, and writing it down as an answer is how
+            // the bot decides a way is shut that is merely busy.
+            movingAtAttempt = false;
+            if (const semantic::Affordance *doing =
+                    world.affordance(world.openAttempt()))
+                for (semantic::GeometryId which : doing->commands)
+                {
+                    const semantic::StatefulGeometry *piece =
+                        world.geometryOf(which);
+                    movingAtAttempt = movingAtAttempt
+                        || (piece && piece->moving);
+                }
+            // Which way this act was chosen to open, and how what stands in
+            // it stands at this moment, so that an act which changes nothing
+            // is known to have changed nothing.
+            aimedAtWay = executor.inspecting();
+            if (aimedAtWay != semantic::kNoId)
+            {
+                bloodmap::WorldAdapter::ObjectState blocker;
+                const semantic::SpatialRelation *way =
+                    world.relation(aimedAtWay);
+                uint64_t stamp = 0;
+                if (way && way->obstruction != semantic::kNoId
+                    && adapter.objectState(way->obstruction, blocker))
+                    stamp = (uint64_t(uint32_t(blocker.state)) << 32)
+                        ^ uint64_t(uint32_t(blocker.busy))
+                        ^ (uint64_t(uint32_t(blocker.x)) << 8);
+                world.noteBlockerState(aimedAtWay, stamp);
+                blockerAtAttempt = stamp;
+            }
+            configurationAtAttempt.clear();
+            for (const semantic::StatefulGeometry &piece : world.geometry())
+                configurationAtAttempt.push_back(
+                    { piece.id, piece.state, piece.moving });
         }
         // Whether the act opened anything up is measured once the world has
         // stopped moving, which is the right question for that and the wrong
         // one for whether to stand still (see below).
+        // Whatever started moving, or finished somewhere else, while this
+        // act was in the air is what the act moves.
+        //
+        // Watched every tick rather than only when the act settles: geometry
+        // takes time to get going, and an act judged only at the end of its
+        // settling gets superseded by the next one and its effect is never
+        // attributed to anything. Nothing here asks what the geometry is.
+        if (world.attemptOpen() && !configurationAtAttempt.empty())
+        {
+            const semantic::AffordanceId acting = world.openAttempt();
+            for (const auto &was : configurationAtAttempt)
+            {
+                const semantic::StatefulGeometry *now =
+                    world.geometryOf(std::get<0>(was));
+                if (!now)
+                    continue;
+                const bool started = now->moving && !std::get<2>(was);
+                // A thing already travelling was going to arrive whatever
+                // happened next, so crediting its arrival to whichever act
+                // was in flight is false: picking up an ammo box gets
+                // recorded as the thing that works a lift, and that then
+                // decides what the pickup is allowed to do and from where.
+                //
+                // Told apart by when the thing set off, not by whether it is
+                // moving now. Blood resolves a use inside the tick it
+                // happens, so something this act started is already moving
+                // when the attempt is written down -- asking "was it still"
+                // rejects the act's own doing and leaves AGTST8 at two
+                // sectors. Asking "did it set off after I asked" separates
+                // them exactly. Something never seen to set off is left as it
+                // was: unknown is not evidence either way.
+                auto began = setOffAt.find(std::get<0>(was));
+                const bool mine = began == setOffAt.end()
+                    || began->second >= attemptFrame;
+                const bool arrived = now->state != std::get<1>(was) && mine;
+                if (!started && !arrived)
+                    continue;
+                if (!world.moves(acting, std::get<0>(was)))
+                {
+                    char note[128];
+                    std::snprintf(note, sizeof(note),
+                        "affordance=%u moves=%u started=%d arrived=%d",
+                        unsigned(acting), unsigned(std::get<0>(was)),
+                        started ? 1 : 0, arrived ? 1 : 0);
+                    event("geometry_moved_by", note);
+                }
+                world.noteMoves(acting, std::get<0>(was));
+            }
+        }
         if (world.attemptOpen() && !world.settling())
         {
             const semantic::AffordanceId id = world.openAttempt();
@@ -744,6 +1027,18 @@ struct LLMapperBot::Impl
             // to open it again -- and nothing else counts at all, which is
             // what keeps a door from being credited with the ledges in the
             // rooms it happens to border.
+            configurationAtAttempt.clear();
+            // Did it open the way it was chosen to open? If not, that is
+            // an experiment run and answered.
+            if (aimedAtWay != semantic::kNoId)
+            {
+                const std::vector<char> now = crossableNow();
+                const bool opened = size_t(aimedAtWay) < now.size()
+                    && now[size_t(aimedAtWay)];
+                if (!opened && !movingAtAttempt)
+                    world.noteFruitless(id, aimedAtWay, blockerAtAttempt);
+                aimedAtWay = semantic::kNoId;
+            }
             const std::vector<char> after = crossableNow();
             const size_t common = std::min(after.size(),
                                            crossableAtAttempt.size());
@@ -757,18 +1052,144 @@ struct LLMapperBot::Impl
                 && affordance->lastAttemptOpenedWay
                     ? "opened_way=1" : "opened_way=0");
         }
-        if (!reportedBody && physics.profile().revision)
+        if (physics.profile().revision != reportedBody)
         {
-            reportedBody = true;
+            reportedBody = physics.profile().revision;
             const traversal::ActorProfile &shape = physics.profile();
             char detail[224];
             std::snprintf(detail, sizeof(detail),
                 "radius=%d stand=%d crouch=%d step_up=%d walk_speed=%d "
-                "jump=%d gravity=%d",
+                "jump=%d gravity=%d posture=%d life=%d",
                 shape.radius, shape.standHeight, shape.crouchHeight,
                 shape.stepUp, shape.walkSpeed, shape.jumpImpulse,
-                shape.gravity);
+                shape.gravity, shape.posture, shape.lifeMode);
             event("actor_measured", detail);
+        }
+        // Every piece of geometry that rests in more than one configuration,
+        // said once, as heights. Nothing here is called a door or a lift.
+        for (const semantic::StatefulGeometry &piece : world.geometry())
+        {
+            if (reportedGeometry.count(piece.id))
+                continue;
+            reportedGeometry.insert(piece.id);
+            char detail[224];
+            int said = std::snprintf(detail, sizeof(detail),
+                "geometry=%u states=%u at=", unsigned(piece.id),
+                unsigned(piece.configurations.size()));
+            for (size_t which = 0; which < piece.configurations.size()
+                     && said < int(sizeof(detail)) - 32; ++which)
+                said += std::snprintf(detail + said,
+                    sizeof(detail) - size_t(said), "%s[%u]support=%d,ceiling=%d",
+                    which ? " " : "", unsigned(which),
+                    piece.configurations[which].supportZ,
+                    piece.configurations[which].ceilingZ);
+            event("geometry_states", detail);
+        }
+        // When each thing set off, so that what an act did can be told from
+        // what was already happening. Watched every tick because it is the
+        // only place the answer exists: by the time an act is settled the
+        // world has long since replied.
+        for (const semantic::StatefulGeometry &piece : world.geometry())
+        {
+            const bool was = wasTravelling.count(piece.id) != 0;
+            if (piece.moving && !was)
+                setOffAt[piece.id] = gFrame;
+            if (piece.moving)
+                wasTravelling.insert(piece.id);
+            else
+                wasTravelling.erase(piece.id);
+        }
+        for (const semantic::StatefulGeometry &piece : world.geometry())
+        {
+            if (reportedWiring.count(piece.id))
+                continue;
+            reportedWiring.insert(piece.id);
+            char detail[96];
+            std::snprintf(detail, sizeof(detail),
+                "geometry=%u listens=%d described=%d", unsigned(piece.id),
+                adapter.listensOn(piece.id),
+                piece.configurationsDiffer ? 1 : 0);
+            event("geometry_wiring", detail);
+        }
+        // What the world's own wiring says each act works, and whether the
+        // model can describe where that geometry goes.
+        for (const semantic::Affordance &thing : world.affordances())
+        {
+            if (thing.id == semantic::kNoId || thing.commands.empty()
+                || reportedCommands.count(thing.id))
+                continue;
+            reportedCommands.insert(thing.id);
+            char detail[224];
+            int said = std::snprintf(detail, sizeof(detail),
+                "affordance=%u works=", unsigned(thing.id));
+            for (size_t i = 0; i < thing.commands.size()
+                     && said < int(sizeof(detail)) - 16; ++i)
+            {
+                const semantic::StatefulGeometry *piece =
+                    world.geometryOf(thing.commands[i]);
+                said += std::snprintf(detail + said,
+                    sizeof(detail) - size_t(said), "%s%u%s", i ? "," : "",
+                    unsigned(thing.commands[i]),
+                    piece && piece->configurationsDiffer ? "" : "?");
+            }
+            event("act_commands", detail);
+        }
+        {
+            char detail[224];
+            int said = std::snprintf(detail, sizeof(detail),
+                "looked=%d skipped=%d sealed=", traversal.sealingLooked(),
+                traversal.sealingSkipped());
+            for (const auto &one : traversal.sealedActs())
+            {
+                if (said >= int(sizeof(detail)) - 16)
+                    break;
+                said += std::snprintf(detail + said,
+                    sizeof(detail) - size_t(said), "%u@r%u,",
+                    unsigned(one.first), unsigned(one.second));
+            }
+            if (lastSealing != std::string(detail))
+            {
+                lastSealing = detail;
+                event("seal_check", detail);
+                for (const auto &said : traversal.sealingAudit())
+                {
+                    std::snprintf(detail, sizeof(detail),
+                        "affordance=%u room=%u ways=%d open_now=%d"
+                        " open_after=%d", unsigned(said.thing),
+                        unsigned(said.region), said.ways,
+                        said.openNow ? 1 : 0, said.openAfter ? 1 : 0);
+                    event("seal_one", detail);
+                }
+            }
+        }
+        // Every way whose walkability depends on a configuration, and which
+        // configurations allow it. Derived by asking the engine with the
+        // geometry posed each way -- not declared, and not named.
+        for (const semantic::SpatialRelation &way : world.relations())
+        {
+            if (!way.exists || way.id == semantic::kNoId)
+                continue;
+            const semantic::GeometryId on = traversal.conditionOf(way.id);
+            if (on == semantic::kNoId || reportedCondition.count(way.id))
+                continue;
+            const semantic::StatefulGeometry *piece = world.geometryOf(on);
+            if (!piece)
+                continue;
+            reportedCondition.insert(way.id);
+            char detail[224];
+            int said = std::snprintf(detail, sizeof(detail),
+                "relation=%u from=%u to=%u geometry=%u walk_in=",
+                unsigned(way.id), unsigned(way.from), unsigned(way.to),
+                unsigned(on));
+            for (uint32_t which = 0;
+                 which < uint32_t(piece->configurations.size())
+                     && said < int(sizeof(detail)) - 12; ++which)
+                said += std::snprintf(detail + said,
+                    sizeof(detail) - size_t(said), "%s%u:%d",
+                    which ? "," : "", which,
+                    traversal.possibleInConfiguration(way.id, which,
+                        traversal::Mode::Walk) ? 1 : 0);
+            event("conditional_way", detail);
         }
         if (!bloodmap::motionTrace().empty())
         {
@@ -887,16 +1308,46 @@ struct LLMapperBot::Impl
                 // further to learn by setting off for it again.
                 if (executor.intent() == planner::Intent::Approach)
                     world.noteInspected(executor.inspecting());
-                char why[96];
+                char why[160];
                 std::snprintf(why, sizeof(why),
-                    "%s block=%s leg=%d region=%d",
+                    "%s block=%s leg=%d region=%d dest=%d at_place=%u"
+                    " act=%d opt=%u opt_place=%u places=%u",
                     exec::outcomeName(outcome),
                     exec::blockName(executor.block()),
                     executor.leg() == semantic::kNoId
                         ? -1 : int(executor.leg()),
                     world.actor().region == semantic::kNoId
-                        ? -1 : int(world.actor().region));
+                        ? -1 : int(world.actor().region),
+                    executor.destination() == semantic::kNoId
+                        ? -1 : int(executor.destination()),
+                    unsigned(traversal.actorPlace()),
+                    executor.affordance() == semantic::kNoId
+                        ? -1 : int(executor.affordance()),
+                    unsigned(executor.option()),
+                    unsigned(traversal.placeOfOption(executor.affordance(),
+                                                     executor.option())),
+                    unsigned(traversal.places()));
                 event("goal_finished", why);
+                if (executor.block() == exec::Block::NoProgress)
+                {
+                    // Where it was, where it was heading, and the whole of
+                    // the route it thought it was walking.
+                    char stuck[240];
+                    int said = std::snprintf(stuck, sizeof(stuck),
+                        "at=(%d,%d) aim=(%d,%d) left=%d legs=%u path=",
+                        world.actor().position.x, world.actor().position.y,
+                        executor.aim().x, executor.aim().y,
+                        executor.remaining(), unsigned(executor.legs()));
+                    for (const semantic::Vec2 &point : executor.path())
+                    {
+                        if (said >= int(sizeof(stuck)) - 24)
+                            break;
+                        said += std::snprintf(stuck + said,
+                            sizeof(stuck) - size_t(said), "(%d,%d)",
+                            point.x, point.y);
+                    }
+                    event("went_nowhere", stuck);
+                }
                 if (executor.block() == exec::Block::NoLocalPath
                     || executor.block() == exec::Block::NoProgress
                     || executor.block() == exec::Block::NoRoute)
@@ -1012,6 +1463,7 @@ struct LLMapperBot::Impl
                 "\"places\":%u,\"split_regions\":%u,\"refusals\":%d,"
                 "\"affordances\":%u,\"terrain_builds\":%d,"
                 "\"traversal_evaluations\":%d,\"domain_queries\":%d,"
+                "\"stale_by_crossing\":%d,\"stale_by_body\":%d,"
                 "\"physical_probes\":%d,\"worst_tick_ms\":%.1f,"
                 "\"mean_tick_ms\":%.2f,\"worst_observe_ms\":%.1f,"
                 "\"worst_traversal_ms\":%.1f,\"worst_decide_ms\":%.1f,"
@@ -1033,6 +1485,7 @@ struct LLMapperBot::Impl
                 unsigned(traversal.splitRegions()), traversal.refusals(),
                 unsigned(world.affordances().size()), work.terrainBuilds,
                 traversal.totalEvaluations(), work.domainQueries,
+                traversal.staleByCrossing(), traversal.staleByBody(),
                 bloodmap::probeCount(), worstTickMs,
                 ticksTimed ? totalTickMs / ticksTimed : 0.0,
                 worstObserveMs, worstTraversalMs, worstDecideMs,
@@ -1117,6 +1570,7 @@ void LLMapperBot::PrepareLaunch()
 {
     if (!m_enabled)
         return;
+    m_impl->connectGeometry();
     m_impl->openFiles();
     m_impl->adapter.reset();
     m_impl->event("run_started", "architecture=layered_semantic");

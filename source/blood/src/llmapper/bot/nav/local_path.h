@@ -61,6 +61,14 @@ public:
     // and from it both are reachable.
     void componentsAt(const semantic::Vec2 &at,
                       std::vector<int> &out) const;
+    // Which piece a body standing here belongs to when the free space does
+    // not describe where it is standing -- on a boundary, or hard enough
+    // against a wall that nothing is a clear stride away. The nearest place
+    // it could stand answers for it: a body is never further than its own
+    // width from one. Saying "all of them" instead is how two pieces of a
+    // region that a body cannot walk between become one, and a route then
+    // crosses a wall.
+    int componentNear(const semantic::Vec2 &at) const;
     int components() const { return m_components; }
 
     // Every place a body of this width can stand from which this point is a
@@ -123,14 +131,20 @@ public:
     int queries() const { return m_queries; }
     void countQuery() { ++m_queries; }
 
-private:
     struct Entry
     {
         semantic::RegionId id = semantic::kNoId;
         uint64_t signature = 0;
         int generation = 0;
+        int rebuilds = 0;
         LocalMap map;
     };
+
+    // How many times each region's map has been thrown away and made again,
+    // for finding out which region is churning and why.
+    const std::vector<Entry> &entries() const { return m_entries; }
+
+private:
 
     std::vector<Entry> m_entries;
     int m_builds = 0;

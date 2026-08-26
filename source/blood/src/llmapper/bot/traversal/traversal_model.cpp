@@ -1,8 +1,10 @@
 #include "traversal_model.h"
+#include <tuple>
 
 #include <algorithm>
 #include <limits>
 #include <queue>
+#include <string>
 
 namespace traversal {
 
@@ -74,10 +76,11 @@ uint64_t signatureOf(const SpatialRelation &relation, const Region &from,
         hash = mixHash(hash, uint64_t(uint32_t(region.ceiling.zAt(0, 0))));
         hash = mixHash(hash, uint64_t(int(region.clearance)));
         hash = mixHash(hash, region.hazard.harmful ? 1u : 0u);
-        // Whether the ground here is moving at this moment. Not part of what
-        // makes a Region, and every part of what makes a crossing into one
-        // available, so it belongs here and not in the clustering.
-        hash = mixHash(hash, region.hazard.shifting ? 1u : 0u);
+        // Whether the ground is moving at this instant is deliberately not
+        // in here. Nothing this signature guards depends on it any more --
+        // the executor declines to step into a moving room, the derivation
+        // does not -- and putting a per-tick fact into a test for whether a
+        // verdict is stale means every verdict is stale every tick.
     };
     shape(from);
     shape(to);
@@ -153,6 +156,8 @@ void TraversalModel::update(const SemanticWorld &world,
         // might have -- its stances are worked out a few at a time -- and
         // that has its own test, so ask it. It is the cheap half.
         refreshOptions(world, oracle.profile().radius);
+    refreshSurvival(world, oracle);
+    refreshSealing(world, oracle);
         locateActor(world, oracle.profile().radius);
         return;
     }
@@ -194,6 +199,10 @@ void TraversalModel::update(const SemanticWorld &world,
         if (entry.valid && entry.signature == signature
             && entry.profileRevision == revision)
             continue;
+        if (entry.valid && entry.signature == signature)
+            ++m_staleByBody;
+        else
+            ++m_staleByCrossing;
 
         // What the world says about this crossing has changed, so what the
         // executor found out about the old answer is about an answer that no
@@ -243,6 +252,40 @@ void TraversalModel::update(const SemanticWorld &world,
             ++m_evaluations;
             ++m_lastEvaluations;
         }
+
+        // And the same question again for each configuration of whatever
+        // stateful geometry this crossing is made of, if it is made of any.
+        //
+        // Only the crossing's own geometry: a way is decided by the ground
+        // at its two ends, so asking about anything else would be asking the
+        // whole world at once, which is the combinatorial explosion this is
+        // written to avoid. Everything else stays unconditional.
+        entry.conditionedOn = kNoId;
+        entry.modesInConfiguration.clear();
+        const semantic::GeometryId mover = from->mover != kNoId ? from->mover
+                                                                : to->mover;
+        const semantic::StatefulGeometry *piece = mover == kNoId
+            ? nullptr : world.geometryOf(mover);
+        if (entry.exists && piece && piece->configurations.size() > 1)
+        {
+            entry.conditionedOn = mover;
+            entry.modesInConfiguration.assign(
+                piece->configurations.size(), 0u);
+            for (uint32_t which = 0;
+                 which < uint32_t(piece->configurations.size()); ++which)
+                for (int mode = 0; mode < kModeCount; ++mode)
+                {
+                    semantic::Vec2 crossing = relation.gateway.midpoint();
+                    semantic::Vec2 arrival = to->interior;
+                    semantic::Vec2 departure = from->interior;
+                    if (!oracle.canTraverseWith(mover, which, Mode(mode),
+                            relation, *from, *to, startFrom, crossing,
+                            arrival, departure))
+                        continue;
+                    entry.modesInConfiguration[which] |=
+                        modeBit(Mode(mode));
+                }
+        }
     }
 
     { const double spent = lap();
@@ -281,6 +324,47 @@ void TraversalModel::update(const SemanticWorld &world,
             for (size_t i = 1; i < entry.arrives[mode].size(); ++i)
                 joinPlaces(placeFor(entry.to, entry.arrives[mode][0]),
                            placeFor(entry.to, entry.arrives[mode][i]));
+        }
+    }
+
+    // Which piece of each side's free space a conditional crossing touches.
+    //
+    // The gateway is where the crossing happens, and it stays where it is
+    // when the geometry moves -- only the heights change -- so which piece
+    // of the free space as it stands it belongs to is a question that can be
+    // asked now, in the configuration the world is actually in.
+    {
+        std::map<RegionId, std::vector<semantic::Segment>> ways;
+        gatherOpenings(world, ways);
+        static const std::vector<semantic::Segment> none;
+        const int radius = oracle.profile().radius;
+        auto pieceAt = [&](RegionId which, const semantic::Vec2 &at) {
+            const Region *space = world.region(which);
+            if (!space || !space->exists)
+                return m_places.size();
+            auto found = ways.find(which);
+            const nav::LocalMap &map = m_navigator.mapFor(*space,
+                found == ways.end() ? none : found->second, radius);
+            const int piece = map.componentNear(at);
+            if (piece < 0)
+                return m_places.size();
+            return rootOf(placeFor(which, piece));
+        };
+        for (size_t index = 0; index < m_entries.size(); ++index)
+        {
+            Entry &entry = m_entries[index];
+            entry.leavesPlace = m_places.size();
+            entry.arrivesPlace = m_places.size();
+            if (!entry.valid || !entry.exists
+                || entry.conditionedOn == semantic::kNoId)
+                continue;
+            const semantic::SpatialRelation *way =
+                world.relation(RelationId(index));
+            if (!way || !way->exists)
+                continue;
+            const semantic::Vec2 mid = way->gateway.midpoint();
+            entry.leavesPlace = pieceAt(entry.from, mid);
+            entry.arrivesPlace = pieceAt(entry.to, mid);
         }
     }
 
@@ -371,7 +455,25 @@ void TraversalModel::openingsFor(const SemanticWorld &world, RegionId region,
     openingsInto(world, region, out);
 }
 
-// The one rule, for one region.
+// The one rule, for one region: where the engine does not clip this body.
+//
+// An opening is somewhere the world is not wall *to this body*, and Build
+// decides that with cliptestsector: a two-sided wall stops a body when the
+// floor behind it is further up than the body steps over, or when there is
+// not the height to stand in. Where it stops the body, it is wall, and free
+// space has to be eroded against it like any other.
+//
+// Leaving that out -- counting every adjacency as open, whoever is asking --
+// puts free space where the engine will not let a body be. Poses land within
+// a hull of a clip line that nothing in the model knows about, routes lead to
+// them, and the body drives into the invisible wall and pushes. On AGTST14 it
+// pushed for twenty-six thousand ticks, eighty-three units from a switch it
+// could see, wedged on a boundary the model called a doorway.
+//
+// This is directional and it has to be. A step too tall is a wall from below
+// and a ledge from above, so it erodes the low room's floor and not the high
+// room's -- which is also why the room above a ledge nobody can climb keeps
+// its free space: that room's own ways out are its own question.
 void TraversalModel::openingsInto(const SemanticWorld &world, RegionId region,
                                   std::vector<semantic::Segment> &out) const
 {
@@ -381,6 +483,12 @@ void TraversalModel::openingsInto(const SemanticWorld &world, RegionId region,
         if (!relation.exists || relation.blocked || relation.id == kNoId)
             continue;
         if (relation.from != region || relation.gateway.width() <= 0)
+            continue;
+        // A rise this body does not step over is not an opening, and
+        // neither is one with nowhere to be on the other side.
+        if (-relation.verticalStep > m_profile.stepUp)
+            continue;
+        if (relation.clearance < m_profile.standHeight)
             continue;
         out.push_back({ relation.gateway.from, relation.gateway.to });
     }
@@ -400,7 +508,10 @@ void TraversalModel::gatherOpenings(const SemanticWorld &world,
             continue;
         if (relation.gateway.width() <= 0)
             continue;
-
+        if (-relation.verticalStep > m_profile.stepUp)
+            continue;
+        if (relation.clearance < m_profile.standHeight)
+            continue;
         out[relation.from].push_back({ relation.gateway.from,
                                        relation.gateway.to });
     }
@@ -433,18 +544,18 @@ void TraversalModel::refreshStanding(const SemanticWorld &world,
     std::map<semantic::RegionId, std::vector<semantic::Vec2>> kept;
     std::map<semantic::RegionId, int> keptAt;
     std::vector<semantic::Vec2> candidates;
-    // Every region's ways out, gathered in one pass over the relations
-    // rather than one pass per region.
+    // Every region's ways out. Asked of the one function that answers it.
+    //
+    // This used to be a third copy of the rule, written out inline, and it
+    // was the copy that got missed when the rule changed. Everything else
+    // asked for the filtered set and this asked for the unfiltered one, so
+    // every region's free space was built one way here and the other way
+    // everywhere else -- and since they share a cache keyed on the openings,
+    // each of the hundred and nineteen regions was thrown away and rebuilt
+    // twice on every derivation. Twenty thousand rebuilds, and a decision
+    // that took a fifth of a second.
     std::map<RegionId, std::vector<semantic::Segment>> ways;
-    for (const SpatialRelation &relation : world.relations())
-    {
-        if (!relation.exists || relation.blocked || relation.id == kNoId)
-            continue;
-        if (relation.gateway.width() <= 0)
-            continue;
-        ways[relation.from].push_back({ relation.gateway.from,
-                                        relation.gateway.to });
-    }
+    gatherOpenings(world, ways);
     static const std::vector<semantic::Segment> none;
     for (const Region &region : world.regions())
     {
@@ -585,6 +696,29 @@ void TraversalModel::refreshComponents(const SemanticWorld &world, int radius)
                 .componentsAt(entry.departure[mode], entry.leaves[mode]);
             m_navigator.mapFor(*to, in, radius)
                 .componentsAt(entry.arrival[mode], entry.arrives[mode]);
+            // A crossing the physics agreed to, whose end the free space
+            // cannot label, is a way out the planner will never be offered.
+            //
+            // It happens where the body ends up hard against something --
+            // which at a doorway is most of the time, and after a wall has
+            // slid past it is nearly always. The nearest place the body
+            // could stand answers for it, the same way it answers for the
+            // actor's own position: "I cannot see a node from here" is not
+            // "there is no space here".
+            if (entry.leaves[mode].empty())
+            {
+                const int piece = m_navigator.mapFor(*from, out, radius)
+                    .componentNear(entry.departure[mode]);
+                if (piece >= 0)
+                    entry.leaves[mode].push_back(piece);
+            }
+            if (entry.arrives[mode].empty())
+            {
+                const int piece = m_navigator.mapFor(*to, in, radius)
+                    .componentNear(entry.arrival[mode]);
+                if (piece >= 0)
+                    entry.arrives[mode].push_back(piece);
+            }
         }
     }
 }
@@ -605,9 +739,17 @@ void TraversalModel::refreshOptions(const SemanticWorld &world, int radius)
         && m_optionPlace.size() == world.affordances().size())
         return;
     m_domainSignature = signature;
-    m_optionPlace.assign(world.affordances().size(), {});
-    m_optionWhy.assign(world.affordances().size(), {});
-    m_optionAt.assign(world.affordances().size(), {});
+    // Kept, not cleared. One action's stances are worked out per tick, so
+    // this runs most ticks -- and rebuilding the placements of all of them
+    // every time is most of what the bot costs on a large level, where there
+    // are hundreds of stances and each one asks a region's free space where
+    // it falls. Only the action whose stances actually moved is placed again.
+    const size_t count = world.affordances().size();
+    m_optionPlace.resize(count);
+    m_optionWhy.resize(count);
+    m_optionAt.resize(count);
+    m_optionSignature.resize(count, 0);
+    const bool mapsMoved = m_mapsAtComponents != m_navigator.builds();
     // Every region's ways out, once. Working them out inside the loop below
     // walks all five hundred and sixty-eight relations for every stance of
     // every action -- seven hundred of them once each action kept all the
@@ -622,6 +764,19 @@ void TraversalModel::refreshOptions(const SemanticWorld &world, int radius)
         if (affordance.id == kNoId
             || size_t(affordance.id) >= m_optionPlace.size())
             continue;
+        // What this one's stances are, on their own.
+        uint64_t mine = 1469598103934665603ULL;
+        for (const semantic::ExecutionOption &option : affordance.domain)
+        {
+            mine = mixHash(mine, uint64_t(uint32_t(option.at.x)));
+            mine = mixHash(mine, uint64_t(uint32_t(option.at.y)));
+            mine = mixHash(mine, uint64_t(option.region));
+        }
+        if (!mapsMoved && mine == m_optionSignature[size_t(affordance.id)]
+            && m_optionPlace[size_t(affordance.id)].size()
+                   == affordance.domain.size())
+            continue;
+        m_optionSignature[size_t(affordance.id)] = mine;
         std::vector<size_t> &places = m_optionPlace[size_t(affordance.id)];
         std::vector<uint8_t> &why = m_optionWhy[size_t(affordance.id)];
         std::vector<semantic::Vec2> &at = m_optionAt[size_t(affordance.id)];
@@ -654,17 +809,440 @@ void TraversalModel::refreshOptions(const SemanticWorld &world, int radius)
             map.componentsAt({ where.at.x, where.at.y }, m_scratch);
             if (m_scratch.empty())
             {
-                why[option] = 3;
+                // Somewhere the body fits but nothing is a clear stride
+                // away: hard against the wall the switch is on, which is
+                // where a switch is pressed from. Throwing the stance away
+                // for that is throwing away the act.
+                //
+                // On AGTST8 it threw away every stance for calling the
+                // second lift from the ledge it serves, so the only way left
+                // to call it was from the floor below -- and the plan came
+                // out as "walk back off the ledge, drop into the pit, press
+                // it there, and ride all the way round again".
+                const int piece =
+                    map.componentNear({ where.at.x, where.at.y });
+                if (piece < 0)
+                {
+                    why[option] = 3;
+                    continue;
+                }
+                why[option] = 0;
+                places[option] = rootOf(placeFor(where.region, piece));
                 continue;
             }
             why[option] = 0;
             places[option] = rootOf(placeFor(where.region, m_scratch[0]));
         }
+        for (size_t option = 0; option < affordance.domain.size(); ++option)
+            m_sealedRegionOf[std::make_pair(size_t(affordance.id), option)] =
+                affordance.domain[option].region;
     }
 }
 
 namespace {
 constexpr size_t kAnyPlace = size_t(-1);
+}
+
+// Whether an act done from a stance leaves the body anywhere to be.
+//
+// The act commands geometry; the geometry goes somewhere; the stance is a
+// point in the world the geometry is going through. So the question is asked
+// the only way it can be answered -- by putting the geometry in each
+// configuration it could arrive in and asking the engine whether the body
+// still fits where it is standing. That is the same machinery that answers
+// "is this crossing walkable in that configuration", used for the actor
+// rather than for a doorway.
+//
+// Where the configurations say nothing -- which today is everything that
+// moves in the plane -- there is one thing still known: where the geometry
+// is now. A stance whose hull is inside something about to move, with no
+// account of where it moves to, is not a stance to wait on. That is not a
+// rule about doors; it is a refusal to stand inside an unanswered question.
+void TraversalModel::refreshSurvival(const SemanticWorld &world,
+                                     const PhysicsOracle &oracle)
+{
+    const size_t count = world.affordances().size();
+    m_optionSurvival.resize(count);
+    m_optionEscape.resize(count);
+    m_survivalSignature.resize(count, 0);
+    const int radius = oracle.profile().radius;
+    // The spaces each piece of stateful geometry currently occupies.
+    std::map<semantic::GeometryId, std::vector<const Region *>> occupies;
+    for (const Region &region : world.regions())
+        if (region.exists && region.mover != semantic::kNoId)
+            occupies[region.mover].push_back(&region);
+
+    struct Ask
+    {
+        size_t thing = 0;
+        size_t option = 0;
+        size_t candidate = 0;
+    };
+    std::map<semantic::GeometryId, std::vector<Ask>> asking;
+    std::map<semantic::GeometryId,
+             std::vector<PhysicsOracle::Stance>> places;
+    std::map<size_t, std::vector<semantic::GeometryId>> commanded;
+
+    // Which acts need answering again.
+    //
+    // Nothing about this changes while an act's stances stay where they are
+    // and it works the same things: the travel it would set off is fixed by
+    // the world, and the answer is about those two together. So it is worked
+    // out for one act when that act moves and not otherwise -- it is by a
+    // long way the most expensive question this layer asks, and asking it
+    // every tick was eighty milliseconds a tick on a level full of movers,
+    // against a budget of thirty-three.
+    for (const semantic::Affordance &thing : world.affordances())
+    {
+        if (thing.id == kNoId || size_t(thing.id) >= count)
+            continue;
+        const size_t slot = size_t(thing.id);
+        std::vector<semantic::GeometryId> worked = thing.commands;
+        for (semantic::GeometryId also : thing.moves)
+        {
+            bool known = false;
+            for (semantic::GeometryId already : worked)
+                known = known || already == also;
+            if (!known)
+                worked.push_back(also);
+        }
+        uint64_t mine = 1469598103934665603ULL;
+        for (const semantic::ExecutionOption &option : thing.domain)
+        {
+            mine = mixHash(mine, uint64_t(uint32_t(option.at.x)));
+            mine = mixHash(mine, uint64_t(uint32_t(option.at.y)));
+            mine = mixHash(mine, uint64_t(option.region));
+        }
+        for (semantic::GeometryId which : worked)
+            mine = mixHash(mine, uint64_t(which) + 1);
+        if (mine == m_survivalSignature[slot]
+            && m_optionSurvival[slot].size() == thing.domain.size())
+            continue;
+        m_survivalSignature[slot] = mine;
+        m_optionSurvival[slot].assign(thing.domain.size(),
+                                      uint8_t(Survival::Remain));
+        m_optionEscape[slot].assign(thing.domain.size(),
+                                    semantic::Vec2{ 0, 0 });
+        if (worked.empty())
+            continue;   // it moves nothing: there is nothing to survive
+        commanded[slot] = worked;
+
+        for (size_t option = 0; option < thing.domain.size(); ++option)
+        {
+            const semantic::ExecutionOption &where = thing.domain[option];
+            const Region *standing = world.region(where.region);
+            if (!standing || !standing->exists)
+                continue;
+            const semantic::Vec2 at = { where.at.x, where.at.y };
+            Survival worst = Survival::Remain;
+            for (semantic::GeometryId which : worked)
+            {
+                const semantic::StatefulGeometry *piece =
+                    world.geometryOf(which);
+                if (!piece)
+                    continue;
+                if (!piece->configurationsDiffer)
+                {
+                    // Nothing describes where this goes. Standing clear of it
+                    // is all that can be said for a stance; standing in it
+                    // cannot be vouched for at all.
+                    bool inside = false;
+                    auto found = occupies.find(which);
+                    if (found != occupies.end())
+                        for (const Region *space : found->second)
+                            inside = inside
+                                || semantic::touches(space->shape(), at,
+                                                     radius);
+                    const Survival said = inside ? Survival::Unsafe
+                                                 : Survival::Unknown;
+                    if (int(said) > int(worst))
+                        worst = said;
+                    continue;
+                }
+                Ask ask;
+                ask.thing = slot;
+                ask.option = option;
+                asking[which].push_back(ask);
+                places[which].push_back({ standing, at });
+            }
+            m_optionSurvival[slot][option] = uint8_t(worst);
+        }
+    }
+    if (asking.empty())
+        return;
+
+    // Whether the body can be where it is standing, all the way through what
+    // the act sets off. Each configuration is posed once and every place
+    // wanted from it is asked while it is there.
+    const uint32_t kPoses = 5;
+    auto sweep = [&](const std::map<semantic::GeometryId,
+                                    std::vector<Ask>> &questions,
+                     std::map<semantic::GeometryId,
+                              std::vector<PhysicsOracle::Stance>> &where,
+                     std::map<std::tuple<size_t, size_t, size_t>, bool> &into) {
+        for (const auto &entry : questions)
+        {
+            std::vector<char> answer;
+            std::vector<char> swept;
+            for (uint32_t c = 0; c < kPoses; ++c)
+            {
+                oracle.canStandThrough(entry.first, c, kPoses,
+                                       where[entry.first], answer);
+                // And whether the thing itself arrives at this place on the
+                // way. Somewhere the body can stand and the geometry comes
+                // to is not somewhere to be: it is carried off, which is
+                // riding when the place is the thing's own and being run
+                // over when it is not.
+                oracle.sweptThrough(entry.first, c, kPoses,
+                                    where[entry.first], swept);
+                for (size_t i = 0; i < entry.second.size()
+                         && i < answer.size(); ++i)
+                {
+                    bool safe = answer[i] != 0;
+                    if (i < swept.size() && swept[i]
+                        && !(where[entry.first][i].region
+                             && where[entry.first][i].region->mover
+                                    == entry.first))
+                        safe = false;
+                    const Ask &ask = entry.second[i];
+                    const auto key = std::make_tuple(ask.thing, ask.option,
+                                                     ask.candidate);
+                    auto found = into.find(key);
+                    if (found == into.end())
+                        into[key] = safe;
+                    else
+                        found->second = found->second && safe;
+                }
+            }
+        }
+    };
+
+    std::map<std::tuple<size_t, size_t, size_t>, bool> stays;
+    sweep(asking, places, stays);
+
+
+    // Only where staying is not an answer is there any point asking where
+    // else the body could be. Working that out means a visibility sweep of
+    // the region for every candidate, so it is not done for stances that
+    // never needed it -- which is nearly all of them.
+    std::map<RegionId, std::vector<semantic::Segment>> ways;
+    std::map<semantic::GeometryId, std::vector<Ask>> running;
+    std::map<semantic::GeometryId,
+             std::vector<PhysicsOracle::Stance>> runningTo;
+    std::map<std::pair<size_t, size_t>, std::vector<semantic::Vec2>> options;
+    bool gathered = false;
+    static const std::vector<semantic::Segment> none;
+    for (const auto &verdict : stays)
+    {
+        if (verdict.second)
+            continue;
+        const size_t slot = std::get<0>(verdict.first);
+        const size_t option = std::get<1>(verdict.first);
+        const semantic::Affordance *thing =
+            world.affordance(semantic::AffordanceId(slot));
+        if (!thing || option >= thing->domain.size())
+            continue;
+        const semantic::ExecutionOption &where = thing->domain[option];
+        const Region *standing = world.region(where.region);
+        if (!standing || !standing->exists)
+            continue;
+        if (!gathered)
+        {
+            gatherOpenings(world, ways);
+            gathered = true;
+        }
+        const semantic::Vec2 at = { where.at.x, where.at.y };
+        auto opening = ways.find(where.region);
+        const nav::LocalMap &map = m_navigator.mapFor(*standing,
+            opening == ways.end() ? none : opening->second, radius);
+        std::vector<semantic::Vec2> reachable;
+        map.visibleFrom(at, reachable);
+        std::vector<semantic::Vec2> &candidates =
+            options[std::make_pair(slot, option)];
+        const size_t kMostConsidered = 6;
+        for (const semantic::Vec2 &spot : reachable)
+        {
+            candidates.push_back(spot);
+            if (candidates.size() >= kMostConsidered)
+                break;
+        }
+        auto worked = commanded.find(slot);
+        if (worked == commanded.end())
+            continue;
+        for (semantic::GeometryId which : worked->second)
+        {
+            const semantic::StatefulGeometry *piece =
+                world.geometryOf(which);
+            if (!piece || !piece->configurationsDiffer)
+                continue;
+            for (size_t c = 0; c < candidates.size(); ++c)
+            {
+                Ask run;
+                run.thing = slot;
+                run.option = option;
+                run.candidate = c + 1;
+                running[which].push_back(run);
+                runningTo[which].push_back({ standing, candidates[c] });
+            }
+        }
+    }
+    std::map<std::tuple<size_t, size_t, size_t>, bool> reaches;
+    if (!running.empty())
+        sweep(running, runningTo, reaches);
+
+    // Somewhere the body cannot be throughout is somewhere it has to leave,
+    // and leaving is only an answer if there is somewhere to go.
+    for (const auto &verdict : stays)
+    {
+        if (verdict.second)
+            continue;
+        const size_t slot = std::get<0>(verdict.first);
+        const size_t option = std::get<1>(verdict.first);
+        if (slot >= m_optionSurvival.size()
+            || option >= m_optionSurvival[slot].size())
+            continue;
+        Survival said = Survival::Unsafe;
+        auto candidates = options.find(std::make_pair(slot, option));
+        if (candidates != options.end())
+            for (size_t c = 0; c < candidates->second.size(); ++c)
+            {
+                auto found = reaches.find(
+                    std::make_tuple(slot, option, c + 1));
+                if (found == reaches.end() || !found->second)
+                    continue;
+                m_optionEscape[slot][option] = candidates->second[c];
+                said = Survival::Escape;
+                break;
+            }
+        if (int(said) > int(m_optionSurvival[slot][option]))
+            m_optionSurvival[slot][option] = uint8_t(said);
+    }
+}
+
+// Would doing this shut the body into the room it is done from?
+//
+// Separate from whether the body survives, because it does survive: it is
+// alive and it is sealed in. On AGTST18 that is a wall sliding across the
+// only doorway of the room the switch is in, worked by a switch that only
+// works once.
+//
+// The derived table cannot see it. A crossing is conditioned on the ground
+// at its two ends, and the wall that shuts this one belongs to neither room
+// -- so the engine is asked directly, with everything the act works held
+// where the act would leave it.
+//
+// On its own cache, and not the one the stance verdicts use. Where a stance
+// is depends on the stance; whether it seals depends on where everything is
+// resting right now, so this is worked out again when a resting position
+// changes and not otherwise. Never while anything is still travelling: the
+// question has no answer half way through.
+void TraversalModel::refreshSealing(const SemanticWorld &world,
+                                    const PhysicsOracle &oracle)
+{
+    uint64_t resting = 1469598103934665603ULL;
+    for (const semantic::StatefulGeometry &piece : world.geometry())
+    {
+        if (piece.moving)
+            return;   // nothing to be said until it stops
+        resting = mixHash(resting, uint64_t(piece.id) + 1);
+        resting = mixHash(resting, uint64_t(piece.state) + 1);
+    }
+    if (resting == m_sealingSignature && !m_sealed.empty())
+        return;
+    m_sealingSignature = resting;
+    m_sealed.clear();
+    m_sealingLooked = 0;
+    m_sealingSkipped = 0;
+    m_sealingAudit.clear();
+    for (const semantic::Affordance &thing : world.affordances())
+    {
+        if (thing.id == kNoId || !thing.exists || thing.commands.empty())
+            continue;
+        std::vector<std::pair<semantic::GeometryId, uint32_t>> after;
+        for (semantic::GeometryId which : thing.commands)
+        {
+            const semantic::StatefulGeometry *piece = world.geometryOf(which);
+            if (!piece || piece->configurations.size() < 2
+                || !piece->configurationsDiffer)
+                continue;
+            after.push_back({ which, piece->state == 0 ? 1u : 0u });
+        }
+        if (after.empty())
+            continue;
+        std::set<RegionId> asked;
+        for (const semantic::ExecutionOption &where : thing.domain)
+        {
+            if (!asked.insert(where.region).second)
+                continue;
+            const Region *standing = world.region(where.region);
+            if (!standing || !standing->exists)
+                continue;
+            std::vector<PhysicsOracle::WayOut> ways;
+            for (const semantic::SpatialRelation &way : world.relations())
+            {
+                if (!way.exists || way.id == kNoId || way.from != where.region
+                    || way.blocked || way.gateway.width() <= 0)
+                    continue;
+                ways.push_back({ &way, world.region(way.to) });
+            }
+            if (ways.empty())
+            {
+                ++m_sealingSkipped;
+                continue;
+            }
+            const semantic::Vec2 at = { where.at.x, where.at.y };
+            // Only where there is a way out now. An act is not to blame for
+            // a room that was already shut.
+            ++m_sealingLooked;
+            Sealing said;
+            said.thing = size_t(thing.id);
+            said.region = where.region;
+            said.ways = int(ways.size());
+            said.openNow = oracle.anyWayOut({}, *standing, at, ways);
+            said.openAfter = said.openNow
+                && oracle.anyWayOut(after, *standing, at, ways);
+            m_sealingAudit.push_back(said);
+            if (!said.openNow)
+            {
+                ++m_sealingSkipped;
+                continue;
+            }
+            if (!said.openAfter)
+                m_sealed.insert({ size_t(thing.id), where.region });
+        }
+    }
+}
+
+bool TraversalModel::wouldSealIn(semantic::AffordanceId action,
+                                 uint32_t option) const
+{
+    if (size_t(action) >= m_optionAt.size())
+        return false;
+    const semantic::Region *nothing = nullptr;
+    (void)nothing;
+    auto found = m_sealedRegionOf.find(
+        std::make_pair(size_t(action), size_t(option)));
+    if (found == m_sealedRegionOf.end())
+        return false;
+    return m_sealed.count({ size_t(action), found->second }) != 0;
+}
+
+TraversalModel::Survival TraversalModel::survivalOf(
+    semantic::AffordanceId action, uint32_t option) const
+{
+    if (size_t(action) >= m_optionSurvival.size()
+        || size_t(option) >= m_optionSurvival[size_t(action)].size())
+        return Survival::Remain;
+    return Survival(m_optionSurvival[size_t(action)][size_t(option)]);
+}
+
+bool TraversalModel::escapeFrom(semantic::AffordanceId action,
+                                uint32_t option, semantic::Vec2 &out) const
+{
+    if (survivalOf(action, option) != Survival::Escape)
+        return false;
+    out = m_optionEscape[size_t(action)][size_t(option)];
+    return true;
 }
 
 // Where the piece of free space an action is taken from is, if the model has
@@ -681,10 +1259,24 @@ int TraversalModel::optionVerdict(semantic::AffordanceId action,
 bool TraversalModel::optionCost(RegionId from, semantic::AffordanceId action,
                                 uint32_t option, int &cost) const
 {
-    std::vector<RegionId> path;
-    std::vector<RelationId> via;
+    // An option the executor has been unable to drive is not offered again
+    // until something changes. This is planner policy and not topology --
+    // reachableFrom and findRoute know nothing about it -- and everything
+    // that asks "can this act be reached" has to ask the same way, or the
+    // planner proposes what the router has quietly banned and the two
+    // disagree for ever.
     if (refusedOption(action, option))
         return false;
+    // Nor one with no survivable trajectory through what the act sets off.
+    // This is not a cost and it is not a preference: there is no journey to
+    // price to a place the body cannot come back from.
+    if (survivalOf(action, option) == Survival::Unsafe)
+        return false;
+    // Nor one that would shut the body into the room it is done from.
+    if (wouldSealIn(action, option))
+        return false;
+    std::vector<RegionId> path;
+    std::vector<RelationId> via;
     if (size_t(action) >= m_optionPlace.size()
         || size_t(option) >= m_optionPlace[size_t(action)].size())
         return false;
@@ -700,19 +1292,20 @@ bool TraversalModel::optionCost(RegionId from, semantic::AffordanceId action,
 bool TraversalModel::optionRoute(RegionId from, semantic::AffordanceId action,
                                  uint32_t option,
                                  std::vector<RegionId> &path,
-                                 std::vector<RelationId> &via) const
+                                 std::vector<RelationId> &via,
+                                 std::vector<size_t> *through) const
 {
     path.clear();
     via.clear();
-    if (refusedOption(action, option))
-        return false;
+    if (through)
+        through->clear();
     if (size_t(action) >= m_optionPlace.size()
         || size_t(option) >= m_optionPlace[size_t(action)].size())
         return false;
     if (m_indexStale)
         rebuildIndex();
     return findRoute(startPlace(from), m_optionPlace[size_t(action)][option],
-                     kNoId, &path, &via, nullptr);
+                     kNoId, &path, &via, nullptr, through);
 }
 
 void TraversalModel::refuseOption(semantic::AffordanceId action,
@@ -829,16 +1422,22 @@ void TraversalModel::locateActor(const SemanticWorld &world, int radius)
     map.componentsAt(m_actorAt, m_scratch);
     if (m_scratch.empty())
     {
-        // Standing somewhere the free space does not describe. Say nothing
-        // rather than something wrong: every piece of this region counts as
-        // where the actor is, which is what the model assumed before free
-        // space was split at all.
-        for (int component = 0; component + 1 < map.components(); ++component)
-            joinPlaces(placeFor(m_actorRegion, 0),
-                       placeFor(m_actorRegion, component + 1));
-        if (map.components() > 0)
+        // Standing somewhere the free space does not describe -- on a
+        // boundary, or hard against a wall. The nearest place the body could
+        // stand says which piece it is in.
+        //
+        // This used to join every piece of the region into one instead, on
+        // the grounds that saying nothing was safer than saying something
+        // wrong. It is not: joining them says the body can walk between
+        // them, which on AGTST8 is the difference between the half of the
+        // mid ledge that reaches the second lift and the half that does not.
+        // The route came out as "step off the first lift and board the
+        // second", the executor found no way across the region it had just
+        // been routed through, and the run went round again.
+        const int piece = map.componentNear(m_actorAt);
+        if (piece >= 0)
         {
-            m_actorPlace = rootOf(placeFor(m_actorRegion, 0));
+            m_actorPlace = rootOf(placeFor(m_actorRegion, piece));
             m_actorPlaceKnown = true;
         }
         return;
@@ -1006,6 +1605,40 @@ int TraversalModel::legCost(size_t transition, size_t place,
 // Where a route starts. For the region the actor is standing in that is the
 // piece of free space it is actually in; for anywhere else it is any piece,
 // because the question being asked is about that region as a whole.
+void TraversalModel::placesOf(RegionId region,
+                              std::vector<size_t> &out) const
+{
+    out.clear();
+    if (m_indexStale)
+        rebuildIndex();
+    for (size_t index = 0; index < m_places.size(); ++index)
+    {
+        if (m_places[index].region != region)
+            continue;
+        const size_t root = rootOf(index);
+        bool known = false;
+        for (size_t already : out)
+            known = known || already == root;
+        if (!known)
+            out.push_back(root);
+    }
+}
+
+bool TraversalModel::placesAcross(semantic::RelationId way, size_t &leaves,
+                                  size_t &arrives) const
+{
+    if (m_indexStale)
+        rebuildIndex();
+    for (size_t index = 0; index < m_transitions.size(); ++index)
+        if (m_transitions[index].relation == way)
+        {
+            leaves = m_transitionPlaces[index].leaves;
+            arrives = m_transitionPlaces[index].arrives;
+            return true;
+        }
+    return false;
+}
+
 size_t TraversalModel::startPlace(RegionId from) const
 {
     if (from == kNoId)
@@ -1064,10 +1697,13 @@ void TraversalModel::reachableFrom(RegionId origin,
 
 bool TraversalModel::route(RegionId from, RegionId to,
                            std::vector<RegionId> &path,
-                           std::vector<RelationId> &via) const
+                           std::vector<RelationId> &via,
+                           std::vector<size_t> *through) const
 {
     path.clear();
     via.clear();
+    if (through)
+        through->clear();
     if (m_indexStale)
         rebuildIndex();
     if (from == kNoId || to == kNoId)
@@ -1075,15 +1711,325 @@ bool TraversalModel::route(RegionId from, RegionId to,
     if (from == to)
     {
         path.push_back(from);
+        if (through)
+            through->push_back(startPlace(from));
         return true;
     }
-    return findRoute(startPlace(from), kAnyPlace, to, &path, &via, nullptr);
+    return findRoute(startPlace(from), kAnyPlace, to, &path, &via, nullptr,
+                     through);
+}
+
+// A plan that may have to arrange the world before it can be walked.
+//
+// Dijkstra over (Place, what the plan has committed the geometry to). The
+// commitments are lazy: a piece of geometry only enters the search state
+// when an edge is taken that depends on it, so a level full of movers costs
+// nothing until one of them is actually on the way.
+//
+// Three kinds of edge, and not one of them is a new thing the body can do:
+//   walking a crossing that works as the world stands
+//   walking a crossing that works with some geometry resting elsewhere
+//   acting on something that moves that geometry
+//
+// The goal is anywhere the body has not stood. Multi-goal, so one search
+// answers both "is there anything left worth doing" and "what is the first
+// step of getting there".
+bool TraversalModel::planSomewhereNew(const semantic::SemanticWorld &world,
+                                      RegionId from, PlanStep &first,
+                                      std::vector<PlanStep> *whole) const
+{
+    if (m_indexStale)
+        rebuildIndex();
+    const size_t places = m_places.size();
+    const size_t start = startPlace(from);
+    if (start >= places)
+        return false;
+
+    using Commitment = std::vector<std::pair<semantic::GeometryId, uint32_t>>;
+    struct Node { size_t place; Commitment held; };
+    auto keyOf = [](size_t place, const Commitment &held) {
+        std::string key = std::to_string(place);
+        for (const auto &one : held)
+            key += ":" + std::to_string(one.first) + "="
+                + std::to_string(one.second);
+        return key;
+    };
+    auto restingAt = [&](const Commitment &held, semantic::GeometryId which) {
+        for (const auto &one : held)
+            if (one.first == which)
+                return one.second;
+        const semantic::StatefulGeometry *piece = world.geometryOf(which);
+        return piece ? piece->state : 0u;
+    };
+    // Is everything the plan has committed to already true? If so this node
+    // is somewhere the body can get to right now, and an act done here is an
+    // act the executor can actually be sent to do. If not, the node only
+    // exists inside the plan, and an act here is not yet a first step.
+    auto standingNow = [&](const Commitment &held) {
+        for (const auto &one : held)
+        {
+            const semantic::StatefulGeometry *piece =
+                world.geometryOf(one.first);
+            if (!piece || piece->state != one.second)
+                return false;
+        }
+        return true;
+    };
+    // Holding more than a handful of things in one configuration at once is
+    // not a plan this is going to find, and the bound is what keeps a level
+    // full of movers from becoming a search over every combination of them.
+    const size_t kMostHeld = 4;
+
+    // What the body can already walk to. A plan is for somewhere it cannot.
+    //
+    // Stated any other way, this rule goes wrong. "A plan containing an act"
+    // is what it used to ask for, and where the walking it wanted was
+    // already possible, a search told to find an act had to invent one: the
+    // cheapest invention is a round trip that puts a lift back where it
+    // started, and doing the first half of that moves the lift out from
+    // under the very walk the plan was for. Asking instead for somewhere
+    // unreachable says what is actually wanted, and leaves a plan free to
+    // move the same lift twice -- which is exactly what calling a lift and
+    // then riding it is.
+    std::vector<char> walkable(places, 0);
+    {
+        std::vector<size_t> front{ start };
+        walkable[start] = 1;
+        while (!front.empty())
+        {
+            const size_t at = front.back();
+            front.pop_back();
+            for (size_t index : m_outgoing[at])
+            {
+                const size_t next = m_transitionPlaces[index].arrives;
+                if (next < places && !walkable[next])
+                {
+                    walkable[next] = 1;
+                    front.push_back(next);
+                }
+            }
+        }
+    }
+
+    std::map<std::string, int64_t> seen;
+    std::map<std::string, PlanStep> opening;
+    std::map<std::string, Node> nodes;
+    std::map<std::string, std::string> cameFrom;
+    std::map<std::string, PlanStep> arrivedBy;
+    using Queued = std::pair<int64_t, std::string>;
+    std::priority_queue<Queued, std::vector<Queued>, std::greater<Queued>>
+        queue;
+    const std::string origin = keyOf(start, Commitment());
+    seen[origin] = 0;
+    nodes[origin] = Node{ start, Commitment() };
+    opening[origin] = PlanStep();
+    queue.push({ 0, origin });
+
+    while (!queue.empty())
+    {
+        const Queued top = queue.top();
+        queue.pop();
+        auto known = seen.find(top.second);
+        if (known == seen.end() || top.first != known->second)
+            continue;
+        const Node here = nodes[top.second];
+        const PlanStep arrived = opening[top.second];
+
+        // Somewhere the body has not stood and cannot walk to, reached by
+        // a plan that arranges the world on the way.
+        //
+        // Somewhere it can already walk to is not this rule's business:
+        // ordinary routing already offers it, and offering the first stride
+        // of it here just means arriving, re-planning, and being handed the
+        // same stride again. What is wanted is the first *act* -- the
+        // walking before it is reachable as things stand, by construction,
+        // so the executor gets there on its own.
+        if (arrived.act && !walkable[here.place])
+        {
+            const Region *space = world.region(m_places[here.place].region);
+            if (space && space->exists && !space->occupied)
+            {
+                first = arrived;
+                first.cost = int(top.first);
+                if (whole)
+                {
+                    whole->clear();
+                    std::string walk = top.second;
+                    while (arrivedBy.count(walk))
+                    {
+                        whole->push_back(arrivedBy[walk]);
+                        walk = cameFrom[walk];
+                    }
+                    std::reverse(whole->begin(), whole->end());
+                }
+                return true;
+            }
+        }
+
+        auto relax = [&](size_t place, const Commitment &held, int64_t cost,
+                         const PlanStep &step) {
+            if (place >= places || held.size() > kMostHeld)
+                return;
+            const std::string key = keyOf(place, held);
+            auto found = seen.find(key);
+            if (found != seen.end() && found->second <= cost)
+                return;
+            seen[key] = cost;
+            nodes[key] = Node{ place, held };
+            cameFrom[key] = top.second;
+            arrivedBy[key] = step;
+            // Only an act reachable in the world as it stands can be the
+            // first step. An act the plan can only get to after moving
+            // something else is a later step; the executor would be sent to
+            // a place it cannot route to and would come straight back with
+            // no route, over and over.
+            opening[key] = arrived.act
+                ? arrived
+                : ((step.act && standingNow(here.held)) ? step : PlanStep());
+            queue.push({ cost, key });
+        };
+
+        // Walking, as the world stands.
+        for (size_t index : m_outgoing[here.place])
+        {
+            const size_t next = m_transitionPlaces[index].arrives;
+            if (next >= places)
+                continue;
+            // A crossing that works as the world stands only works while the
+            // world still stands that way. If the plan has already committed
+            // the geometry this crossing is made of to some other
+            // configuration, this is not a crossing the plan may use --
+            // however plainly it can be walked at this moment.
+            //
+            // Leaving this out is how the plan came out as "send the lift
+            // down, get on it, and walk off at the top": the last step was
+            // derived while the lift was at the top, and the plan had
+            // already sent it to the bottom to get on it.
+            const RelationId about = m_transitions[index].relation;
+            const semantic::GeometryId shaped = conditionOf(about);
+            if (shaped != semantic::kNoId)
+            {
+                bool held = false;
+                uint32_t wanted = 0;
+                for (const auto &one : here.held)
+                    if (one.first == shaped)
+                    {
+                        held = true;
+                        wanted = one.second;
+                    }
+                if (held && !possibleInConfiguration(about, wanted,
+                                                     Mode::Walk))
+                    continue;
+            }
+            PlanStep step;
+            step.crossing = m_transitions[index].relation;
+            step.region = m_places[here.place].region;
+            step.steps = arrived.steps + 1;
+            relax(next, here.held,
+                  top.first + legCost(index, here.place, m_actorAt), step);
+        }
+
+        // Walking, with some geometry resting where the plan has put it.
+        for (size_t index = 0; index < m_entries.size(); ++index)
+        {
+            const Entry &entry = m_entries[index];
+            if (!entry.valid || !entry.exists
+                || entry.conditionedOn == semantic::kNoId)
+                continue;
+            if ((m_executable & modeBit(Mode::Walk)) == 0)
+                continue;
+            if (entry.leavesPlace != here.place
+                || entry.arrivesPlace >= places)
+                continue;
+            // Only for geometry the plan has actually committed to moving.
+            //
+            // Where it is resting now, the authoritative answer is the
+            // derived transition above -- that came from asking the engine
+            // about the world as it is, while these came from asking it
+            // about a world posed by hand, and the two can disagree at the
+            // margin. Trusting the posed answer for the present produces
+            // plans whose walking prefix the executor cannot actually route,
+            // and it comes straight back with no route, for ever.
+            bool committed = false;
+            for (const auto &one : here.held)
+                committed = committed || one.first == entry.conditionedOn;
+            if (!committed)
+                continue;
+            const uint32_t resting = restingAt(here.held,
+                                               entry.conditionedOn);
+            if (resting >= entry.modesInConfiguration.size())
+                continue;
+            if ((entry.modesInConfiguration[resting]
+                    & modeBit(Mode::Walk)) == 0)
+                continue;
+            const Commitment held = here.held;
+            PlanStep step;
+            step.crossing = RelationId(index);
+            step.region = entry.from;
+            step.steps = arrived.steps + 1;
+            relax(entry.arrivesPlace, held,
+                  top.first + entry.cost[int(Mode::Walk)], step);
+        }
+
+        // Acting on something that moves geometry, from where we are.
+        for (const semantic::Affordance &thing : world.affordances())
+        {
+            if (thing.id == semantic::kNoId || !thing.exists
+                || !thing.executable || thing.moves.empty())
+                continue;
+            for (size_t option = 0; option < thing.domain.size(); ++option)
+            {
+                if (size_t(thing.id) >= m_optionPlace.size()
+                    || option >= m_optionPlace[size_t(thing.id)].size())
+                    continue;
+                if (m_optionPlace[size_t(thing.id)][option] != here.place)
+                    continue;
+                // The same policy the router uses. A plan whose first act the
+                // executor has already been unable to drive is a plan that
+                // will be proposed, refused, and proposed again.
+                if (refusedOption(thing.id, uint32_t(option)))
+                    continue;
+                if (survivalOf(thing.id, uint32_t(option))
+                        == Survival::Unsafe)
+                    continue;
+                for (semantic::GeometryId which : thing.moves)
+                {
+                    const semantic::StatefulGeometry *piece =
+                        world.geometryOf(which);
+                    if (!piece || piece->configurations.size() < 2)
+                        continue;
+                    const uint32_t resting = restingAt(here.held, which);
+                    for (uint32_t to = 0;
+                         to < uint32_t(piece->configurations.size()); ++to)
+                    {
+                        if (to == resting)
+                            continue;
+                        Commitment held;
+                        for (const auto &one : here.held)
+                            if (one.first != which)
+                                held.push_back(one);
+                        held.push_back({ which, to });
+                        std::sort(held.begin(), held.end());
+                        PlanStep step;
+                        step.act = true;
+                        step.affordance = thing.id;
+                        step.option = uint32_t(option);
+                        step.region = m_places[here.place].region;
+                        step.steps = arrived.steps + 1;
+                        relax(here.place, held, top.first + 1, step);
+                    }
+                }
+            }
+        }
+    }
+    return false;
 }
 
 bool TraversalModel::findRoute(size_t start, size_t goalPlace,
                                RegionId goalRegion,
                                std::vector<RegionId> *path,
-                               std::vector<RelationId> *via, int *cost) const
+                               std::vector<RelationId> *via, int *cost,
+                               std::vector<size_t> *through) const
 {
     const size_t count = m_places.size();
     if (start >= count)
@@ -1094,6 +2040,8 @@ bool TraversalModel::findRoute(size_t start, size_t goalPlace,
     {
         if (path)
             path->push_back(m_places[start].region);
+        if (through)
+            through->push_back(start);
         if (cost)
             *cost = 0;
         return true;
@@ -1141,13 +2089,15 @@ bool TraversalModel::findRoute(size_t start, size_t goalPlace,
         return false;
     if (cost)
         *cost = int(distance[goal]);
-    if (!path && !via)
+    if (!path && !via && !through)
         return true;
     std::vector<RegionId> reverseNodes;
     std::vector<RelationId> reverseEdges;
+    std::vector<size_t> reversePlaces;
     for (size_t node = goal; node != count; node = parent[node])
     {
         reverseNodes.push_back(m_places[node].region);
+        reversePlaces.push_back(node);
         if (node == start)
             break;
         reverseEdges.push_back(m_transitions[parentEdge[node]].relation);
@@ -1156,6 +2106,8 @@ bool TraversalModel::findRoute(size_t start, size_t goalPlace,
         path->assign(reverseNodes.rbegin(), reverseNodes.rend());
     if (via)
         via->assign(reverseEdges.rbegin(), reverseEdges.rend());
+    if (through)
+        through->assign(reversePlaces.rbegin(), reversePlaces.rend());
     return true;
 }
 
@@ -1200,6 +2152,25 @@ int TraversalModel::journeyCost(const std::vector<RelationId> &via,
     return std::max(1, cost);
 }
 
+semantic::GeometryId TraversalModel::conditionOf(RelationId relation) const
+{
+    if (size_t(relation) >= m_entries.size())
+        return kNoId;
+    return m_entries[size_t(relation)].conditionedOn;
+}
+
+bool TraversalModel::possibleInConfiguration(RelationId relation,
+                                             uint32_t configuration,
+                                             Mode mode) const
+{
+    if (size_t(relation) >= m_entries.size())
+        return false;
+    const Entry &entry = m_entries[size_t(relation)];
+    if (configuration >= entry.modesInConfiguration.size())
+        return false;
+    return (entry.modesInConfiguration[configuration] & modeBit(mode)) != 0;
+}
+
 bool TraversalModel::routeCost(RegionId from, RegionId to, int &cost) const
 {
     if (refusedRegion(to))
@@ -1212,6 +2183,28 @@ bool TraversalModel::routeCost(RegionId from, RegionId to, int &cost) const
     cost = journeyCost(via, anchor == m_regionAnchor.end() ? m_actorAt
                                                           : anchor->second);
     return true;
+}
+
+TraversalModel::Verdict TraversalModel::verdictFor(
+    semantic::RelationId relation, Mode mode) const
+{
+    Verdict said;
+    if (relation == kNoId || size_t(relation) >= m_entries.size())
+        return said;
+    const Entry &entry = m_entries[size_t(relation)];
+    said.valid = entry.valid;
+    said.exists = entry.exists;
+    said.possible = entry.possible[int(mode)];
+    said.executable = (m_executable & modeBit(mode)) != 0;
+    said.refused = refusedCrossing(relation);
+    said.leaves = int(entry.leaves[int(mode)].size());
+    said.arrives = int(entry.arrives[int(mode)].size());
+    said.from = stancesIn(entry.from) > 0 ? 1 : 0;
+    said.to = stancesIn(entry.to) > 0 ? 1 : 0;
+    size_t leaves = 0;
+    size_t arrives = 0;
+    said.routed = placesAcross(relation, leaves, arrives);
+    return said;
 }
 
 bool TraversalModel::derived(RelationId relation, Mode mode) const

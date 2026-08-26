@@ -11,6 +11,7 @@
 //-------------------------------------------------------------------------
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "../traversal/traversal_model.h"
@@ -99,7 +100,43 @@ private:
 
     void note(semantic::RelationId relation, Refusal refusal) const;
 
+    // How to turn a GeometryId back into the engine handle it was interned
+    // from. Supplied by the adapter, which owns that mapping; this layer
+    // must not keep its own copy of it.
+    std::function<uint64_t(semantic::GeometryId)> m_geometryTag;
+public:
+    void resolveGeometryWith(std::function<uint64_t(semantic::GeometryId)> f)
+    {
+        m_geometryTag = std::move(f);
+    }
+    void canStandThrough(
+        semantic::GeometryId geometry, uint32_t step, uint32_t steps,
+        const std::vector<traversal::PhysicsOracle::Stance> &places,
+        std::vector<char> &out) const override;
+    void sweptThrough(
+        semantic::GeometryId geometry, uint32_t step, uint32_t steps,
+        const std::vector<traversal::PhysicsOracle::Stance> &places,
+        std::vector<char> &out) const override;
+    bool anyWayOut(
+        const std::vector<std::pair<semantic::GeometryId, uint32_t>> &posed,
+        const semantic::Region &from, const semantic::Vec2 &at,
+        const std::vector<traversal::PhysicsOracle::WayOut> &ways)
+        const override;
+    bool canTraverseWith(semantic::GeometryId geometry, uint32_t configuration,
+                         traversal::Mode mode,
+                         const semantic::SpatialRelation &relation,
+                         const semantic::Region &from,
+                         const semantic::Region &to,
+                         const semantic::Vec2 *startFrom,
+                         semantic::Vec2 &crossing, semantic::Vec2 &arrival,
+                         semantic::Vec2 &departure) const override;
+private:
     traversal::ActorProfile m_profile;
+    // What the body measured the first time it was seen in each posture, so
+    // the walk animation cannot keep changing what the body is said to be.
+    struct Measured { int key = -1; BodyShape shape; };
+    mutable std::vector<Measured> m_measured;
+    BodyShape stableBody() const;
     mutable int m_queries = 0;
     mutable std::vector<Refusal> m_refusal;
     mutable std::vector<Evidence> m_evidence;

@@ -1278,6 +1278,11 @@ SWITCH switches[] = {
     { "bot_visible", 52, 0 },
     { "bot_debug", 54, 0 },
     { "playback_speed", 53, 1 },
+    // Read by app_main before this table is consulted, and listed here only
+    // so the parser does not then reject it as unknown -- which throws, and
+    // the throw is a message box that waits for a click. A test run started
+    // without a console has nobody to click it.
+    { "noinstancechecking", 55, 0 },
     { NULL, 0, 0 }
 };
 
@@ -1365,6 +1370,8 @@ void ParseOptions(void)
     {
         switch (option)
         {
+        case 55:
+            break;   // handled before the parser runs; nothing to do here
         case -3:
             ThrowError("Invalid argument: %s", OptFull);
             fallthrough__;

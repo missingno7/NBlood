@@ -38,7 +38,12 @@ const char *actionName(ActionKind action)
 }
 
 void SemanticWorld::apply(const WorldDelta &delta)
-{
+{    const bool wasFresh = m_attemptFresh;
+    m_attemptFresh = false;
+    (void)wasFresh;
+    if (!delta.geometry.empty())
+        m_geometry = delta.geometry;
+
     for (const Region &incoming : delta.regions)
     {
         if (incoming.id == kNoId)
@@ -67,8 +72,14 @@ void SemanticWorld::apply(const WorldDelta &delta)
         const bool openedWay = stored.lastAttemptOpenedWay;
         std::vector<RelationId> affects;
         std::vector<uint64_t> affectedAt;
+        std::vector<GeometryId> moves;
+        std::vector<Affordance::Fruitless> vain;
         affects.swap(stored.affects);
+        vain.swap(stored.triedInVain);
+        // `commands` is not carried across: the mapper reads it from the
+        // world every build, like everything else the world holds.
         affectedAt.swap(stored.affectedAt);
+        moves.swap(stored.moves);
         const uint64_t triedAt = stored.triedAt;
         const bool triedAtKnown = stored.triedAtKnown;
         stored = incoming;
@@ -76,6 +87,8 @@ void SemanticWorld::apply(const WorldDelta &delta)
         stored.lastAttemptOpenedWay = openedWay;
         stored.affects.swap(affects);
         stored.affectedAt.swap(affectedAt);
+        stored.moves.swap(moves);
+        stored.triedInVain.swap(vain);
         stored.triedAt = triedAt;
         stored.triedAtKnown = triedAtKnown;
     }
@@ -240,6 +253,7 @@ uint64_t SemanticWorld::stateOf(const SpatialRelation &relation) const
 
 void SemanticWorld::beginAttempt(AffordanceId id, int possibilities)
 {
+    m_attemptFresh = true;
     if (size_t(id) >= m_affordances.size())
         return;
     // Whatever was being watched, stop watching it now and keep what was
@@ -257,6 +271,99 @@ void SemanticWorld::beginAttempt(AffordanceId id, int possibilities)
     m_waysAtAttempt.assign(m_relations.size(), 0);
     for (size_t index = 0; index < m_relations.size(); ++index)
         m_waysAtAttempt[index] = stateOf(m_relations[index]);
+}
+
+void SemanticWorld::noteMoves(AffordanceId thing, GeometryId geometry)
+{
+    if (thing == kNoId || geometry == kNoId
+        || size_t(thing) >= m_affordances.size())
+        return;
+    Affordance &acting = m_affordances[size_t(thing)];
+    for (GeometryId known : acting.moves)
+        if (known == geometry)
+            return;
+    acting.moves.push_back(geometry);
+}
+
+bool SemanticWorld::moves(AffordanceId thing, GeometryId geometry) const
+{
+    if (thing == kNoId || geometry == kNoId
+        || size_t(thing) >= m_affordances.size())
+        return false;
+    for (GeometryId known : m_affordances[size_t(thing)].moves)
+        if (known == geometry)
+            return true;
+    return false;
+}
+
+bool SemanticWorld::works(AffordanceId thing, GeometryId geometry) const
+{
+    if (thing == kNoId || geometry == kNoId
+        || size_t(thing) >= m_affordances.size())
+        return false;
+    const Affordance &acting = m_affordances[size_t(thing)];
+    for (GeometryId known : acting.moves)
+        if (known == geometry)
+            return true;
+    for (GeometryId known : acting.commands)
+        if (known == geometry)
+            return true;
+    return false;
+}
+
+bool SemanticWorld::effectKnown(AffordanceId thing) const
+{
+    if (thing == kNoId || size_t(thing) >= m_affordances.size())
+        return false;
+    const Affordance &acting = m_affordances[size_t(thing)];
+    if (acting.attempts > 0)
+        return true;
+    if (acting.commands.empty())
+        return false;   // nothing says what it works: only doing it will
+    for (const Affordance &other : m_affordances)
+    {
+        if (other.id == thing || other.attempts == 0)
+            continue;
+        for (GeometryId mine : acting.commands)
+            if (works(other.id, mine))
+                return true;
+    }
+    return false;
+}
+
+void SemanticWorld::noteFruitless(AffordanceId thing, RelationId way,
+                                  uint64_t blockingState)
+{
+    if (thing == kNoId || way == kNoId
+        || size_t(thing) >= m_affordances.size()
+        || size_t(way) >= m_relations.size())
+        return;
+    Affordance &acting = m_affordances[size_t(thing)];
+    const AffordanceId blocking = m_relations[size_t(way)].obstruction;
+    for (Affordance::Fruitless &known : acting.triedInVain)
+        if (known.way == way)
+        {
+            known.blocking = blocking;
+            known.blockingState = blockingState;
+            return;
+        }
+    acting.triedInVain.push_back({ way, blocking, blockingState });
+}
+
+bool SemanticWorld::worthTryingFor(AffordanceId thing, RelationId way,
+                                   uint64_t blockingState) const
+{
+    if (thing == kNoId || way == kNoId
+        || size_t(thing) >= m_affordances.size()
+        || size_t(way) >= m_relations.size())
+        return true;
+    const AffordanceId blocking = m_relations[size_t(way)].obstruction;
+    for (const Affordance::Fruitless &known
+             : m_affordances[size_t(thing)].triedInVain)
+        if (known.way == way)
+            return known.blocking != blocking
+                || known.blockingState != blockingState;
+    return true;
 }
 
 void SemanticWorld::noteAffects(AffordanceId thing, RelationId way)

@@ -341,6 +341,9 @@ void build(const std::vector<SupportFace> &faces,
         region.supports = supports;
         region.interior = semantic::representativePoint(region.shape());
         built.key = mixHash(supportTag, semantic::shapeKey(region.footprint));
+        // Every face in a cluster shares a stateTag -- sameSample refuses to
+        // merge faces that do not -- so the cluster has one.
+        built.stateTag = group.empty() ? 0 : group.front()->stateTag;
         built.provenance = provenance;
 
         regionOfCluster[entry.first] = out.regions.size();
@@ -528,11 +531,42 @@ void build(const std::vector<SupportFace> &faces,
                 continue;
             const Region &a = out.regions[left].region;
             const Region &b = out.regions[right].region;
+            // Every loop of each shape, not only the outer one.
+            //
+            // A region with a hole in it borders whatever stands in that
+            // hole along the hole's own edge, and that is the only edge they
+            // share. Comparing outer loops alone finds nothing between them,
+            // falls through to "these two overlap" below, and gives them a
+            // gateway of no width -- which is a way the body is never
+            // offered. On AGTST8 that way is the walkway across the pit, and
+            // without it half the top floor cannot be reached at all.
             std::vector<Segment> shared;
-            semantic::sharedBoundaries(a.footprint, b.footprint, shared);
+            {
+                const semantic::Polygon leftShape = a.shape();
+                const semantic::Polygon rightShape = b.shape();
+                std::vector<const semantic::Loop *> here;
+                std::vector<const semantic::Loop *> there;
+                here.push_back(&leftShape.outer);
+                for (const semantic::Loop &hole : leftShape.holes)
+                    here.push_back(&hole);
+                there.push_back(&rightShape.outer);
+                for (const semantic::Loop &hole : rightShape.holes)
+                    there.push_back(&hole);
+                std::vector<Segment> found;
+                for (const semantic::Loop *one : here)
+                    for (const semantic::Loop *other : there)
+                    {
+                        found.clear();
+                        semantic::sharedBoundaries(*one, *other, found);
+                        shared.insert(shared.end(), found.begin(),
+                                      found.end());
+                    }
+            }
             if (!shared.empty())
             {
-                addPair(left, right, shared, false);
+                std::vector<Segment> merged;
+                semantic::mergeCollinearSegments(shared, merged);
+                addPair(left, right, merged, false);
                 joined.insert(pair);
                 continue;
             }

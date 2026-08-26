@@ -32,11 +32,15 @@ struct Best
     RegionId region = kNoId;
     uint32_t tag = kNoId;
     uint32_t option = 0;
+    // The way this act was chosen in order to open, when it was chosen for
+    // one. Carried so that having tried it can be remembered.
+    semantic::RelationId aimedAt = semantic::kNoId;
     int cost = 0;
     bool found = false;
 
     void offer(RegionId destination, uint32_t subject, int candidate,
-               uint32_t which = 0)
+               uint32_t which = 0,
+               semantic::RelationId about = semantic::kNoId)
     {
         if (found && candidate >= cost)
             return;
@@ -45,6 +49,7 @@ struct Best
         region = destination;
         tag = subject;
         option = which;
+        aimedAt = about;
     }
 };
 
@@ -117,6 +122,7 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
         // is this layer's question and not the mapper's.
         size_t chosenOption = affordance.domain.size();
         int best = 0;
+        int bestSurvival = 0;
         for (size_t option = 0; option < affordance.domain.size(); ++option)
         {
             const semantic::ExecutionOption &where = affordance.domain[option];
@@ -129,10 +135,21 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
             if (!traversal.optionCost(origin, affordance.id,
                                       uint32_t(option), cost))
                 continue;
-            if (chosenOption == affordance.domain.size() || cost < best)
+            // Nearer is better, but only among stances that leave the body
+            // somewhere to be afterwards. A stance that is a hundred units
+            // closer and inside the thing the act is about to move is not a
+            // cheaper way of doing it; it is a different outcome.
+            const int survival = int(traversal.survivalOf(affordance.id,
+                                                          uint32_t(option)));
+            if (chosenOption != affordance.domain.size()
+                && survival > bestSurvival)
+                continue;
+            if (chosenOption == affordance.domain.size()
+                || survival < bestSurvival || cost < best)
             {
                 chosenOption = option;
                 best = cost;
+                bestSurvival = survival;
             }
         }
         if (chosenOption == affordance.domain.size())
@@ -147,6 +164,18 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
         // about.
         if (affordance.settling)
             continue;
+        // Trying a thing to find out what it does is only worth a journey
+        // while what it does is unknown. Where the world says this works the
+        // same geometry as something already done, its effect is known and
+        // there is nothing to find out: pressing it is only worth doing when
+        // some other rule actually wants that geometry moved. This is why
+        // the second control for one door is not a second discovery -- and
+        // why undoing what was just done is not one either.
+        if (world.effectKnown(affordance.id))
+        {
+            ++diagnosis.affordancesAttemptedInertly;
+            continue;
+        }
         if (affordance.attempts == 0)
             untried.offer(where, affordance.id, best, uint32_t(chosenOption));
         else if (affordance.lastAttemptOpenedWay
@@ -194,6 +223,15 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
         // is offered again like anything else.
         if (thing->settling)
             continue;
+        // Not if this same act has already been done to open this same way,
+        // with this same thing standing in it in this same state. That
+        // experiment has been run; running it again asks a question that has
+        // been answered. It becomes worth doing again the moment what is in
+        // the way changes, or changes state, which is the only thing that
+        // could make the answer different.
+        if (!world.worthTryingFor(thing->id, relation.id,
+                                  world.blockerState(relation.id)))
+            continue;
         for (size_t option = 0; option < thing->domain.size(); ++option)
         {
             int cost = 0;
@@ -201,7 +239,7 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
                                       cost))
                 continue;
             shut.offer(thing->domain[option].region, thing->id, cost,
-                       uint32_t(option));
+                       uint32_t(option), relation.id);
         }
     }
 
@@ -242,16 +280,48 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
                 continue;
             if (!world.worthTrying(thing.id, relation.id))
                 continue;
+            // The same experiment memory rule 3a keeps. Knowing that this
+            // act moves this way is a reason to do it again while the way
+            // is shut; having already done it against this way, with this
+            // same thing standing in it in this same state, and watched the
+            // way stay shut, is a reason not to.
+            if (!world.worthTryingFor(thing.id, relation.id,
+                                      world.blockerState(relation.id)))
+                continue;
             for (size_t option = 0; option < thing.domain.size(); ++option)
             {
                 int cost = 0;
                 if (!traversal.optionCost(origin, thing.id, uint32_t(option),
                                           cost))
                     continue;
-                remembered.offer(thing.domain[option].region, thing.id, cost,
-                                 uint32_t(option));
+                remembered.offer(thing.domain[option].region, thing.id,
+                                 cost, uint32_t(option), relation.id);
             }
         }
+    }
+
+    // 3c. somewhere the body has not stood that can be reached by a plan
+    //     which arranges the world on the way.
+    //
+    //     Every other rule reads the world as it is and asks what is worth
+    //     doing in it. This one asks whether there is an order of walking
+    //     and acting that opens something up, and offers the first step of
+    //     it. That is a different question and it is the only one that finds
+    //     a plan whose steps are each individually available but only work
+    //     in one order -- which is what a level with two lifts is.
+    //
+    //     The search is in the traversal layer, over Places and whatever
+    //     geometry the plan has had to commit to. Nothing here knows what
+    //     the geometry is; it gets back "walk this" or "do that", and both
+    //     are things it already knows how to want.
+    Best arrangedAct;
+    traversal::TraversalModel::PlanStep plan;
+    if (traversal.planSomewhereNew(world, origin, plan, &diagnosis.plan))
+    {
+        ++diagnosis.reconfigureOffered;
+        if (plan.act)
+            arrangedAct.offer(plan.region, plan.affordance, plan.cost,
+                              plan.option);
     }
 
     // 4. a way that is known and cannot be gone through, with nothing in it
@@ -281,6 +351,18 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
                     & traversal::modeBit(traversal::Mode(mode))) != 0;
         if (drivable)
             continue;
+        // Only if there is anything to learn by looking.
+        //
+        // The point of walking over to a way that cannot be gone through is
+        // that what would open it is usually written on it, and the sweep
+        // picks that up on arrival. If what is on the other side has already
+        // been seen, there is nothing on the far side to find out and the
+        // walk is purely a walk. On AGTST14 the last three goals of the run
+        // were this: two of them to look at boundaries inside a hall the bot
+        // had already been through eight times.
+        const Region *beyond = world.region(relation.to);
+        if (beyond && beyond->observed)
+            continue;
         ++diagnosis.uninspectedGateways;
         int cost = 0;
         if (traversal.routeCost(origin, relation.from, cost))
@@ -293,12 +375,13 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
     // something are all just things to do, and the one to do is the one you
     // are nearest. Ranking them is what makes a bot walk the length of the
     // level past a switch it will have to come back for.
-    struct Candidate { const Best *best; Intent intent; bool relation; };
+    struct Candidate { const Best *best; Intent intent; const char *name; };
     const Candidate kinds[] = {
-        { &shut,       Intent::ExecuteAffordance, false },
-        { &remembered, Intent::ExecuteAffordance, false },
-        { &untried,    Intent::ExecuteAffordance, false },
-        { &frontier,   Intent::GoTo,              false },
+        { &shut,        Intent::ExecuteAffordance, "shut" },
+        { &remembered,  Intent::ExecuteAffordance, "remembered" },
+
+        { &untried,     Intent::ExecuteAffordance, "untried" },
+        { &frontier,    Intent::GoTo,              "frontier" },
     };
     const Candidate *nearest = nullptr;
     for (const Candidate &kind : kinds)
@@ -311,14 +394,37 @@ Decision choose(const SemanticWorld &world, const TraversalModel &traversal)
     }
     if (nearest)
     {
-        decision.why = nearest->intent == Intent::GoTo ? "frontier" : "act";
+        decision.why = nearest->name;
         decision.intent = nearest->intent;
         decision.destination = nearest->best->region;
         if (nearest->intent == Intent::ExecuteAffordance)
         {
             decision.affordance = nearest->best->tag;
             decision.option = nearest->best->option;
+            decision.relation = nearest->best->aimedAt;
+            decision.leaveAtOnce = traversal.escapeFrom(decision.affordance,
+                decision.option, decision.escapeTo);
         }
+        return decision;
+    }
+
+    // Then arranging the world so that somewhere new can be walked to.
+    //
+    // Not a peer of the others, for the same reason looking at something is
+    // not: it is what there is to do when there is nothing left to walk to.
+    // Pricing it against walking does not work either -- an act costs almost
+    // nothing to perform and a walk costs its whole length, so any plan that
+    // presses something undercuts every plan that does not, and the bot ends
+    // up riding a lift back and forth instead of stepping off it.
+    //
+    // Explore what can be reached; when that runs out, rearrange.
+    if (arrangedAct.found)
+    {
+        decision.why = "planned_act";
+        decision.intent = Intent::ExecuteAffordance;
+        decision.destination = arrangedAct.region;
+        decision.affordance = arrangedAct.tag;
+        decision.option = arrangedAct.option;
         return decision;
     }
 

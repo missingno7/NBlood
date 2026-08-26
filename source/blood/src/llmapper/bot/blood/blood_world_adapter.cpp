@@ -1,5 +1,7 @@
 #include "blood_world_adapter.h"
 
+#include "../../../triggers.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -153,6 +155,7 @@ void WorldAdapter::rebuildTerrain()
         record.region.observed = observed;
         record.region.occupied = occupied;
         record.key = fresh.key;
+        record.region.mover = internGeometry(fresh.stateTag);
         record.provenance = fresh.provenance;
         assigned[index] = id;
     }
@@ -203,6 +206,28 @@ RegionId WorldAdapter::locate(const PhysicalPose &pose) const
         return kNoId;
     const Vec2 at = { pose.x, pose.y };
     const uint64_t holding = uint64_t(uint32_t(pose.supportHit));
+
+    // Where no region's outline contains the body's centre at all, what the
+    // engine says is holding it up settles it.
+    //
+    // A body standing across the join between two platforms has its centre
+    // in neither of them, so nothing below is a candidate and whatever else
+    // happens to cover that point wins by default -- on AGTST8 the two
+    // sprite bridges cross, so the one overhead at the top of the level
+    // claimed a body standing on the one below it. Only a fallback, though:
+    // one support can belong to several regions, so where the outlines do
+    // answer, they answer.
+    auto standingOn = [&]() {
+        RegionId onIt = kNoId;
+        if (holding == 0)
+            return onIt;
+        for (const RegionRecord &record : m_regions)
+            if (record.region.exists && record.region.holds(holding)
+                && onIt == kNoId)
+                onIt = record.region.id;
+        return onIt;
+    };
+
     RegionId best = kNoId;
     int bestGap = 0;
     int bestDepth = -1;
@@ -210,9 +235,20 @@ RegionId WorldAdapter::locate(const PhysicalPose &pose) const
     {
         if (!record.region.exists)
             continue;
-        const semantic::Loop &outline = record.region.footprint;
-        if (!semantic::pointInLoop(outline, at))
+        // The whole shape, holes and all.
+        //
+        // Asking only the outer loop makes a region that wraps around others
+        // contain every point inside it -- and one of them here wraps around
+        // the entire level. So every point in the map was a candidate for
+        // it, and when the body stood on a bridge whose own region did not
+        // claim the exact centre, the tie below picked whichever floor
+        // height was numerically nearest: the top, which the body had never
+        // been to, over the pit it was actually above. Everything after that
+        // is routing from somewhere the body is not.
+        const semantic::Polygon shape = record.region.shape();
+        if (!semantic::pointInPolygon(shape, at))
             continue;
+        const semantic::Loop &outline = record.region.footprint;
         // The engine says what is holding the body up. A region made of that
         // thing is where the body is, whatever the heights work out to.
         const int gap = record.region.holds(holding)
@@ -221,11 +257,20 @@ RegionId WorldAdapter::locate(const PhysicalPose &pose) const
         // A body on the line between two regions is in both. Prefer the one
         // it is furthest inside, so standing on a boundary does not make the
         // answer flap between them.
+        // How far inside it is -- measured against everything that bounds
+        // this space, the holes included. A region measured only against its
+        // outer loop looks enormously deep at a point that is in fact right
+        // beside one of the rooms it wraps around.
         int depth = INT32_MAX;
-        for (size_t i = 0; i < outline.size(); ++i)
-            depth = std::min(depth, semantic::planarDistance(at,
-                semantic::closestPointOnSegment(at, outline[i],
-                    outline[(i + 1) % outline.size()])));
+        auto against = [&](const semantic::Loop &loop) {
+            for (size_t i = 0; i < loop.size(); ++i)
+                depth = std::min(depth, semantic::planarDistance(at,
+                    semantic::closestPointOnSegment(at, loop[i],
+                        loop[(i + 1) % loop.size()])));
+        };
+        against(outline);
+        for (const semantic::Loop &hole : shape.holes)
+            against(hole);
         if (best == kNoId || gap < bestGap
             || (gap == bestGap && depth > bestDepth))
         {
@@ -238,6 +283,8 @@ RegionId WorldAdapter::locate(const PhysicalPose &pose) const
     // candidates; it never rules the last one out. Reporting no region for a
     // body that is plainly standing in one would be the model contradicting
     // the world.
+    if (best == kNoId)
+        return standingOn();
     return best;
 }
 
@@ -374,6 +421,132 @@ bool WorldAdapter::objectState(semantic::AffordanceId id,
     return false;
 }
 
+// Every configuration the engine will rest this geometry in.
+//
+// Blood stores the two ends of a motion and interpolates between them, so
+// the ends are the rest configurations and everything between is transit.
+// They are read out as heights and nothing more: which of them is "open" or
+// "up" is not written down here, because it is not a fact about the
+// geometry -- it is a fact about what walking turns out to be possible in
+// each, and that is derived, not declared.
+void WorldAdapter::readConfigurations(uint64_t stateTag,
+                                      semantic::StatefulGeometry &out) const
+{
+    out.configurations.clear();
+    if (stateTag == 0 || stateTag >= kMaxXSectors)
+        return;
+    const XSECTOR &extra = xsector[stateTag];
+    // Two ends. Stored as an ordered list so that nothing above depends on
+    // there being exactly two of them.
+    semantic::GeometryConfiguration first;
+    first.supportZ = extra.offFloorZ;
+    first.ceilingZ = extra.offCeilZ;
+    semantic::GeometryConfiguration second;
+    second.supportZ = extra.onFloorZ;
+    second.ceilingZ = extra.onCeilZ;
+    out.configurations.push_back(first);
+    out.configurations.push_back(second);
+    // Whether the two ends are anything different.
+    //
+    // Heights say so for something that moves up and down. For something
+    // that moves in the plane the heights are identical at both ends and the
+    // difference is where its walls are -- which Blood keeps as a pair of
+    // marker sprites, so two markers that are not the same place, or not the
+    // same facing, are two configurations.
+    //
+    // Saying so is what makes the difference between a thing whose motion is
+    // described and one whose motion is not, and those lead to opposite
+    // decisions everywhere: "the same" and "not described" must never be
+    // confused.
+    out.configurationsDiffer = first.supportZ != second.supportZ
+        || first.ceilingZ != second.ceilingZ;
+    const int owner = extra.reference;
+    if (validSector(owner) && movesInThePlane(sector[owner].type)
+        && validSprite(extra.marker0))
+    {
+        const spritetype &from = sprite[extra.marker0];
+        const spritetype *to = validSprite(extra.marker1)
+            ? &sprite[extra.marker1] : nullptr;
+        const bool turns = sector[owner].type == kSectorRotate
+            || sector[owner].type == kSectorRotateMarked;
+        if (turns)
+            out.configurationsDiffer = out.configurationsDiffer
+                || from.ang != 0;
+        if (to)
+        {
+            out.configurationsDiffer = out.configurationsDiffer
+                || to->x != from.x || to->y != from.y
+                || to->ang != from.ang;
+            second.shift = { to->x - from.x, to->y - from.y };
+            out.configurations[1] = second;
+        }
+    }
+    out.state = extra.state ? 1u : 0u;
+    // In transit, not "not at zero".
+    //
+    // busy is where the motion has got to, not whether it is happening: it
+    // runs from 0 at one end to 0x10000 at the other and stays there. So
+    // "busy != 0" reads as permanently moving for anything resting in its
+    // second configuration, and every plan that waits for it to stop waits
+    // for ever. Between the two ends is the only thing that means moving.
+    out.moving = extra.busy != 0 && extra.busy != 0x10000;
+}
+
+// Which channel each piece of stateful geometry listens on.
+//
+// Read from the world, once per build, exactly like the shape of a room. It
+// is the other half of the wiring an act's own channel is one end of.
+void WorldAdapter::readWiring()
+{
+    m_listening.clear();
+    for (int sectorId = 0; sectorId < numsectors; ++sectorId)
+    {
+        const uint64_t tag = moverTagOf(sectorId);
+        if (tag == 0 || tag >= kMaxXSectors)
+            continue;
+        m_listening[tag] = xsector[tag].rxID;
+    }
+}
+
+semantic::GeometryId WorldAdapter::internGeometry(uint64_t stateTag)
+{
+    if (stateTag == 0)
+        return semantic::kNoId;   // ground that does not move
+    for (size_t index = 0; index < m_geometry.size(); ++index)
+        if (m_geometry[index] == stateTag)
+            return semantic::GeometryId(index);
+    m_geometry.push_back(stateTag);
+    return semantic::GeometryId(m_geometry.size() - 1);
+}
+
+// What is holding this pose up, if it is something that can move.
+//
+// Asked of the surface the engine actually reported, not of the region the
+// model thinks the body is in: when geometry moves, which Region the space
+// is called can change under a body that has not moved at all, and the point
+// of this identity is that it does not.
+semantic::GeometryId WorldAdapter::geometryUnder(
+    const PhysicalPose &pose) const
+{
+    if (!pose.valid)
+        return semantic::kNoId;
+    int wallId = -1;
+    int spriteId = -1;
+    splitObstacle(pose.supportHit, wallId, spriteId);
+    uint64_t tag = 0;
+    if (spriteId >= 0 && validSprite(spriteId)
+        && sprite[spriteId].extra > 0)
+        tag = uint64_t(sprite[spriteId].extra);
+    else if (validSector(pose.sector))
+        tag = moverTagOf(pose.sector);
+    if (tag == 0)
+        return semantic::kNoId;
+    for (size_t index = 0; index < m_geometry.size(); ++index)
+        if (m_geometry[index] == tag)
+            return semantic::GeometryId(index);
+    return semantic::kNoId;
+}
+
 semantic::AffordanceId WorldAdapter::actionAt(int obstacle) const
 {
     int wallId = -1;
@@ -500,6 +673,36 @@ semantic::WorldDelta WorldAdapter::observe()
 
     const RegionId here = locateActor(actorPose);
     delta.actor.region = here;
+    // What is under the body, named so that it stays the same thing while it
+    // moves. The Region underfoot can be re-derived into a differently
+    // decomposed space by the very motion the body is riding; this does not.
+    delta.actor.supportedBy = geometryUnder(actorPose);
+    // What every piece of stateful geometry can be, and what it is now.
+    readWiring();
+    delta.geometry.clear();
+    std::map<semantic::GeometryId, bool> stillGoing;
+    for (size_t index = 0; index < m_geometry.size(); ++index)
+    {
+        semantic::StatefulGeometry piece;
+        piece.id = semantic::GeometryId(index);
+        readConfigurations(m_geometry[index], piece);
+        if (piece.configurations.empty())
+            continue;
+        // Between the ends of its travel is one way to be still going. The
+        // other is to have arrived this very tick: Blood resolves a use
+        // inside the tick it happens, and one of these does not accept a use
+        // until it has finished arriving, so a press on the tick it lands is
+        // a press the world drops. Reading "it is not where it was a tick
+        // ago" covers both, and needs no clock.
+        const uint64_t tag = m_geometry[index];
+        const int along = tag < kMaxXSectors ? int(xsector[tag].busy) : 0;
+        auto before = m_geometryWas.find(tag);
+        if (before != m_geometryWas.end() && before->second != along)
+            piece.moving = true;
+        m_geometryWas[tag] = along;
+        stillGoing[piece.id] = piece.moving;
+        delta.geometry.push_back(piece);
+    }
     if (here != kNoId)
     {
         RegionRecord &record = m_regions[size_t(here)];
@@ -626,7 +829,38 @@ semantic::WorldDelta WorldAdapter::observe()
                 action.wasKnown = false;
             }
         }
+        // What this act addresses, from the world's own wiring: it speaks on
+        // one channel, and whatever stateful geometry listens on that
+        // channel is what it works. Read here and published as GeometryIds,
+        // so nothing above this line knows there is a channel at all.
+        //
+        // Without it an act can only be understood by doing it, and two
+        // controls for one door are two mysteries rather than one fact.
+        {
+            const int channel = bloodmap::interactionChannel(
+                action.record().key);
+            if (channel > 0)
+                for (size_t index = 0; index < m_geometry.size(); ++index)
+                {
+                    auto heard = m_listening.find(m_geometry[index]);
+                    if (heard != m_listening.end() && heard->second == channel)
+                        affordance.commands.push_back(
+                            semantic::GeometryId(index));
+                }
+        }
+        // Still going means what it works is still going, not that the thing
+        // it is drawn on moved. A switch on a wall does not stir while the
+        // door it opens travels, so watching the switch says a door that is
+        // halfway shut is at rest -- and these doors do not accept a use
+        // until they have finished, so the press is dropped and the world
+        // looks as though it refused.
         affordance.settling = action.moving;
+        for (semantic::GeometryId which : affordance.commands)
+        {
+            auto going = stillGoing.find(which);
+            affordance.settling = affordance.settling
+                || (going != stillGoing.end() && going->second);
+        }
         if (affordance.executable)
             for (const Stance &stance : action.domain)
             {
@@ -690,15 +924,43 @@ GINPUT WorldAdapter::steer(int targetX, int targetY) const
         velocityX * velocityX + velocityY * velocityY);
     if (remaining > 0 && velocityLength > 1.0)
     {
-        // Blood input is acceleration, not velocity. Keep one unit toward
-        // the target while cancelling the live momentum, so a corner brakes
-        // instead of curving off the line the engine certified.
+        // Blood input is acceleration, not velocity, so what is asked for is
+        // a push against the momentum there already is. Two different jobs,
+        // and they were one.
+        //
+        // Travelling: only the sideways momentum is wrong. Cancelling the
+        // forward part too swings the push either side of the line, and the
+        // body wanders -- two or three turn reversals a second, all the way
+        // down a corridor.
+        //
+        // Arriving: all of it is wrong. What is wanted is to stop on a spot
+        // the width of the body, and momentum carried into that spot goes
+        // straight through it; the body then drives at a stance it can never
+        // settle on and the leg is reported as going nowhere.
+        //
+        // Which job this is, is how far there is left to go, measured in
+        // bodies. The width is the engine's own for this body, not a number
+        // chosen here.
         const double towardX = double(targetX - actor->x) / remaining;
         const double towardY = double(targetY - actor->y) / remaining;
-        const double controlX = 2.0 * towardX - velocityX / velocityLength;
-        const double controlY = 2.0 * towardY - velocityY / velocityLength;
-        movementAngle = getangle(int(std::lround(controlX * 1048576.0)),
-                                 int(std::lround(controlY * 1048576.0)));
+        const int width = actor->clipdist << 2;
+        const bool arriving = remaining < width * 4;
+        double controlX = 0.0;
+        double controlY = 0.0;
+        if (arriving)
+        {
+            controlX = 2.0 * towardX - velocityX / velocityLength;
+            controlY = 2.0 * towardY - velocityY / velocityLength;
+        }
+        else
+        {
+            const double along = velocityX * towardX + velocityY * towardY;
+            const double push = std::max(1.0, velocityLength);
+            controlX = towardX * push - (velocityX - along * towardX);
+            controlY = towardY * push - (velocityY - along * towardY);
+        }
+        movementAngle = getangle(int(std::lround(controlX)),
+                                 int(std::lround(controlY)));
     }
     // Blood resolves forward and strafe in the live facing basis, so the
     // desired world direction is expressed in that basis here.
@@ -763,6 +1025,8 @@ bool WorldAdapter::regionProvenance(RegionId id, RegionProvenance &out) const
         else
             out.sectors.push_back(int(entry));
     }
+    out.mover = record.region.mover == semantic::kNoId
+        ? -1 : int(record.region.mover);
     out.vertices = int(record.region.footprint.size());
     out.holes = int(record.region.holes.size());
     out.barriers = int(record.region.barriers.size());

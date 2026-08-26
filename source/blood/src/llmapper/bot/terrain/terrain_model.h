@@ -65,6 +65,10 @@ struct BuiltRegion
 {
     semantic::Region region;
     uint64_t key = 0;                  // stable identity, shape-derived
+    // What can move this space, in whatever terms the caller supplied, or
+    // zero. Opaque here; carried up so that the thing which moved can be
+    // recognised after it has moved.
+    uint64_t stateTag = 0;
     std::vector<uint64_t> provenance;  // debug only
 };
 

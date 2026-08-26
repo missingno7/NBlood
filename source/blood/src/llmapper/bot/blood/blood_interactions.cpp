@@ -591,6 +591,8 @@ void executionDomain(const InteractionRecord &record,
                 record.y - mulscale30(distance, Sin(angle)),
                 record.targetZ, record.referenceSector));
 
+    // Nearest the actor first. This decides the order of the list and
+    // nothing else -- every pose the engine accepts is kept, below.
     const int actorX = gMe->pSprite->x;
     const int actorY = gMe->pSprite->y;
     std::sort(stances.begin(), stances.end(),
@@ -624,8 +626,6 @@ void executionDomain(const InteractionRecord &record,
             accepted.look = look;
             out.push_back(accepted);
         }
-        if (out.size() >= 8)
-            break;
     }
 }
 

@@ -49,4 +49,15 @@ int obstructedSeamCount();
 void obstructedSeamAt(int index, int &x1, int &y1, int &x2, int &y2,
                       int &spriteId, int &owner, int &behind);
 
+
+// The engine's own handle for the mechanism that can move this sector, or
+// zero if nothing can. Blood keeps this handle pointing at the same
+// mechanism however far the sector's walls travel, which is what makes it
+// usable as an identity for geometry that moves.
+uint64_t moverTagOf(int sectorId);
+// Does this kind of sector move its walls rather than its heights? The two
+// need telling apart because only one of them is described by the numbers a
+// configuration is made of.
+bool movesInThePlane(int sectorType);
+
 } // namespace bloodmap

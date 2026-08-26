@@ -45,6 +45,13 @@ struct Diagnosis
     // Physically real, but this bot has no executor for it. Reported so a
     // stall says what the world offered that could not be taken up.
     int possibleButUnexecutable = 0;
+    // The state-conditioned rule, step by step.
+    int reconfigureLooked = 0;
+    int reconfigureWouldOpen = 0;
+    int reconfigureNoMover = 0;
+    int reconfigureOffered = 0;
+    // The whole sequence the plan search found, for reading back.
+    std::vector<traversal::TraversalModel::PlanStep> plan;
 };
 
 struct Decision
@@ -54,6 +61,17 @@ struct Decision
     semantic::AffordanceId affordance = semantic::kNoId;
     semantic::RelationId relation = semantic::kNoId;
     uint32_t option = 0;    // which of the affordance's execution options
+    // Where to be the moment the act is done, when the stance it is done
+    // from is not somewhere to still be afterwards.
+    //
+    // Part of the decision rather than something the executor works out on
+    // arrival, because it is what makes the act allowed at all: an act that
+    // is survivable only by leaving is not committed until the leaving is
+    // settled. There is deliberately no rule that waits after a Use --
+    // waiting is right where the stance is safe and fatal where it is not,
+    // and which of those it is has already been derived.
+    bool leaveAtOnce = false;
+    semantic::Vec2 escapeTo;
     Diagnosis diagnosis;
     // Which rule offered this, for reading a run back.
     const char *why = "none";

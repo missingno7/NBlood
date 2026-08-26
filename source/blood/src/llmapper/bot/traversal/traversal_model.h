@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "../nav/local_path.h"
@@ -52,6 +53,8 @@ struct ActorProfile
     int standHeight = 0;
     int crouchHeight = 0;
     int stepUp = 0;
+    int posture = 0;
+    int lifeMode = 0;
     int walkSpeed = 0;
     int jumpImpulse = 0;
     int gravity = 0;
@@ -102,6 +105,105 @@ public:
                              semantic::Vec2 &crossing,
                              semantic::Vec2 &arrival,
                              semantic::Vec2 &departure) const = 0;
+
+    // The same question, asked of a configuration the world is not in.
+    //
+    // A piece of stateful geometry rests in several configurations, and
+    // which of them it is in decides what can be walked. To know that a way
+    // is walkable "when G is in configuration k" the world has to be asked
+    // about configuration k -- so the layer that owns the engine puts it in
+    // that configuration, asks, and puts it back. Nothing else works: the
+    // alternative is a second opinion about physics derived from planes,
+    // and a second opinion is how a model starts disagreeing with itself.
+    //
+    // Default: geometry that rests in one configuration is the world as it
+    // stands, so the plain question is the right one.
+    // One place to ask about, in a world that is not the world as it stands.
+    struct Stance
+    {
+        const semantic::Region *region = nullptr;
+        semantic::Vec2 at;
+    };
+
+    // Can the body be at each of these places, part of the way through that
+    // geometry's travel?
+    //
+    // `step` runs from zero to `steps - 1` across the whole of it, both ends
+    // included. The ends are deliberately not the whole question: a wall
+    // that sweeps past a point and comes to rest beyond it leaves that point
+    // clear in both configurations and runs over anything standing there on
+    // the way. What has to be survivable is the transition, not its ends.
+    //
+    // A batch, because putting the world into a pose and taking it out again
+    // is the whole cost, and every place wanted from one posed world should
+    // be asked of it while it is posed.
+    virtual void canStandThrough(semantic::GeometryId, uint32_t, uint32_t,
+                                 const std::vector<Stance> &places,
+                                 std::vector<char> &out) const
+    {
+        out.assign(places.size(), 0);
+        for (size_t i = 0; i < places.size(); ++i)
+            out[i] = places[i].region
+                && canStand(*places[i].region, places[i].at) ? 1 : 0;
+    }
+
+    // Does that geometry come to occupy this place, part of the way through
+    // its travel?
+    //
+    // Not the same question as whether the body can stand there, and the
+    // difference is the whole point. A sector sliding across a room engulfs
+    // whatever is standing in it and carries it along -- which is standing
+    // somewhere perfectly good, on a perfectly good floor, right up until it
+    // arrives at a wall. "Can the body be here" answers yes at every pose.
+    //
+    // Being carried is not always wrong: it is what riding is. What tells
+    // them apart is not asked here -- this says only where the thing goes.
+    virtual void sweptThrough(semantic::GeometryId, uint32_t, uint32_t,
+                              const std::vector<Stance> &places,
+                              std::vector<char> &out) const
+    {
+        out.assign(places.size(), 0);
+    }
+
+    // One way out of a region, for the question below.
+    struct WayOut
+    {
+        const semantic::SpatialRelation *relation = nullptr;
+        const semantic::Region *to = nullptr;
+    };
+
+    // With all of these held in these configurations at once, is any of
+    // these crossings still one the body can walk?
+    //
+    // Several at once because one act can work several things, and the way
+    // out of a room can be the one shut by the second of them. Asked of the
+    // engine rather than of the derived table because what shuts a doorway
+    // is not always the ground at either end of it: a wall sliding across a
+    // doorway belongs to neither room, and a crossing conditioned on the
+    // geometry at its own two ends cannot see it coming.
+    //
+    // Default: no opinion. An oracle that cannot pose the world cannot
+    // answer, and "there is a way out" is the answer that changes nothing.
+    virtual bool anyWayOut(
+        const std::vector<std::pair<semantic::GeometryId, uint32_t>> &,
+        const semantic::Region &, const semantic::Vec2 &,
+        const std::vector<WayOut> &) const
+    {
+        return true;
+    }
+
+    virtual bool canTraverseWith(semantic::GeometryId, uint32_t, Mode mode,
+                                 const semantic::SpatialRelation &relation,
+                                 const semantic::Region &from,
+                                 const semantic::Region &to,
+                                 const semantic::Vec2 *startFrom,
+                                 semantic::Vec2 &crossing,
+                                 semantic::Vec2 &arrival,
+                                 semantic::Vec2 &departure) const
+    {
+        return canTraverse(mode, relation, from, to, startFrom, crossing,
+                           arrival, departure);
+    }
 };
 
 struct Transition
@@ -173,6 +275,24 @@ public:
     size_t splitRegions() const;
     // How many pieces of free space this region has for the current body.
     int piecesOf(semantic::RegionId region) const;
+    // Which Places this region's free space came out as. Diagnostic: a
+    // region that routes as one piece when it is two shows up here and
+    // nowhere else.
+    size_t actorPlace() const;
+    void placesOf(semantic::RegionId region, std::vector<size_t> &out) const;
+    // Which Place an act's stance stands in, or the place count if the
+    // model never worked one out for it -- which is a route that cannot be
+    // asked for rather than a route that does not exist.
+    size_t placeOfOption(semantic::AffordanceId action, uint32_t option) const
+    {
+        if (size_t(action) >= m_optionPlace.size()
+            || size_t(option) >= m_optionPlace[size_t(action)].size())
+            return m_places.size();
+        return m_optionPlace[size_t(action)][size_t(option)];
+    }
+    // Which Place each end of a crossing leaves from and arrives in.
+    bool placesAcross(semantic::RelationId way, size_t &leaves,
+                      size_t &arrives) const;
     // How many places in this region the physics layer agreed the body can be.
     int stancesIn(semantic::RegionId region) const;
     // The witness poses themselves. Diagnostic: when the stance list and the
@@ -190,8 +310,85 @@ public:
     // is in. Every one of these is a way the body can go that the planner
     // will never be offered.
     int orphanedCrossings() const { return m_orphaned; }
+    // Why entries were worked out again: because the crossing itself changed,
+    // or because the body did. The second invalidates every entry at once, so
+    // if it is the larger number the model is re-deriving the world over
+    // something that has nothing to do with any particular crossing.
+    int staleByCrossing() const { return m_staleByCrossing; }
+    int staleByBody() const { return m_staleByBody; }
+    // Which geometry a crossing depends on, and whether it can be walked
+    // with that geometry in a given configuration. `geometry` comes back as
+    // kNoId when nothing about the crossing depends on a configuration.
+    semantic::GeometryId conditionOf(semantic::RelationId relation) const;
+
+    // The first thing to do, out of a plan that may have to arrange the
+    // world before it can be walked.
+    //
+    // Ordinary routing answers "can I walk there now". This answers "is
+    // there a sequence of walking and acting that gets me somewhere I have
+    // not been, and what is the first step of it" -- which is a different
+    // question, and the only one that can find a plan whose steps have to
+    // happen in an order. AGTST8 needs one: the far lift can only be sent
+    // for from the pit, and once you have ridden the near lift up you can no
+    // longer reach the pit, so it has to be sent for first. Nothing local
+    // sees that; each step is individually available, and only the order is
+    // wrong.
+    struct PlanStep
+    {
+        bool act = false;                 // otherwise: walk this crossing
+        semantic::RelationId crossing = semantic::kNoId;
+        semantic::AffordanceId affordance = semantic::kNoId;
+        uint32_t option = 0;
+        semantic::RegionId region = semantic::kNoId;  // where to do it
+        int cost = 0;
+        int steps = 0;                    // how long the plan is
+    };
+    bool planSomewhereNew(const semantic::SemanticWorld &world,
+                          semantic::RegionId from, PlanStep &first,
+                          std::vector<PlanStep> *whole = nullptr) const;
+    bool possibleInConfiguration(semantic::RelationId relation,
+                                 uint32_t configuration, Mode mode) const;
     // Why an act's option was or was not given a Place. See m_optionWhy.
     int optionVerdict(semantic::AffordanceId action, uint32_t option) const;
+    // Whether doing this act from that stance leaves the body anywhere to
+    // be, once the geometry the act commands has gone where it is going.
+    //
+    // CanUse is not this question. An act is a thing done from a place, and
+    // the place is inside the world the act changes: on AGTST18 the switch
+    // that works a sliding wall has stances whose hull is inside the wall's
+    // own sector, and the executor stands on one of them waiting for the
+    // world to settle.
+    enum class Survival
+    {
+        Remain,    // the body can stay where it is throughout
+        Escape,    // only if it leaves at once, and there is somewhere to go
+        Unknown,   // the transition is not described, so nothing can be said
+        Unsafe,    // no survivable trajectory from here
+    };
+    Survival survivalOf(semantic::AffordanceId action, uint32_t option) const;
+    // Would doing it from that stance leave the body shut into the room the
+    // stance is in? Alive, and with nowhere to go.
+    bool wouldSealIn(semantic::AffordanceId action, uint32_t option) const;
+    // Diagnostic: which acts were examined for it and which came out sealed.
+    const std::set<std::pair<size_t, semantic::RegionId>> &sealedActs() const
+    {
+        return m_sealed;
+    }
+    // What the two questions answered, per act and room examined.
+    struct Sealing
+    {
+        size_t thing = 0;
+        semantic::RegionId region = semantic::kNoId;
+        int ways = 0;
+        bool openNow = false;
+        bool openAfter = false;
+    };
+    const std::vector<Sealing> &sealingAudit() const { return m_sealingAudit; }
+    int sealingLooked() const { return m_sealingLooked; }
+    int sealingSkipped() const { return m_sealingSkipped; }
+    // Where to go, for an option that is survivable only by leaving.
+    bool escapeFrom(semantic::AffordanceId action, uint32_t option,
+                    semantic::Vec2 &out) const;
     const std::vector<DroppedCrossing> &droppedCrossings() const
     {
         return m_dropped;
@@ -207,15 +404,23 @@ public:
     double totalPiecesMs() const { return m_totalPieces; }
     int derivations() const { return m_derivations; }
     int standingBuilds() const { return m_navigator.builds(); }
+    const nav::Navigator &navigatorFor() const { return m_navigator; }
     int evaluationsLastUpdate() const { return m_lastEvaluations; }
     int totalEvaluations() const { return m_evaluations; }
 
     // Navigation over what the bot can actually execute.
     void reachableFrom(semantic::RegionId origin,
                        std::vector<semantic::RegionId> &out) const;
+    // `through` is the route as Places rather than Regions. Whoever walks
+    // a route needs it: a Region can be more than one piece of free space
+    // and a route may legitimately pass through the same Region twice, in
+    // two pieces the body cannot walk between. Told only which Regions it
+    // passes through, a walker that finds itself in one of them cannot say
+    // which visit it is on.
     bool route(semantic::RegionId from, semantic::RegionId to,
                std::vector<semantic::RegionId> &path,
-               std::vector<semantic::RelationId> &via) const;
+               std::vector<semantic::RelationId> &via,
+               std::vector<size_t> *through = nullptr) const;
     bool routeCost(semantic::RegionId from, semantic::RegionId to,
                    int &cost) const;
     // What it costs to get to one particular place an action can be taken
@@ -230,7 +435,8 @@ public:
     // chooses something the executor turns straight back down.
     bool optionRoute(semantic::RegionId from, semantic::AffordanceId action,
                      uint32_t option, std::vector<semantic::RegionId> &path,
-                     std::vector<semantic::RelationId> &via) const;
+                     std::vector<semantic::RelationId> &via,
+                     std::vector<size_t> *through = nullptr) const;
 
     // The executor could not drive something the derivation offered. That
     // is a fact about this actor in this world, so it is recorded here and
@@ -254,6 +460,22 @@ public:
     // Diagnostics: physically real, but this bot cannot drive it yet.
     int knownButUnexecutable() const;
     bool derived(semantic::RelationId relation, Mode mode) const;
+    // Everything this layer decided about one crossing, for reading back a
+    // way out that the body has and the planner does not.
+    struct Verdict
+    {
+        bool valid = false;
+        bool exists = false;
+        bool possible = false;
+        bool executable = false;
+        bool refused = false;
+        int leaves = 0;
+        int arrives = 0;
+        size_t from = 0;
+        size_t to = 0;
+        bool routed = false;
+    };
+    Verdict verdictFor(semantic::RelationId relation, Mode mode) const;
     // Where on a relation's gateway the executable crossing was verified,
     // and where on the far side it left the body.
     bool crossingFor(semantic::RelationId relation, semantic::Vec2 &out,
@@ -284,6 +506,20 @@ private:
         std::vector<int> leaves[kModeCount];
         std::vector<int> arrives[kModeCount];
         int cost[kModeCount] = {};
+        // Which stateful geometry decides whether this crossing works, if
+        // any does, and which of its configurations allow which modes. This
+        // is what lets the planner see "walkable when that is in that
+        // configuration" while the world is in another one.
+        semantic::GeometryId conditionedOn = semantic::kNoId;
+        std::vector<uint32_t> modesInConfiguration;
+        // Which piece of each side's free space this crossing touches, for
+        // a crossing that only works in some other configuration. A derived
+        // transition gets this from witnesses the physics layer accepted; a
+        // conditional one has no witnesses to get it from, and "any piece of
+        // that region" is not a usable answer -- it plans a walk between two
+        // pieces of one region the body cannot walk between.
+        size_t leavesPlace = size_t(-1);
+        size_t arrivesPlace = size_t(-1);
         int head[kModeCount] = {};
         int tail[kModeCount] = {};
         semantic::RegionId from = semantic::kNoId;
@@ -335,7 +571,6 @@ private:
     size_t rootOf(size_t place) const;
     void joinPlaces(size_t left, size_t right);
     // Where the actor is, and any piece of a region, as graph nodes.
-    size_t actorPlace() const;
     size_t placeIn(semantic::RegionId region) const;
     size_t startPlace(semantic::RegionId from) const;
     // What one crossing costs to walk, from wherever the body is coming from.
@@ -348,7 +583,8 @@ private:
     bool findRoute(size_t start, size_t goalPlace,
                    semantic::RegionId goalRegion,
                    std::vector<semantic::RegionId> *path,
-                   std::vector<semantic::RelationId> *via, int *cost) const;
+                   std::vector<semantic::RelationId> *via, int *cost,
+                   std::vector<size_t> *through = nullptr) const;
 
     std::vector<Entry> m_entries;
     std::vector<Transition> m_transitions;
@@ -356,6 +592,8 @@ private:
     uint32_t m_executable = 0;
     int m_evaluations = 0;
     int m_orphaned = 0;
+    int m_staleByCrossing = 0;
+    int m_staleByBody = 0;
     std::vector<DroppedCrossing> m_dropped;
     double m_worstStanding = 0.0;
     double m_worstCrossings = 0.0;
@@ -393,6 +631,19 @@ private:
     std::vector<int> m_scratch;
     // Per affordance, per option: which piece of free space it is in.
     std::vector<std::vector<size_t>> m_optionPlace;
+    std::vector<std::vector<uint8_t>> m_optionSurvival;
+    std::vector<uint64_t> m_survivalSignature;
+    std::set<std::pair<size_t, semantic::RegionId>> m_sealed;
+    std::map<std::pair<size_t, size_t>, semantic::RegionId> m_sealedRegionOf;
+    uint64_t m_sealingSignature = 0;
+    int m_sealingLooked = 0;
+    std::vector<Sealing> m_sealingAudit;
+    int m_sealingSkipped = 0;
+    void refreshSealing(const semantic::SemanticWorld &world,
+                        const PhysicsOracle &oracle);
+    std::vector<std::vector<semantic::Vec2>> m_optionEscape;
+    void refreshSurvival(const semantic::SemanticWorld &world,
+                         const PhysicsOracle &oracle);
     // Where each option actually is, so the last leg of a journey to it can
     // be measured to the thing rather than to the middle of its room.
     std::vector<std::vector<semantic::Vec2>> m_optionAt;
@@ -404,6 +655,9 @@ private:
     // than guessed at. 0 kept, 1 nowhere, 2 no room for the body there,
     // 3 room but no piece of free space this layer can name.
     std::vector<std::vector<uint8_t>> m_optionWhy;
+    // What each action's stances looked like when its options were last
+    // placed, so only the action that changed is placed again.
+    std::vector<uint64_t> m_optionSignature;
     uint64_t m_domainSignature = 0;
     std::vector<std::pair<semantic::AffordanceId, uint32_t>> m_refusedOptions;
     std::vector<semantic::RegionId> m_refusedRegions;

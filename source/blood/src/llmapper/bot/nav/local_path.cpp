@@ -508,10 +508,23 @@ bool LocalMap::visible(const Vec2 &a, const Vec2 &b) const
     // on boundaries, and a hair is the body's own width.
     if (!nearlyInside(a) || !nearlyInside(b))
         return false;
+    // Meeting a way out at all is leaving through it, not just crossing it
+    // at an angle.
+    //
+    // A doorway is a line, and a leg can run straight down that line without
+    // ever "properly intersecting" it -- overlapping is not crossing. So a
+    // route was allowed to travel the length of a doorway, in and out along
+    // the boundary between two rooms. Worse, only a point exactly on that
+    // line could make the leg: from thirty units off, the same leg does cross
+    // the doorway and is refused. So the route insisted on a waypoint the
+    // body had to stand exactly on, the body could not stand exactly
+    // anywhere, and it rocked back and forth beside it until the goal was
+    // given up on. Narrow places are where this bites, because that is where
+    // the only route runs along a boundary.
     for (const Segment &opening : m_openings)
     {
-        if (!semantic::segmentsProperlyIntersect(a, b, opening.from,
-                                                 opening.to))
+        if (semantic::segmentDistanceSquared(a, b, opening.from,
+                                             opening.to) != 0)
             continue;
         if (lyingOn(a, opening) || lyingOn(b, opening))
             continue;
@@ -550,6 +563,30 @@ void LocalMap::componentsAt(const Vec2 &at, std::vector<int> &out) const
         if (int(out.size()) >= m_components)
             return;   // there are no more pieces to be in
     }
+}
+
+int LocalMap::componentNear(const Vec2 &at) const
+{
+    int answer = -1;
+    int64_t best = 0;
+    bool bestVisible = false;
+    for (size_t node = 0; node < m_nodes.size(); ++node)
+    {
+        const int64_t dx = int64_t(m_nodes[node].x) - at.x;
+        const int64_t dy = int64_t(m_nodes[node].y) - at.y;
+        const int64_t span = dx * dx + dy * dy;
+        // One this point can actually walk to beats a nearer one it cannot,
+        // because the piece it belongs to is the piece the body is in.
+        const bool seen = visible(at, m_nodes[node]);
+        if (answer >= 0 && bestVisible && !seen)
+            continue;
+        if (answer >= 0 && (seen == bestVisible) && span >= best)
+            continue;
+        answer = m_label[node];
+        best = span;
+        bestVisible = seen;
+    }
+    return answer;
 }
 
 void LocalMap::visibleFrom(const Vec2 &at, std::vector<Vec2> &out) const
@@ -654,6 +691,7 @@ const LocalMap &Navigator::mapFor(const semantic::Region &region,
                                 radius, &region.interior);
                 entry.signature = signature;
                 ++entry.generation;
+                ++entry.rebuilds;
                 ++m_builds;
             }
             return entry.map;

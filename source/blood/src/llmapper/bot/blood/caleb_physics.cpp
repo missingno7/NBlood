@@ -1,6 +1,9 @@
 #include "caleb_physics.h"
+#include "blood_terrain.h"
 
 #include <algorithm>
+#include <deque>
+#include <map>
 #include <cmath>
 
 #include "fix16.h"
@@ -10,6 +13,14 @@
 #include "../../../common_game.h"
 #include "../../../globals.h"
 #include "../../../player.h"
+
+// Blood's own sector translation. It has external linkage and no header, so
+// it is declared here rather than reached for through one -- the alternative
+// is a second implementation of the same arithmetic, and a second opinion
+// about where a wall is.
+void TranslateSector(int nSector, int a2, int a3, int a4, int a5, int a6,
+                     int a7, int a8, int a9, int a10, int a11,
+                     char bAllWalls);
 
 namespace bloodmap {
 
@@ -191,6 +202,22 @@ int slotOrder(int step, int slots)
 
 } // namespace
 
+// The body measured once per posture, rather than once per animation frame.
+BodyShape CalebPhysics::stableBody() const
+{
+    const int key = gMe ? (gMe->lifeMode * 8 + gMe->posture) : -1;
+    if (key < 0)
+        return liveBody();
+    for (const Measured &known : m_measured)
+        if (known.key == key)
+            return known.shape;
+    Measured fresh;
+    fresh.key = key;
+    fresh.shape = liveBody();
+    m_measured.push_back(fresh);
+    return fresh.shape;
+}
+
 void CalebPhysics::refresh()
 {
     traversal::ActorProfile next;
@@ -200,7 +227,25 @@ void CalebPhysics::refresh()
         m_profile = next;
         return;
     }
-    const BodyShape body = liveBody();
+    // The body as it is when it is not mid-stride.
+    //
+    // GetSpriteExtents measures the tile the player sprite is showing, and
+    // the frames of the walk cycle are not all the same height. So the
+    // measured body breathes as Caleb walks -- five different heights on one
+    // level, and a step allowance moving with them -- and since this
+    // profile's revision is what says whether a derived crossing still
+    // stands, every frame of the walk animation threw away every crossing in
+    // the map and worked it out again with engine probes. On E2M3 that was
+    // two hundred and thirty-nine thousand re-derivations against fifteen
+    // hundred real changes, fifty-eight milliseconds a decision, and
+    // second-long hangs.
+    //
+    // What the body really is changes with posture and with life mode --
+    // crouching, swimming, shrunk, beast -- so that is what it is keyed on.
+    // Which frame of the walk it happens to be showing is not a fact about
+    // the body. Probes still ask the engine with the live extents wherever
+    // they need them; this is only what the model is told the body is.
+    const BodyShape body = stableBody();
     const POSTURE &standing = gMe->pPosture[gMe->lifeMode][kPostureStand];
     const POSTURE &crouching = gMe->pPosture[gMe->lifeMode][kPostureCrouch];
     next.radius = body.radius;
@@ -216,6 +261,8 @@ void CalebPhysics::refresh()
     next.jumpImpulse = packItemActive(gMe, kPackJumpBoots)
         ? standing.pwupJumpZ : standing.normalJumpZ;
     next.gravity = kDudeGravity;
+    next.posture = gMe->posture;
+    next.lifeMode = gMe->lifeMode;
 
     uint64_t revision = 1469598103934665603ULL;
     revision = mixHash(revision, uint64_t(uint32_t(next.radius)));
@@ -308,13 +355,10 @@ bool CalebPhysics::walkAcross(const SpatialRelation &relation,
         note(relation.id, Refusal::NoWidth);
         return false; // stacked surfaces are not walked between
     }
-    // Not into ground that is on the move.
-    //
-    // A sector Blood is animating has its walls travelling across the space
-    // it covers, and there is no standing still in the way of that: the body
-    // is pushed into whatever is behind it and squashed. This is a fact
-    // about right now rather than about the place, so it stops being true
-    // when the sector does, and the crossing is derived again then.
+    // Not into ground that is on the move. This reads the flag as the
+    // terrain snapshot left it, which is stale far more often than not --
+    // see the note in blood_world_adapter about why making it live is not
+    // as simple as reading gBusy here.
     if (to.hazard.shifting)
     {
         note(relation.id, Refusal::NoStance);
@@ -570,6 +614,346 @@ bool CalebPhysics::dropAcross(const SpatialRelation &relation,
     arrival = landing;
     departure = start;
     return true;
+}
+
+namespace {
+
+// Put a piece of stateful geometry into one of its configurations, ask, and
+// put it back exactly as it was.
+//
+// Blood keeps a moving sector's two ends in its XSECTOR and interpolates
+// between them; setting floorz and ceilingz to one of those ends is the
+// world as it rests in that configuration, and every z query the engine
+// answers -- GetZRange, getflorzofslope, the clip tests -- then answers for
+// that configuration. Which is the point: the engine stays the only thing
+// that says what is walkable, whichever configuration is being asked about.
+//
+// baseFloor/baseCeil go with them: they are what the engine measures its own
+// motion against, and leaving them behind would make the next real movement
+// of this geometry start from the wrong place.
+// Where a mover's walls are in one configuration.
+//
+// Blood keeps the two ends of a sliding or turning sector as a pair of
+// marker sprites and a position along the way between them; posing it is
+// putting it at one end. Restoring is putting it back where it was, by the
+// same route -- not by saving wall coordinates, because moving a wall moves
+// every wall that shares its corners, including in sectors this one has
+// nothing to do with.
+//
+// Only a mover at rest can be posed at all. One in transit is not in a
+// configuration, and where it is cannot be recovered by asking for a number
+// again, so the answer to any question about it is that there is no answer.
+void translateTo(uint64_t stateTag, int busy)
+{
+    XSECTOR &extra = xsector[stateTag];
+    const int owner = extra.reference;
+    if (!validSector(owner) || !validSprite(extra.marker0))
+        return;
+    const spritetype &first = sprite[extra.marker0];
+    const int type = sector[owner].type;
+    if (type == kSectorSlide || type == kSectorSlideMarked)
+    {
+        if (!validSprite(extra.marker1))
+            return;
+        const spritetype &second = sprite[extra.marker1];
+        TranslateSector(owner, 0, busy, first.x, first.y, first.x, first.y,
+                        first.ang, second.x, second.y, second.ang,
+                        type == kSectorSlide);
+        return;
+    }
+    TranslateSector(owner, 0, busy, first.x, first.y, first.x, first.y, 0,
+                    first.x, first.y, first.ang, type == kSectorRotate);
+}
+
+// How far a mover's walls actually went, read back rather than worked out.
+//
+// Posing puts the engine into another configuration. The Region descriptions
+// handed around above still describe the old one, and anything that consults
+// them -- which canTraverse does -- is then reasoning about half a world:
+// engine geometry in the new pose, outlines in the old. That is how a doorway
+// a sliding wall has just closed still answers "you can walk through this".
+//
+// So the motion is measured off the walls after posing and applied to the
+// description too. A motion that is not the same for every wall is not a
+// translation, and this says so rather than inventing one.
+struct WallShift
+{
+    bool known = false;
+    int dx = 0;
+    int dy = 0;
+};
+
+std::vector<std::pair<int, int>> wallsOf(int owner)
+{
+    std::vector<std::pair<int, int>> out;
+    if (!validSector(owner))
+        return out;
+    const int first = sector[owner].wallptr;
+    for (int i = 0; i < sector[owner].wallnum; ++i)
+        out.push_back({ wall[first + i].x, wall[first + i].y });
+    return out;
+}
+
+WallShift shiftOf(int owner, const std::vector<std::pair<int, int>> &before)
+{
+    WallShift said;
+    if (!validSector(owner) || before.empty()
+        || int(before.size()) != sector[owner].wallnum)
+        return said;
+    const int first = sector[owner].wallptr;
+    const int dx = wall[first].x - before[0].first;
+    const int dy = wall[first].y - before[0].second;
+    for (int i = 1; i < sector[owner].wallnum; ++i)
+        if (wall[first + i].x - before[size_t(i)].first != dx
+            || wall[first + i].y - before[size_t(i)].second != dy)
+            return said;   // a turn, or a shape change: not one offset
+    said.known = true;
+    said.dx = dx;
+    said.dy = dy;
+    return said;
+}
+
+void shiftRegion(Region &region, const WallShift &by)
+{
+    for (semantic::Vec2 &corner : region.footprint)
+    {
+        corner.x += by.dx;
+        corner.y += by.dy;
+    }
+    for (semantic::Loop &hole : region.holes)
+        for (semantic::Vec2 &corner : hole)
+        {
+            corner.x += by.dx;
+            corner.y += by.dy;
+        }
+    region.interior.x += by.dx;
+    region.interior.y += by.dy;
+}
+
+class PosedGeometry
+{
+public:
+    // `part` is how far along the travel to put it, as a fraction of 0x10000.
+    PosedGeometry(uint64_t stateTag, int part)
+    {
+        if (stateTag == 0 || stateTag >= kMaxXSectors)
+            return;
+        XSECTOR &extra = xsector[stateTag];
+        const int owner = extra.reference;
+        if (!validSector(owner))
+            return;
+        if (movesInThePlane(sector[owner].type)
+            && (extra.busy == 0 || extra.busy == 0x10000))
+        {
+            // Only something at rest can be posed and put back. One in
+            // transit is not at any configuration, and where it was cannot be
+            // recovered by asking for a number again.
+            m_outline = stateTag;
+            m_busy = extra.busy;
+            translateTo(stateTag, part);
+        }
+        m_sector = owner;
+        m_floor = sector[owner].floorz;
+        m_ceiling = sector[owner].ceilingz;
+        m_baseFloor = baseFloor[owner];
+        m_baseCeil = baseCeil[owner];
+        const int floorZ = extra.offFloorZ
+            + int((int64_t(extra.onFloorZ - extra.offFloorZ) * part) / 0x10000);
+        const int ceilZ = extra.offCeilZ
+            + int((int64_t(extra.onCeilZ - extra.offCeilZ) * part) / 0x10000);
+        sector[owner].floorz = floorZ;
+        sector[owner].ceilingz = ceilZ;
+        baseFloor[owner] = floorZ;
+        baseCeil[owner] = ceilZ;
+    }
+
+    ~PosedGeometry()
+    {
+        if (m_outline != 0)
+            translateTo(m_outline, m_busy);
+        if (m_sector < 0)
+            return;
+        sector[m_sector].floorz = m_floor;
+        sector[m_sector].ceilingz = m_ceiling;
+        baseFloor[m_sector] = m_baseFloor;
+        baseCeil[m_sector] = m_baseCeil;
+    }
+
+    PosedGeometry(const PosedGeometry &) = delete;
+    PosedGeometry &operator=(const PosedGeometry &) = delete;
+
+private:
+    uint64_t m_outline = 0;
+    int m_busy = 0;
+    int m_sector = -1;
+    int m_floor = 0;
+    int m_ceiling = 0;
+    int m_baseFloor = 0;
+    int m_baseCeil = 0;
+};
+
+} // namespace
+
+bool CalebPhysics::anyWayOut(
+    const std::vector<std::pair<semantic::GeometryId, uint32_t>> &posed,
+    const Region &from, const semantic::Vec2 &at,
+    const std::vector<traversal::PhysicsOracle::WayOut> &ways) const
+{
+    // Everything held at once, and put back in the reverse order it was
+    // taken, which is what a stack of these does on the way out of scope.
+    std::deque<PosedGeometry> holding;
+    std::map<semantic::GeometryId, WallShift> moved;
+    for (const auto &one : posed)
+    {
+        const uint64_t tag = m_geometryTag ? m_geometryTag(one.first) : 0;
+        if (tag == 0 || tag >= kMaxXSectors)
+            continue;
+        const int owner = xsector[tag].reference;
+        const std::vector<std::pair<int, int>> before = wallsOf(owner);
+        holding.emplace_back(tag, one.second == 0 ? 0 : 0x10000);
+        moved[one.first] = shiftOf(owner, before);
+    }
+    // The description of a space that has just moved, moved with it.
+    auto posedAs = [&](const Region &space, Region &out) {
+        out = space;
+        if (space.mover == semantic::kNoId)
+            return true;
+        auto found = moved.find(space.mover);
+        if (found == moved.end())
+            return true;   // not one of the things being held
+        if (!found->second.known)
+            return false;  // it turned, and this cannot say where it went
+        shiftRegion(out, found->second);
+        return true;
+    };
+    for (const traversal::PhysicsOracle::WayOut &way : ways)
+    {
+        if (!way.relation || !way.to || !way.to->exists)
+            continue;
+        Region posedFrom;
+        Region posedTo;
+        // Somewhere this cannot describe is not somewhere to call a way out.
+        // For the question this answers -- is the body about to shut itself
+        // in -- an unanswerable way is not one to count on.
+        if (!posedAs(from, posedFrom) || !posedAs(*way.to, posedTo))
+            continue;
+        semantic::Vec2 crossing = way.relation->gateway.midpoint();
+        semantic::Vec2 arrival = posedTo.interior;
+        semantic::Vec2 departure = at;
+        ++m_queries;
+        if (canTraverse(traversal::Mode::Walk, *way.relation, posedFrom,
+                        posedTo, &at, crossing, arrival, departure))
+            return true;
+    }
+    return false;
+}
+
+void CalebPhysics::sweptThrough(
+    semantic::GeometryId geometry, uint32_t step, uint32_t steps,
+    const std::vector<traversal::PhysicsOracle::Stance> &places,
+    std::vector<char> &out) const
+{
+    out.assign(places.size(), 0);
+    const uint64_t tag = m_geometryTag ? m_geometryTag(geometry) : 0;
+    if (tag == 0 || tag >= kMaxXSectors)
+        return;
+    const int owner = xsector[tag].reference;
+    if (!validSector(owner))
+        return;
+    const int part = steps < 2 ? 0
+        : int((int64_t(0x10000) * step) / (steps - 1));
+    const int reach = m_profile.radius;
+    PosedGeometry held(tag, part);
+    for (size_t index = 0; index < places.size(); ++index)
+    {
+        // The body is a hull, not a point, so the corners of it are asked
+        // about too: a wall arriving at a shoulder arrives at the body.
+        const semantic::Vec2 &at = places[index].at;
+        const int probe[5][2] = {
+            { at.x, at.y },
+            { at.x + reach, at.y }, { at.x - reach, at.y },
+            { at.x, at.y + reach }, { at.x, at.y - reach },
+        };
+        for (const auto &spot : probe)
+            if (inside(spot[0], spot[1], int16_t(owner)) == 1)
+            {
+                out[index] = 1;
+                break;
+            }
+    }
+}
+
+void CalebPhysics::canStandThrough(
+    semantic::GeometryId geometry, uint32_t step, uint32_t steps,
+    const std::vector<traversal::PhysicsOracle::Stance> &places,
+    std::vector<char> &out) const
+{
+    out.assign(places.size(), 0);
+    const uint64_t tag = m_geometryTag ? m_geometryTag(geometry) : 0;
+    const XSECTOR *extra = tag == 0 ? nullptr : &xsector[tag];
+    const int part = steps < 2 ? 0
+        : int((int64_t(0x10000) * step) / (steps - 1));
+    // The floor plane is part of the world as the region describes it, so a
+    // region made of this geometry has to be told where its floor is at the
+    // pose asked about -- but only where the geometry moves in z. Something
+    // that slides has no such numbers, and writing the zeros it reports into
+    // the plane puts its floor at the origin.
+    const bool inZ = extra
+        && (extra->offFloorZ != extra->onFloorZ
+            || extra->offCeilZ != extra->onCeilZ);
+    const int floorZ = !extra ? 0
+        : extra->offFloorZ
+            + int((int64_t(extra->onFloorZ - extra->offFloorZ) * part)
+                  / 0x10000);
+    PosedGeometry held(tag, part);
+    for (size_t index = 0; index < places.size(); ++index)
+    {
+        if (!places[index].region)
+            continue;
+        Region posed = *places[index].region;
+        if (inZ && posed.mover == geometry)
+            posed.support = semantic::flatPlane(floorZ);
+        ++m_queries;
+        out[index] = stanceIn(posed, places[index].at, liveBody()).valid
+            ? 1 : 0;
+    }
+}
+
+bool CalebPhysics::canTraverseWith(semantic::GeometryId geometry,
+                                   uint32_t configuration,
+                                   traversal::Mode mode,
+                                   const SpatialRelation &relation,
+                                   const Region &from, const Region &to,
+                                   const semantic::Vec2 *startFrom,
+                                   semantic::Vec2 &crossing,
+                                   semantic::Vec2 &arrival,
+                                   semantic::Vec2 &departure) const
+{
+    const uint64_t tag = m_geometryTag ? m_geometryTag(geometry) : 0;
+    if (tag == 0)
+        return canTraverse(mode, relation, from, to, startFrom, crossing,
+                           arrival, departure);
+    // The regions either side describe the world as it stands, so the one
+    // this geometry makes has to be told where its floor is in the
+    // configuration being asked about. Nothing else about it changes: the
+    // outline it presents is the outline it has.
+    const XSECTOR &extra = xsector[tag];
+    const int floorZ = configuration == 0 ? extra.offFloorZ : extra.onFloorZ;
+    // Only where the geometry moves in z. A slide reports zero at both ends
+    // because those fields are for something else, and writing that into the
+    // support plane derives every crossing against a floor at the origin.
+    const bool inZ = extra.offFloorZ != extra.onFloorZ
+        || extra.offCeilZ != extra.onCeilZ;
+    Region posedFrom = from;
+    Region posedTo = to;
+    if (inZ && from.mover == geometry)
+        posedFrom.support = semantic::flatPlane(floorZ);
+    if (inZ && to.mover == geometry)
+        posedTo.support = semantic::flatPlane(floorZ);
+
+    PosedGeometry posed(tag, configuration == 0 ? 0 : 0x10000);
+    return canTraverse(mode, relation, posedFrom, posedTo, startFrom,
+                       crossing, arrival, departure);
 }
 
 bool CalebPhysics::canTraverse(traversal::Mode mode,

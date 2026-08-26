@@ -1000,24 +1000,29 @@ void testOpeningsAreDirected()
     assert(downhill > 0);
     assert(uphill == 0);
 
-    // The walking is directed. What the two sides are is not.
+    // The walking is directed, and so is what counts as a wall.
     //
-    // A step the body cannot climb is still an opening from below: it is
-    // somewhere the world is not wall, and a body may stand at the foot of it
-    // with its hull over the lip. Calling it a wall on the low side because
-    // the walk is one way is the conflation this layer exists to avoid -- and
-    // it is not idle, because free space is worked out from these segments,
-    // so a wall here erases ground the engine will happily stand a body on.
+    // An opening is somewhere the engine does not clip *this body*, which is
+    // not the same for both sides of a step: a rise past what the body steps
+    // over is a ledge from above and a wall from below. Erode the low room's
+    // floor against it and a pose can never land inside the clip line the
+    // engine keeps there; call it open and poses do land there, routes lead
+    // to them, and the body pushes into an invisible wall for as long as the
+    // level lasts.
+    //
+    // This does not erase the room above -- see the ledge test. A room's
+    // free space comes from its own ways out, and stepping down is not
+    // something the engine stops.
     std::vector<semantic::Segment> high;
     std::vector<semantic::Segment> low;
     // Region 1 is the higher floor: z counts downwards.
     traversal.openingsFor(world, 1, high);
     traversal.openingsFor(world, 0, low);
-    std::printf("  directed: openings out of the high side %u, out of the"
-                " low side %u -- and the walk is one way regardless\n",
+    std::printf("  directed: ways out of the high side %u, out of the low"
+                " side %u -- the same step, a ledge and a wall\n",
                 unsigned(high.size()), unsigned(low.size()));
-    assert(!high.empty());
-    assert(!low.empty());   // being there is not the same as leaving that way
+    assert(!high.empty());   // stepping down is not stopped
+    assert(low.empty());     // stepping up past the allowance is a wall
 }
 
 // A crossing belongs to the boundary it crossed.
@@ -1349,6 +1354,86 @@ void testAMovingBlockerDoesNotChangeIdentity()
     assert(crossableShut < crossableOpen); // only the walking changed
 }
 
+// The same moving geometry, authored two ways, is the same moving geometry.
+//
+// This is the test that says why a Region's identity cannot simply become
+// the set of engine pieces it is made of. How a level's author chose to cut
+// one physical thing into sectors is not a fact about the world, so it must
+// not reach anything above the mapper -- not the number of Regions, not the
+// ways between them, and not the identity of the thing that moves.
+void testHowMovingGeometryIsCutUpDoesNotReachTheModel()
+{
+    const uint64_t mechanism = 77;
+
+    auto worldFrom = [&](bool subdivided, int floorZ)
+    {
+        std::vector<terrain::SupportFace> faces;
+        std::vector<terrain::Seam> seams;
+        faces.push_back(rectangle(0, 0, 3072, 3072, 1, kFloor));
+        if (!subdivided)
+        {
+            terrain::SupportFace slab = rectangle(3072, 0, 6144, 3072, 2,
+                                                  floorZ);
+            slab.stateTag = mechanism;
+            faces.push_back(slab);
+            seams.push_back(seam(0, 1, 3072, 0, 3072, 3072));
+        }
+        else
+        {
+            for (int part = 0; part < 3; ++part)
+            {
+                terrain::SupportFace slab = rectangle(3072 + part * 1024, 0,
+                    4096 + part * 1024, 3072, uint64_t(2 + part), floorZ);
+                slab.stateTag = mechanism;   // one mechanism, three pieces
+                faces.push_back(slab);
+            }
+            seams.push_back(seam(0, 1, 3072, 0, 3072, 3072));
+            seams.push_back(seam(1, 2, 4096, 0, 4096, 3072));
+            seams.push_back(seam(2, 3, 5120, 0, 5120, 3072));
+        }
+        terrain::BuildResult built;
+        terrain::build(faces, seams, built);
+        return built;
+    };
+
+    const terrain::BuildResult whole = worldFrom(false, kFloor);
+    const terrain::BuildResult cut = worldFrom(true, kFloor);
+    std::printf("  moving tessellation: one piece -> %u region(s), three"
+                " pieces -> %u region(s)\n",
+                unsigned(whole.regions.size()),
+                unsigned(cut.regions.size()));
+    assert(whole.regions.size() == cut.regions.size());
+    assert(whole.relations.size() == cut.relations.size());
+
+    size_t movingWhole = 0;
+    size_t movingCut = 0;
+    for (const terrain::BuiltRegion &region : whole.regions)
+        if (region.stateTag == mechanism)
+            ++movingWhole;
+    for (const terrain::BuiltRegion &region : cut.regions)
+        if (region.stateTag == mechanism)
+            ++movingCut;
+    std::printf("  moving tessellation: the moving space is %u region(s)"
+                " either way\n", unsigned(movingWhole));
+    assert(movingWhole == 1);
+    assert(movingCut == 1);
+
+    // Now move it. The space it makes may be decomposed differently and get
+    // a different RegionId; the mechanism is the same mechanism.
+    const terrain::BuildResult lifted = worldFrom(false, kFloor - 8192);
+    uint64_t before = 0;
+    uint64_t after = 0;
+    for (const terrain::BuiltRegion &region : whole.regions)
+        if (region.stateTag == mechanism)
+            before = region.stateTag;
+    for (const terrain::BuiltRegion &region : lifted.regions)
+        if (region.stateTag == mechanism)
+            after = region.stateTag;
+    std::printf("  moving tessellation: after moving, it is the same"
+                " mechanism\n");
+    assert(before != 0 && before == after);
+}
+
 } // namespace
 
 int main()
@@ -1377,6 +1462,7 @@ int main()
     testPlannerAndExecutorAgreeOnReach();
     testAHighLedgeDoesNotEraseTheRoomAboveIt();
     testALowDoorwayDoesNotEraseTheRoomBehindIt();
+    testHowMovingGeometryIsCutUpDoesNotReachTheModel();
     testEveryStanceBelongsToExactlyOnePlace();
     testAMovingBlockerDoesNotChangeIdentity();
     return 0;
