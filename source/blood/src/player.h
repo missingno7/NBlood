@@ -107,6 +107,13 @@ struct POSTURE
 
 extern POSTURE gPostureDefaults[kModeMax][kPostureMax];
 
+// How far the view may be pitched, in Build angle units.  ProcessInput
+// clamps q16look to these; a vanilla demo uses the narrower original range.
+// Declared here because anything that aims has to respect the same limits.
+CONSTEXPR int kLookUpLimit = 289;
+CONSTEXPR int kLookDownLimit = -347;
+CONSTEXPR int kLookLimitVanilla = 60;
+
 enum
 {
     kWeaponNone         = 0,
@@ -337,12 +344,14 @@ void        playerResetScores(int nPlayer);
 void        playerReset(PLAYER *pPlayer);
 void        playerInit(int nPlayer, unsigned int a2);
 char        findDroppedLeech(PLAYER *a1, spritetype *a2);
+char        playerCanBenefitFromPickup(PLAYER *pPlayer, spritetype *pItem);
 char        PickupItem(PLAYER *pPlayer, spritetype *pItem);
 char        PickupAmmo(PLAYER *pPlayer, spritetype *pAmmo);
 char        PickupWeapon(PLAYER *pPlayer, spritetype *pWeapon);
 void        PickUp(PLAYER *pPlayer, spritetype *pSprite);
 void        CheckPickUp(PLAYER *pPlayer);
 int         ActionScan(PLAYER *pPlayer, int *a2, int *a3);
+int         ActionScanPreview(PLAYER *pPlayer, int *a2, int *a3);
 void        ProcessInput(PLAYER *pPlayer);
 void        playerProcess(PLAYER *pPlayer);
 spritetype *playerFireMissile(PLAYER *pPlayer, int a2, int a3, int a4, int a5, int a6);

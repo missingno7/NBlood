@@ -7,6 +7,7 @@
 // by the EDuke32 team (development@voidpoint.com)
 
 #include "build.h"
+#include "colmatch.h"
 #include "editor.h"
 
 int32_t editorgridextent = -1;
@@ -105,6 +106,55 @@ void plotlines2d(const int32_t *xx, const int32_t *yy, int32_t numpoints, int co
         videoEndDrawing();
 
         drawlinepat = odrawlinepat;
+    }
+}
+
+void renderDrawPolygonRGBA(const int32_t *xx, const int32_t *yy, int32_t npoints,
+                           uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha)
+{
+    if (!xx || !yy || npoints < 3)
+        return;
+
+#ifdef USE_OPENGL
+    if (videoGetRenderMode() >= REND_POLYMOST && in3dmode())
+    {
+        // This is deliberately an x-ray diagnostic overlay. The caller has
+        // already projected real world-space geometry through the active
+        // camera; disabling depth here keeps hidden/missed support visible.
+        glViewport(0, 0, xdim, ydim);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, xdim, ydim, 0, -1, 1);
+        if (videoGetRenderMode() == REND_POLYMER)
+        {
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+        }
+
+        polymost2d = 1;
+        buildgl_setDisabled(GL_ALPHA_TEST);
+        buildgl_setDisabled(GL_DEPTH_TEST);
+        buildgl_setEnabled(GL_BLEND);
+        polymost_useColorOnly(true);
+        glBegin(GL_TRIANGLE_FAN);
+        glColor4ub(red, green, blue, alpha);
+        for (int32_t i = 0; i < npoints; ++i)
+            glVertex2i(xx[i], yy[i]);
+        glEnd();
+        glColor4ub(255, 255, 255, 255);
+        polymost_useColorOnly(false);
+        return;
+    }
+#endif
+
+    // The requested mode is Polymost, but keeping an outline fallback makes
+    // the diagnostic harmless and understandable under classic rendering.
+    const int color = paletteGetClosestColor(red, green, blue);
+    for (int32_t i = 0; i < npoints; ++i)
+    {
+        const int32_t next = (i + 1) % npoints;
+        renderDrawLine(xx[i] << 12, yy[i] << 12,
+                       xx[next] << 12, yy[next] << 12, char(color));
     }
 }
 

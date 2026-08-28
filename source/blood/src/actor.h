@@ -174,6 +174,17 @@ extern THINGINFO thingInfo[];
 extern VECTORDATA gVectorData[];
 
 extern int gDudeDrag;
+
+// Dude physics, shared so nothing has to restate them.
+//
+// kDudeGravity is the vertical acceleration MoveDude adds per game frame.
+// kDudeAirborneHeight is the XSPRITE::height above which a dude is fully
+// airborne: past it, ground drag stops and the player's input authority
+// falls to nothing.  kFallDamageFloor is the impact damage MoveDude forgives
+// on landing, so an impact that produces no more than this hurts nobody.
+CONSTEXPR int kDudeGravity = 58254;
+CONSTEXPR int kDudeAirborneHeight = 0x100;
+CONSTEXPR int kFallDamageFloor = 100<<4;
 extern short gAffectedSectors[kMaxSectors];
 extern short gAffectedXWalls[kMaxXWalls];
 

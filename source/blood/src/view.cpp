@@ -57,6 +57,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "tile.h"
 #include "trig.h"
 #include "view.h"
+#include "llmapper/bot/bot.h"
 #include "warp.h"
 #include "weapon.h"
 #ifdef NOONE_EXTENSIONS
@@ -3876,6 +3877,12 @@ RORHACK:
         sub_5571C(1);
         int nSpriteSortCnt = spritesortcnt;
         renderDrawMasks();
+        // Drawn from the exact camera handed to the renderer, so the overlay
+        // is a view of the bot's own world model rather than a second guess
+        // at where the player is.
+        gLLMapperBot.DrawDebugOverlay(
+            cX, cY, cZ, cA,
+            q16horiz + fix16_from_int(defaultHoriz) + deliriumPitchI);
         spritesortcnt = nSpriteSortCnt;
         sub_5571C(0);
         sub_557C4(cX, cY, gInterpolate);
@@ -4075,6 +4082,7 @@ RORHACK:
     {
         DrawStatSprite(2048, xdim-15, 20);
     }
+    gLLMapperBot.DrawStatus();
     viewDisplayMessage();
     CalcFrameRate();
 #if 0

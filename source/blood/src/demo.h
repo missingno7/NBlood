@@ -83,6 +83,7 @@ public:
     void Write(GINPUT *);
     void Close(void);
     bool SetupPlayback(const char *);
+    void SetPlaybackSpeed(int speed);
     void ProcessKeys(void);
     void Playback(void);
     void StopPlayback(void);
@@ -106,6 +107,7 @@ public:
     DEMOCHAIN *pFirstDemo;
     DEMOCHAIN *pCurrentDemo;
     int nDemosFound;
+    int m_playbackSpeed;
 };
 
 extern CDemo gDemo;

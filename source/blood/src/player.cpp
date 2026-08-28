@@ -36,6 +36,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gib.h"
 #include "globals.h"
 #include "levels.h"
+#include "llmapper/bot/bot.h"
 #include "loadsave.h"
 #include "map2d.h"
 #include "network.h"
@@ -1085,6 +1086,120 @@ char findDroppedLeech(PLAYER *a1, spritetype *a2)
     return 0;
 }
 
+// Side-effect-free counterpart to the pickup handlers below.  Autonomous
+// planning must distinguish an item sprite from a useful pickup *now*: Blood
+// deliberately leaves health, ammo, armour, packs and duplicate weapons in
+// the world when the corresponding resource cannot increase.  Keeping this
+// test beside the authoritative tables prevents the bot from inventing its
+// own tile/type whitelist or walking repeatedly into an item the engine will
+// reject.  A remembered item can naturally become useful again after damage
+// is taken or ammunition is spent.
+char playerCanBenefitFromPickup(PLAYER *pPlayer, spritetype *pItem)
+{
+    if (!pPlayer || !pItem || pItem->statnum != kStatItem)
+        return 0;
+
+    const int type = pItem->type;
+    if (type >= kItemAmmoBase && type < kItemAmmoMax)
+    {
+        const int ammo = gAmmoItemData[type - kItemAmmoBase].type;
+        return ammo >= 0 && ammo < LENGTH(PLAYER::ammoCount)
+            && pPlayer->ammoCount[ammo] < gAmmoInfo[ammo].max;
+    }
+    if (type >= kItemWeaponBase && type < kItemWeaponMax)
+    {
+        const WEAPONITEMDATA &weapon = gWeaponItemData[type - kItemWeaponBase];
+        if (weapon.type < 0 || weapon.type >= LENGTH(PLAYER::hasWeapon))
+            return 0;
+        if (!pPlayer->hasWeapon[weapon.type])
+        {
+            if (type == kItemWeaponLifeLeech
+                && gGameOptions.nGameType >= kGameTypeBloodBath
+                && findDroppedLeech(pPlayer, NULL))
+                return 0;
+            return 1;
+        }
+        if (gGameOptions.nWeaponSettings == 2
+            || gGameOptions.nWeaponSettings == 3)
+        {
+            return weapon.ammoType >= 0
+                && weapon.ammoType < LENGTH(PLAYER::ammoCount)
+                && pPlayer->ammoCount[weapon.ammoType]
+                    < gAmmoInfo[weapon.ammoType].max;
+        }
+        if (!actGetRespawnTime(pItem) || weapon.ammoType < 0
+            || weapon.ammoType >= LENGTH(PLAYER::ammoCount))
+            return 0;
+        return pPlayer->ammoCount[weapon.ammoType]
+            < gAmmoInfo[weapon.ammoType].max;
+    }
+    if (type < kItemBase || type >= kItemMax)
+        return 0;
+
+    const int item = type - kItemBase;
+    if (type >= kItemKeyBase && type < kItemKeyMax)
+    {
+        const int key = type - kItemKeyBase + 1;
+        return key >= 0 && key < LENGTH(PLAYER::hasKey)
+            && !pPlayer->hasKey[key];
+    }
+    switch (type)
+    {
+    case kItemHealthMedPouch:
+    case kItemHealthLifeEssense:
+    case kItemHealthLifeSeed:
+    case kItemHealthRedPotion:
+        return pPlayer->pXSprite && pPlayer->pXSprite->health > 0
+            && pPlayer->pXSprite->health < gPowerUpInfo[item].maxTime;
+
+    case kItemHealthDoctorBag:
+    case kItemJumpBoots:
+    case kItemDivingSuit:
+    case kItemBeastVision:
+    {
+        const int pack = gItemData[item].packSlot;
+        return pack >= 0 && pack < kPackMax
+            && pPlayer->packSlots[pack].curAmount < 100;
+    }
+
+    case kItemArmorBasic:
+    case kItemArmorBody:
+    case kItemArmorFire:
+    case kItemArmorSpirit:
+    case kItemArmorSuper:
+    {
+        const ARMORDATA &armor = armorData[type - kItemArmorBasic];
+        return pPlayer->armor[1] < armor.atc
+            || pPlayer->armor[0] < armor.at4
+            || pPlayer->armor[2] < armor.at14;
+    }
+
+    // Team flag bases are operated in place rather than consumed.  The loose
+    // flags themselves are irrelevant to the single-player bot.
+    case kItemFlagABase:
+    case kItemFlagBBase:
+        return 0;
+    case kItemFlagA:
+    case kItemFlagB:
+        return gGameOptions.nGameType == kGameTypeTeams;
+
+    // Blood explicitly rejects Crystal Ball inventory in single player.
+    case kItemCrystalBall:
+        if (gGameOptions.nGameType == kGameTypeSinglePlayer)
+            return 0;
+        return gItemData[item].packSlot >= 0
+            && gItemData[item].packSlot < kPackMax
+            && pPlayer->packSlots[gItemData[item].packSlot].curAmount < 100;
+
+    default:
+        // Timed powerups do not gain duration while already active.  Walking
+        // over a second copy may consume it for some modes, but it provides
+        // no capability/resource benefit and is not useful exploration work.
+        return item >= 0 && item < kMaxPowerUps
+            && powerupCheck(pPlayer, item) <= 0;
+    }
+}
+
 char PickupItem(PLAYER *pPlayer, spritetype *pItem) {
     
     spritetype *pSprite = pPlayer->pSprite; XSPRITE *pXSprite = pPlayer->pXSprite;
@@ -1472,7 +1587,7 @@ void CheckPickUp(PLAYER *pPlayer)
     }
 }
 
-int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
+static int ActionScanTarget(PLAYER *pPlayer, int *a2, int *a3, bool applySideEffects)
 {
     *a2 = 0;
     *a3 = 0;
@@ -1489,7 +1604,7 @@ int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
         case 3:
             *a2 = gHitInfo.hitsprite;
             *a3 = sprite[*a2].extra;
-            if (*a3 > 0 && sprite[*a2].statnum == kStatThing)
+            if (applySideEffects && *a3 > 0 && sprite[*a2].statnum == kStatThing)
             {
                 spritetype *pSprite = &sprite[*a2];
                 XSPRITE *pXSprite = &xsprite[*a3];
@@ -1503,7 +1618,7 @@ int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
             }
             if (*a3 > 0 && xsprite[*a3].Push)
                 return 3;
-            if (sprite[*a2].statnum == kStatDude)
+            if (applySideEffects && sprite[*a2].statnum == kStatDude)
             {
                 spritetype *pSprite = &sprite[*a2];
                 XSPRITE *pXSprite = &xsprite[*a3];
@@ -1547,6 +1662,16 @@ int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
     if (*a3 > 0 && xsector[*a3].Push)
         return 6;
     return -1;
+}
+
+int ActionScan(PLAYER *pPlayer, int *a2, int *a3)
+{
+    return ActionScanTarget(pPlayer, a2, a3, true);
+}
+
+int ActionScanPreview(PLAYER *pPlayer, int *a2, int *a3)
+{
+    return ActionScanTarget(pPlayer, a2, a3, false);
 }
 
 inline void playerDropHand(PLAYER *pPlayer)
@@ -1651,11 +1776,11 @@ void ProcessInput(PLAYER *pPlayer)
             yvel[nSprite] -= mulscale30(strafe, x);
         }
     }
-    else if (pXSprite->height < 256)
+    else if (pXSprite->height < kDudeAirborneHeight)
     {
         int speed = 0x10000;
         if (pXSprite->height > 0)
-            speed -= divscale16(pXSprite->height, 256);
+            speed -= divscale16(pXSprite->height, kDudeAirborneHeight);
         int x = Cos(pSprite->ang);
         int y = Sin(pSprite->ang);
         if (pInput->forward)
@@ -1746,21 +1871,27 @@ void ProcessInput(PLAYER *pPlayer)
     {
         int a2, a3;
         int hit = ActionScan(pPlayer, &a2, &a3);
+        bool accepted = false;
+        int key = 0;
         switch (hit)
         {
         case 6:
             if (a3 > 0 && a3 < kMaxXSectors)
             {
                 XSECTOR *pXSector = &xsector[a3];
-                int key = pXSector->Key;
+                key = pXSector->Key;
                 if (pXSector->locked && pPlayer == gMe)
                 {
                     viewSetMessage("It's locked");
                     sndStartSample(3062, 255, 2, 0);
                 }
-                if (!key || pPlayer->hasKey[key])
+                if (!pXSector->locked && !pXSector->isTriggered
+                    && (!key || pPlayer->hasKey[key]))
+                {
+                    accepted = true;
                     trTriggerSector(a2, pXSector, kCmdSpritePush, pPlayer->nSprite);
-                else if (pPlayer == gMe)
+                }
+                else if (key && !pPlayer->hasKey[key] && pPlayer == gMe)
                 {
                     viewSetMessage("That requires a key.");
                     sndStartSample(3063, 255, 2, 0);
@@ -1770,17 +1901,19 @@ void ProcessInput(PLAYER *pPlayer)
         case 0:
         {
             XWALL *pXWall = &xwall[a3];
-            int key = pXWall->key;
+            key = pXWall->key;
             if (pXWall->locked && pPlayer == gMe)
             {
                 viewSetMessage("It's locked");
                 sndStartSample(3062, 255, 2, 0);
             }
-            if (!key || pPlayer->hasKey[key])
+            if (!pXWall->locked && !pXWall->isTriggered
+                && (!key || pPlayer->hasKey[key]))
             {
+                accepted = true;
                 trTriggerWall(a2, pXWall, kCmdWallPush, pPlayer->nSprite);
             }
-            else if (pPlayer == gMe)
+            else if (key && !pPlayer->hasKey[key] && pPlayer == gMe)
             {
                 viewSetMessage("That requires a key.");
                 sndStartSample(3063, 255, 2, 0);
@@ -1790,12 +1923,16 @@ void ProcessInput(PLAYER *pPlayer)
         case 3:
         {
             XSPRITE *pXSprite = &xsprite[a3];
-            int key = pXSprite->key;
+            key = pXSprite->key;
             if (pXSprite->locked && pPlayer == gMe && pXSprite->lockMsg)
                 trTextOver(pXSprite->lockMsg);
-            if (!key || pPlayer->hasKey[key])
+            if (!pXSprite->locked && !pXSprite->isTriggered
+                && (!key || pPlayer->hasKey[key]))
+            {
+                accepted = true;
                 trTriggerSprite(a2, pXSprite, kCmdSpritePush, pPlayer->nSprite);
-            else if (pPlayer == gMe)
+            }
+            else if (key && !pPlayer->hasKey[key] && pPlayer == gMe)
             {
                 viewSetMessage("That requires a key.");
                 sndStartSample(3063, 255, 2, 0);
@@ -1803,6 +1940,8 @@ void ProcessInput(PLAYER *pPlayer)
             break;
         }
         }
+        if (pPlayer == gMe)
+            gLLMapperBot.OnActionResolved(hit, a2, a3, accepted, key);
         if (pPlayer->handTime > 0)
             pPlayer->handTime = ClipLow(pPlayer->handTime-kTicsPerFrame*(6-gGameOptions.nDifficulty), 0);
         if (pPlayer->handTime <= 0 && pPlayer->hand) // if hand enemy successfully thrown off
@@ -1823,11 +1962,11 @@ void ProcessInput(PLAYER *pPlayer)
         else
         {
             if (pInput->buttonFlags.lookUp)
-                pPlayer->q16look = fix16_min(pPlayer->q16look+F16(4), F16(60));
+                pPlayer->q16look = fix16_min(pPlayer->q16look+F16(4), F16(kLookLimitVanilla));
             if (pInput->buttonFlags.lookDown)
-                pPlayer->q16look = fix16_max(pPlayer->q16look-F16(4), F16(-60));
+                pPlayer->q16look = fix16_max(pPlayer->q16look-F16(4), F16(-kLookLimitVanilla));
         }
-        pPlayer->q16look = fix16_clamp(pPlayer->q16look+pInput->q16mlook, F16(-60), F16(60));
+        pPlayer->q16look = fix16_clamp(pPlayer->q16look+pInput->q16mlook, F16(-kLookLimitVanilla), F16(kLookLimitVanilla));
         if (pPlayer->q16look > 0)
             pPlayer->q16horiz = fix16_from_int(mulscale30(120, Sin(fix16_to_int(pPlayer->q16look)<<3)));
         else if (pPlayer->q16look < 0)
@@ -1837,10 +1976,10 @@ void ProcessInput(PLAYER *pPlayer)
     }
     else
     {
-        CONSTEXPR int upAngle = 289;
-        CONSTEXPR int downAngle = -347;
-        CONSTEXPR double lookStepUp = 4.0*upAngle/60.0;
-        CONSTEXPR double lookStepDown = -4.0*downAngle/60.0;
+        CONSTEXPR int upAngle = kLookUpLimit;
+        CONSTEXPR int downAngle = kLookDownLimit;
+        CONSTEXPR double lookStepUp = 4.0*upAngle/double(kLookLimitVanilla);
+        CONSTEXPR double lookStepDown = -4.0*downAngle/double(kLookLimitVanilla);
         if (pInput->keyFlags.lookCenter && !pInput->buttonFlags.lookUp && !pInput->buttonFlags.lookDown)
         {
             if (pPlayer->q16look < 0)

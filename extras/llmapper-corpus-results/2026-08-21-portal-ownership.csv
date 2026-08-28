@@ -1,0 +1,5 @@
+map,run,sectors_entered,sectors_observed,route_plans,route_ping_pongs,route_failures,result,game_time,stop_category
+E1M1,before,25,31,217,122,8,TIMEOUT,600,prerequisite_unresolved
+E1M1,after,25,31,69,0,7,TIMEOUT,600,prerequisite_unresolved
+E2M4,before,47,57,419,378,25,STALLED,494,navigation_dead_end
+E2M4,after,61,71,69,0,6,DIED,384,combat_blocked

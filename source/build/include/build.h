@@ -1296,6 +1296,11 @@ void   rotatesprite_(int32_t sx, int32_t sy, int32_t z, int16_t a, int16_t picnu
                      int8_t dashade, char dapalnum, int32_t dastat, uint8_t daalpha, uint8_t dablend,
                      int32_t cx1, int32_t cy1, int32_t cx2, int32_t cy2);
 void   renderDrawLine(int32_t x1, int32_t y1, int32_t x2, int32_t y2, char col);
+// Screen-space filled diagnostic polygon. Coordinates are ordinary pixels,
+// unlike renderDrawLine's 16.16 inputs. Polymost renders the requested alpha;
+// classic renderers fall back to an outline.
+void   renderDrawPolygonRGBA(const int32_t *xx, const int32_t *yy, int32_t npoints,
+                             uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha);
 void   drawlinergb(int32_t x1, int32_t y1, int32_t x2, int32_t y2, palette_t p);
 int32_t    printext16(int32_t xpos, int32_t ypos, int16_t col, int16_t backcol,
                       const char *name, char fontsize) ATTRIBUTE((nonnull(5)));
