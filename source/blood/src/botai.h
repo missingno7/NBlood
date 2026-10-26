@@ -40,6 +40,8 @@ enum
     kBotPortalDoor   = 4,  // closed now, may be opened by pressing action
     kBotPortalLink   = 8,  // ROR water/stack link or teleporter, no wall
     kBotPortalLift   = 16, // floor higher than a jump, but the sector moves
+    kBotPortalBridge = 32, // only crossable on a sprite (bridge, ledge) in the way
+    kBotPortalDrop   = 64, // a fall we take on purpose
 };
 
 struct BOTMOVE
@@ -127,6 +129,11 @@ struct BOTINFO
     int nStrafeUntil;
     int nJumpWait;
     int nAvoids;
+    bool bAltFire;              // fire mode chosen for the current volley
+    int nAltUntil;
+    int nAltShots;
+    int nDoorsOpened;
+    bool bFalling;
 
     BOTNAV nav;
 };
@@ -159,6 +166,12 @@ bool botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
 int botNavProbe(PLAYER *pPlayer, int nAng, int nDist, int *pHit = NULL);
 int botNavRoamSector(BOTINFO *pBot, PLAYER *pPlayer);
 bool botNavReachable(PLAYER *pPlayer, int nSector);
+// Would moving this way walk us off a ledge we did not mean to take?
+bool botNavLedge(PLAYER *pPlayer, int nAng, int nDist);
+bool botNavOnBridge(PLAYER *pPlayer);
+void botNavSafeMove(BOTINFO *pBot, PLAYER *pPlayer, BOTMOVE *pMove);
+void botNavReport(PLAYER *pPlayer);
+void botNavDrawMap(PLAYER *pPlayer);
 
 // botcombat.cpp
 bool botCanSeePlayer(PLAYER *pPlayer, PLAYER *pOther);

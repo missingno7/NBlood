@@ -38,10 +38,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "warp.h"
 #include "botai.h"
 
-// Heights are in z units. A standing jump lifts Caleb's feet a little over
-// 72 pixels (jump velocity 0xbaaaa against gravity 58254 per frame).
-#define kBotJumpRise    (68<<8)
+// Heights are in z units. A standing jump lifts Caleb a little over 72
+// pixels (jump velocity 0xbaaaa against gravity 58254 per frame); on top of
+// that comes the step ClipMove lets the body climb anyway.
+#define kBotJumpLift    (64<<8)
 #define kBotMaxDrop     (320<<8)
+#define kBotSafeDrop    (192<<8)    // falls taken without a reason
 #define kBotRouteAge    kBotFPS
 #define kBotCheckFrames 12
 #define kBotAvoidFrames (kBotFPS*12)
@@ -50,12 +52,18 @@ static short botQueue[kMaxSectors];
 static short botParent[kMaxSectors];
 static short botVia[kMaxSectors];
 static uint8_t botFlags[kMaxSectors];
+// Where each queue entry was entered, and whether it is a sprite we stand on
+// above the sector's real floor (a bridge over a pit).
+static vec2_t botEntry[kMaxSectors];
+static int botEntryZ[kMaxSectors];
+static uint8_t botElevated[kMaxSectors];
 static char botVisited[(kMaxSectors+7)>>3];
 
 struct BOTBODY
 {
     int nRadius, nCeilDist, nFloorDist;
     int nHeight, nCrouchHeight;
+    int nStep;      // highest floor step walked up without jumping
 };
 
 static void botGetBody(PLAYER *pPlayer, BOTBODY *pBody)
@@ -68,6 +76,9 @@ static void botGetBody(PLAYER *pPlayer, BOTBODY *pBody)
     pBody->nFloorDist = (bottom-pSprite->z)/4;
     pBody->nHeight = bottom-top;
     pBody->nCrouchHeight = pBody->nHeight*5/8;
+    // ClipMove refuses a step when the body's origin is below the new floor
+    // minus the floor distance; the origin sits (bottom-z) above the feet.
+    pBody->nStep = ClipLow((bottom-pSprite->z)-pBody->nFloorDist-256, 0);
 }
 
 void botNavReset(BOTINFO *pBot)
@@ -126,8 +137,8 @@ static bool botIsUnderwater(int nSector)
     return pXSector && pXSector->Underwater;
 }
 
-// A sector the player can set in motion: doors, lifts and the like.
-static bool botSectorOperable(int nSector)
+// Doors, lifts and the like.
+static bool botSectorMoves(int nSector)
 {
     XSECTOR *pXSector = botXSector(nSector);
     if (!pXSector || pXSector->locked)
@@ -141,7 +152,34 @@ static bool botSectorOperable(int nSector)
     case kSectorRotate:
     case kSectorRotateMarked:
     case kSectorRotateStep:
-        return pXSector->Push || pXSector->Wallpush || pXSector->Enter;
+        return true;
+    }
+    return false;
+}
+
+static bool botWallPushable(int nWall)
+{
+    if (nWall < 0)
+        return false;
+    int nXWall = wall[nWall].extra;
+    return nXWall > 0 && nXWall < kMaxXWalls && xwall[nXWall].triggerPush && !xwall[nXWall].locked;
+}
+
+// Whether pressing action at this portal can set a door going. Blood has
+// three ways: the door sector reacts to a push on its walls (Wallpush) or
+// on itself (Push), or the wall carries its own push trigger aimed at it.
+static bool botPortalOperable(int nFrom, int nWall, int nTo)
+{
+    if (!botSectorMoves(nTo) && !botSectorMoves(nFrom))
+        return false;
+    if (botWallPushable(nWall) || botWallPushable(wall[nWall].nextwall))
+        return true;
+    int nSectors[2] = { nTo, nFrom };
+    for (int i = 0; i < 2; i++)
+    {
+        XSECTOR *pXSector = botXSector(nSectors[i]);
+        if (pXSector && botSectorMoves(nSectors[i]) && (pXSector->Wallpush || pXSector->Push || pXSector->Enter))
+            return true;
     }
     return false;
 }
@@ -173,26 +211,46 @@ static int botLowestFloor(int nSector, int nFloor)
     return ClipLow(nFloor, ClipLow(pXSector->onFloorZ, pXSector->offFloorZ));
 }
 
-// Can a player walk through this portal, and what does it take? Returns -1
-// when the portal is not usable right now or ever as far as we can tell.
-static int botPortalFlags(const BOTBODY *pBody, int nFrom, int nWall, int nTo)
+// The surface the body would stand on at (x,y) coming from height nRefZ:
+// the sector floor, or a blocking sprite above it such as a bridge. Only
+// what is below jumping reach of nRefZ counts, not lamps or pillar tops.
+static int botSupportFloor(const BOTBODY *pBody, int nSector, int x, int y, int nRefZ)
 {
-    walltype *pWall = &wall[nWall];
-    if (pWall->cstat & 1)
-        return -1;
-    int x = (pWall->x+wall[pWall->point2].x)>>1;
-    int y = (pWall->y+wall[pWall->point2].y)>>1;
-    int nFromCeil, nFromFloor, nToCeil, nToFloor;
-    getzsofslope(nFrom, x, y, &nFromCeil, &nFromFloor);
-    getzsofslope(nTo, x, y, &nToCeil, &nToFloor);
+    int nCeil, nFloor;
+    getzsofslope(nSector, x, y, &nCeil, &nFloor);
+    int nCeilZ, nCeilHit, nFloorZ, nFloorHit;
+    int z = ClipLow(nCeil+256, nRefZ-kBotJumpLift-pBody->nStep);
+    if (z >= nFloor)
+        return nFloor;
+    for (int i = 0; i < 4; i++)
+    {
+        GetZRangeAtXYZ(x, y, z, nSector, &nCeilZ, &nCeilHit, &nFloorZ, &nFloorHit, pBody->nRadius, CLIPMASK0);
+        // Someone's head is not a bridge: look below them.
+        if ((nFloorHit & 0xc000) != 0xc000 || sprite[nFloorHit & 0x3fff].statnum != kStatDude)
+            break;
+        int top, bottom;
+        GetSpriteExtents(&sprite[nFloorHit & 0x3fff], &top, &bottom);
+        z = bottom+256;
+        nFloorZ = nFloor;
+        if (z >= nFloor)
+            break;
+    }
+    return ClipHigh(nFloorZ, nFloor);
+}
 
+// Can a player walk through this portal, given the heights on both sides?
+static int botPortalCheck(const BOTBODY *pBody, int nFrom, int nWall, int nTo,
+    int nFromCeil, int nFromFloor, int nToCeil, int nToFloor, const char **pzWhy)
+{
     int nFlags = 0;
     bool bWater = botIsUnderwater(nFrom) || botIsUnderwater(nTo);
     int nWindow = ClipHigh(nFromFloor, nToFloor)-ClipLow(nFromCeil, nToCeil);
     if (nWindow < pBody->nCrouchHeight)
     {
-        if (!botSectorOperable(nTo) && !botSectorOperable(nFrom))
+        *pzWhy = "opening too low";
+        if (!botPortalOperable(nFrom, nWall, nTo))
             return -1;
+        *pzWhy = "door does not open far enough";
         int nOpenWindow = ClipHigh(nFromFloor, nToFloor)-ClipLow(botOpenCeiling(nFrom, nFromCeil), botOpenCeiling(nTo, nToCeil));
         // A floor that drops (lowering bridge) also opens the way.
         nOpenWindow = ClipLow(nOpenWindow, ClipHigh(botLowestFloor(nFrom, nFromFloor), botLowestFloor(nTo, nToFloor))-ClipLow(nFromCeil, nToCeil));
@@ -204,26 +262,114 @@ static int botPortalFlags(const BOTBODY *pBody, int nFrom, int nWall, int nTo)
         nFlags |= kBotPortalCrouch;
 
     int nRise = nFromFloor-nToFloor;
-    if (nRise > kBotJumpRise && !bWater)
+    if (nRise > kBotJumpLift+pBody->nStep && !bWater)
     {
+        *pzWhy = "too high to jump";
         if (!botSectorMovesFloor(nTo) && !botSectorMovesFloor(nFrom))
             return -1;
         nFlags |= kBotPortalLift;
     }
-    else if (nRise > pBody->nFloorDist)
+    else if (nRise > pBody->nStep)
         nFlags |= kBotPortalJump;
+    *pzWhy = "deadly drop";
     if (-nRise > kBotMaxDrop && !bWater)
         return -1;
+    if (-nRise > kBotSafeDrop && !bWater)
+        nFlags |= kBotPortalDrop;
+    *pzWhy = "";
     return nFlags;
 }
 
-static int botLinkDestination(int nSector, int *pFlags)
+static void botPortalNormal(const BOTBODY *pBody, int nWall, int *nx, int *ny)
 {
-    *pFlags = kBotPortalLink;
-    int nLink = gUpperLink[nSector];
-    if (nLink >= 0 && sprite[nLink].owner >= 0 && sprite[nLink].owner < kMaxSprites)
-        return sprite[sprite[nLink].owner].sectnum;
-    nLink = gLowerLink[nSector];
+    int dx = wall[wall[nWall].point2].x-wall[nWall].x, dy = wall[wall[nWall].point2].y-wall[nWall].y;
+    int nLength = ClipLow(ksqrt(dx*dx+dy*dy), 1);
+    // Out of the sector owning the wall.
+    *nx = (int)((int64_t)dy*(pBody->nRadius+48)/nLength);
+    *ny = (int)((int64_t)-dx*(pBody->nRadius+48)/nLength);
+}
+
+// A portal over a pit or onto a high ledge may still be crossed where a
+// sprite carries the body. Look along the opening for such a place, the
+// one nearest (nx,ny) when asked. Returns the flags for crossing there.
+static int botPortalBridge(const BOTBODY *pBody, int nFrom, int nWall, int nTo, int nearX, int nearY, vec2_t *pCross, vec2_t *pApproach)
+{
+    walltype *pWall = &wall[nWall];
+    int dx = wall[pWall->point2].x-pWall->x, dy = wall[pWall->point2].y-pWall->y;
+    int ox, oy;
+    botPortalNormal(pBody, nWall, &ox, &oy);
+    int nBest = -1, nBestDist = INT32_MAX;
+    for (int i = 1; i < 8; i++)
+    {
+        int px = pWall->x+dx*i/8, py = pWall->y+dy*i/8;
+        int tx = px+ox, ty = py+oy, fx = px-ox, fy = py-oy;
+        if (inside(tx, ty, nTo) != 1 || inside(fx, fy, nFrom) != 1)
+            continue;
+        int nFromCeil, nFromFloor, nToCeil, nToFloor;
+        getzsofslope(nFrom, px, py, &nFromCeil, &nFromFloor);
+        getzsofslope(nTo, px, py, &nToCeil, &nToFloor);
+        int nRef = ClipHigh(nFromFloor, nToFloor);
+        nFromFloor = botSupportFloor(pBody, nFrom, fx, fy, nRef);
+        nToFloor = botSupportFloor(pBody, nTo, tx, ty, nRef);
+        const char *pzWhy;
+        int nFlags = botPortalCheck(pBody, nFrom, nWall, nTo, nFromCeil, nFromFloor, nToCeil, nToFloor, &pzWhy);
+        if (nFlags < 0)
+            continue;
+        int nDist = approxDist(px-nearX, py-nearY);
+        if (nDist < nBestDist)
+        {
+            nBestDist = nDist;
+            nBest = nFlags|kBotPortalBridge;
+            if (pCross)
+            {
+                pCross->x = tx;
+                pCross->y = ty;
+                pApproach->x = fx;
+                pApproach->y = fy;
+            }
+        }
+    }
+    return nBest;
+}
+
+// Can a player walk through this portal, and what does it take? Returns -1
+// when the portal is not usable right now or ever as far as we can tell.
+static int botPortalFlags(const BOTBODY *pBody, int nFrom, int nWall, int nTo, const char **pzWhy = NULL)
+{
+    const char *pzDummy;
+    if (!pzWhy)
+        pzWhy = &pzDummy;
+    walltype *pWall = &wall[nWall];
+    *pzWhy = "blocking wall";
+    if (pWall->cstat & 1)
+        return -1;
+    int x = (pWall->x+wall[pWall->point2].x)>>1;
+    int y = (pWall->y+wall[pWall->point2].y)>>1;
+    int nFromCeil, nFromFloor, nToCeil, nToFloor;
+    getzsofslope(nFrom, x, y, &nFromCeil, &nFromFloor);
+    getzsofslope(nTo, x, y, &nToCeil, &nToFloor);
+    int nFlags = botPortalCheck(pBody, nFrom, nWall, nTo, nFromCeil, nFromFloor, nToCeil, nToFloor, pzWhy);
+    // Sector floors say no or say "fall": a sprite may still carry us over.
+    if (nFlags < 0 && (!strcmp(*pzWhy, "deadly drop") || !strcmp(*pzWhy, "too high to jump")))
+    {
+        int nBridge = botPortalBridge(pBody, nFrom, nWall, nTo, x, y, NULL, NULL);
+        if (nBridge >= 0)
+        {
+            *pzWhy = "";
+            return nBridge;
+        }
+    }
+    else if (nFlags >= 0 && (nFlags & kBotPortalDrop))
+    {
+        int nBridge = botPortalBridge(pBody, nFrom, nWall, nTo, x, y, NULL, NULL);
+        if (nBridge >= 0 && !(nBridge & kBotPortalDrop))
+            return nBridge;
+    }
+    return nFlags;
+}
+
+static int botLinkDestination(int nLink)
+{
     if (nLink >= 0 && sprite[nLink].owner >= 0 && sprite[nLink].owner < kMaxSprites)
         return sprite[sprite[nLink].owner].sectnum;
     return -1;
@@ -242,11 +388,35 @@ static int botTeleportDestination(int nSector)
     return sprite[nMarker].sectnum;
 }
 
-// Breadth-first search from nFrom to nTo. On success returns the index of the
-// queue entry holding the first step and the number of steps.
-static int botSearch(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo, int *pLength)
+// Standing on a sprite well above the sector floor?
+static bool botOnSprite(const BOTBODY *pBody, int nSector, int x, int y, int nRefZ, int *pZ)
 {
-    if ((unsigned)nFrom >= (unsigned)numsectors || (unsigned)nTo >= (unsigned)numsectors)
+    *pZ = botSupportFloor(pBody, nSector, x, y, nRefZ);
+    return getflorzofslope(nSector, x, y)-*pZ > kBotSafeDrop;
+}
+
+// Ground all the way from a to b inside a sector, at about the same height.
+static bool botSupportedPath(const BOTBODY *pBody, int nSector, vec2_t a, int nZ, vec2_t b)
+{
+    int nDist = approxDist(b.x-a.x, b.y-a.y);
+    for (int nStep = 0; nStep <= nDist; nStep += 128)
+    {
+        int x = a.x+(int)((int64_t)(b.x-a.x)*nStep/ClipLow(nDist, 1));
+        int y = a.y+(int)((int64_t)(b.y-a.y)*nStep/ClipLow(nDist, 1));
+        if (botSupportFloor(pBody, nSector, x, y, nZ)-nZ > pBody->nStep)
+            return false;
+    }
+    return true;
+}
+
+// Breadth-first search from nFrom to nTo. On success returns the index of the
+// queue entry holding the first step and the number of steps. A sector only
+// stood in on a bridge is left only where the bridge leads, so the search
+// keeps track of where each sector was entered.
+static int botSearch(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo, int *pLength, const vec3_t *pStart = NULL)
+{
+    // nTo < 0 floods everything reachable (botVisited) and finds nothing.
+    if ((unsigned)nFrom >= (unsigned)numsectors || nTo >= numsectors)
         return -1;
     BOTNAV *pNav = pBot ? &pBot->nav : NULL;
     memset(botVisited, 0, sizeof(botVisited));
@@ -254,28 +424,66 @@ static int botSearch(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo, in
     botParent[0] = -1;
     botVia[0] = -1;
     botFlags[0] = 0;
+    botElevated[0] = 0;
+    if (pStart)
+    {
+        botEntry[0].x = pStart->x;
+        botEntry[0].y = pStart->y;
+        botElevated[0] = botOnSprite(pBody, nFrom, pStart->x, pStart->y, pStart->z, &botEntryZ[0]);
+    }
     SetBitString(botVisited, nFrom);
     int nFound = -1;
     int nTail = 1;
-    for (int nHead = 0; nHead < nTail && nFound < 0; nHead++)
+    for (int nHead = 0; nHead < nTail && nFound < 0 && nTail < kMaxSectors-1; nHead++)
     {
         int nSector = botQueue[nHead];
         int nStart = sector[nSector].wallptr, nEnd = nStart+sector[nSector].wallnum;
-        for (int nWall = nStart; nWall < nEnd; nWall++)
+        for (int nWall = nStart; nWall < nEnd && nTail < kMaxSectors-1; nWall++)
         {
             int nNext = wall[nWall].nextsector;
-            if (nNext < 0 || TestBitString(botVisited, nNext))
+            if (nNext < 0)
                 continue;
             if (pNav && botAvoided(pNav, nWall, pBot->nFrame))
                 continue;
             int nFlags = botPortalFlags(pBody, nSector, nWall, nNext);
             if (nFlags < 0)
                 continue;
+            vec2_t cross;
+            cross.x = (wall[nWall].x+wall[wall[nWall].point2].x)>>1;
+            cross.y = (wall[nWall].y+wall[wall[nWall].point2].y)>>1;
+            bool bElevated = false;
+            if (botElevated[nHead] || (nFlags & kBotPortalBridge))
+            {
+                vec2_t approach;
+                vec2_t aim = botElevated[nHead] ? botEntry[nHead] : cross;
+                if (botPortalBridge(pBody, nSector, nWall, nNext, aim.x, aim.y, &cross, &approach) < 0)
+                    continue;
+                if (botElevated[nHead] && !botSupportedPath(pBody, nSector, botEntry[nHead], botEntryZ[nHead], approach))
+                    continue;
+                int nZ;
+                int nRef = botElevated[nHead] ? botEntryZ[nHead] : getflorzofslope(nSector, approach.x, approach.y);
+                bElevated = botOnSprite(pBody, nNext, cross.x, cross.y, nRef, &nZ);
+                botEntryZ[nTail] = nZ;
+            }
+            if (bElevated)
+            {
+                // The same pit may hold several bridges: it is a new place
+                // unless we already came onto this one.
+                bool bSeen = false;
+                for (int i = 1; i < nTail && !bSeen; i++)
+                    bSeen = botQueue[i] == nNext && approxDist(botEntry[i].x-cross.x, botEntry[i].y-cross.y) < 1024;
+                if (bSeen)
+                    continue;
+            }
+            else if (TestBitString(botVisited, nNext))
+                continue;
             SetBitString(botVisited, nNext);
             botQueue[nTail] = nNext;
             botParent[nTail] = nHead;
             botVia[nTail] = nWall;
             botFlags[nTail] = nFlags;
+            botEntry[nTail] = cross;
+            botElevated[nTail] = bElevated;
             if (nNext == nTo)
             {
                 nFound = nTail++;
@@ -286,18 +494,18 @@ static int botSearch(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo, in
         if (nFound >= 0)
             break;
         // Water surfaces, stacked sectors and teleporters connect sectors without walls.
-        int nLinkFlags;
-        int nDests[2] = { botLinkDestination(nSector, &nLinkFlags), botTeleportDestination(nSector) };
-        for (int i = 0; i < 2 && nFound < 0; i++)
+        int nDests[3] = { botLinkDestination(gUpperLink[nSector]), botLinkDestination(gLowerLink[nSector]), botTeleportDestination(nSector) };
+        for (int i = 0; i < 3 && nFound < 0; i++)
         {
             int nNext = nDests[i];
-            if (nNext < 0 || nNext >= numsectors || TestBitString(botVisited, nNext))
+            if (nNext < 0 || nNext >= numsectors || TestBitString(botVisited, nNext) || nTail >= kMaxSectors-1)
                 continue;
             SetBitString(botVisited, nNext);
             botQueue[nTail] = nNext;
             botParent[nTail] = nHead;
             botVia[nTail] = -1;
             botFlags[nTail] = kBotPortalLink;
+            botElevated[nTail] = 0;
             if (nNext == nTo)
                 nFound = nTail;
             nTail++;
@@ -324,7 +532,9 @@ bool botNavReachable(PLAYER *pPlayer, int nSector)
     BOTBODY body;
     botGetBody(pPlayer, &body);
     BOTINFO *pBot = &gBotInfo[pPlayer->nPlayer];
-    return botSearch(pBot, &body, pPlayer->pSprite->sectnum, nSector, NULL) >= 0;
+    spritetype *pSprite = pPlayer->pSprite;
+    vec3_t start = { pSprite->x, pSprite->y, pSprite->z+(body.nFloorDist<<2) };
+    return botSearch(pBot, &body, pSprite->sectnum, nSector, NULL, &start) >= 0;
 }
 
 // Point beyond the portal where the body fits, preferring the part of the
@@ -384,7 +594,84 @@ static bool botStraightClear(const BOTBODY *pBody, int x, int y, int z, int nSec
     int nDist = ksqrt(dx*dx+dy*dy);
     if (nDist < 16)
         return true;
-    return botClearDist(pBody, x, y, z, nSector, dx, dy) >= nDist-24;
+    if (botClearDist(pBody, x, y, z, nSector, dx, dy) < nDist-24)
+        return false;
+    // A sudden drop somewhere along the way? (Ramps and stairs are fine.)
+    int nLast = z+(pBody->nFloorDist<<2);
+    for (int nStep = 256; nStep < nDist; nStep += 256)
+    {
+        int sx = x+(int)((int64_t)dx*nStep/nDist), sy = y+(int)((int64_t)dy*nStep/nDist);
+        short nSect = nSector;
+        updatesector(sx, sy, &nSect);
+        if (nSect < 0)
+            return false;
+        int nSupport = botSupportFloor(pBody, nSect, sx, sy, nLast);
+        if (nSupport-nLast > kBotSafeDrop)
+            return false;
+        nLast = nSupport;
+    }
+    return true;
+}
+
+bool botNavOnBridge(PLAYER *pPlayer)
+{
+    BOTBODY body;
+    botGetBody(pPlayer, &body);
+    int nZ;
+    spritetype *pSprite = pPlayer->pSprite;
+    return botOnSprite(&body, pSprite->sectnum, pSprite->x, pSprite->y, pSprite->z+(body.nFloorDist<<2), &nZ);
+}
+
+bool botNavLedge(PLAYER *pPlayer, int nAng, int nDist)
+{
+    BOTBODY body;
+    botGetBody(pPlayer, &body);
+    spritetype *pSprite = pPlayer->pSprite;
+    int nFeet = pSprite->z+(body.nFloorDist<<2);
+    for (int nStep = nDist/2; nStep <= nDist; nStep += nDist/2)
+    {
+        int x = pSprite->x+mulscale30(nStep, Cos(nAng)), y = pSprite->y+mulscale30(nStep, Sin(nAng));
+        short nSect = pSprite->sectnum;
+        updatesector(x, y, &nSect);
+        if (nSect < 0)
+            continue;
+        if (botSupportFloor(&body, nSect, x, y, nFeet)-nFeet > kBotSafeDrop)
+            return true;
+    }
+    return false;
+}
+
+// Last check before moving: do not walk off an edge unless the route means to.
+void botNavSafeMove(BOTINFO *pBot, PLAYER *pPlayer, BOTMOVE *pMove)
+{
+    if (!pMove->nSpeed || (!pMove->dx && !pMove->dy) || pPlayer->posture == kPostureSwim)
+        return;
+    if ((pBot->nav.nPortalFlags & kBotPortalDrop) && pBot->nav.nNextSect >= 0)
+        return;
+    int nSprite = pPlayer->nSprite;
+    if (approxDist(xvel[nSprite], yvel[nSprite]) > 0x20000 && botNavLedge(pPlayer, getangle(xvel[nSprite], yvel[nSprite]), 448))
+    {
+        // Sliding toward an edge: push back against it.
+        int nBack = getangle(-xvel[nSprite], -yvel[nSprite]);
+        pMove->dx = Cos(nBack)>>16;
+        pMove->dy = Sin(nBack)>>16;
+        pMove->nSpeed = 2048;
+        return;
+    }
+    int nAng = getangle(pMove->dx, pMove->dy);
+    if (!botNavLedge(pPlayer, nAng, 448))
+        return;
+    for (int i = 1; i <= 4; i++)
+    {
+        int nTry = (nAng+((i+1)>>1)*256*((i&1) ? 1 : -1))&kAngMask;
+        if (!botNavLedge(pPlayer, nTry, 448))
+        {
+            pMove->dx = Cos(nTry)>>16;
+            pMove->dy = Sin(nTry)>>16;
+            return;
+        }
+    }
+    pMove->nSpeed = 0;
 }
 
 // The current sector may be concave or hold pillars. When the straight line
@@ -457,11 +744,16 @@ static int botSteer(BOTINFO *pBot, const BOTBODY *pBody, PLAYER *pPlayer, int tx
         return pNav->nSteerAng;
     }
     // Feel around: the heading closest to the target that gets us somewhere.
+    // On a bridge the headings are tried finer, and none may leave it.
+    bool bBridge = botNavOnBridge(pPlayer);
+    int nStep = bBridge ? 48 : 128;
     int nBestAng = nDirect, nBestScore = INT32_MIN;
-    for (int i = 0; i <= 12; i++)
+    for (int i = 0; i <= (bBridge ? 20 : 12); i++)
     {
-        int nDelta = ((i+1)>>1)*128*((i&1) ? 1 : -1);
+        int nDelta = ((i+1)>>1)*nStep*((i&1) ? 1 : -1);
         int nAng = (nDirect+nDelta)&kAngMask;
+        if (botNavLedge(pPlayer, nAng, 384))
+            continue;
         int nGain = botNavProbe(pPlayer, nAng, 384);
         int nScore = nGain*(4096+(Cos(nDelta)>>18))/4096-klabs(nDelta)/8;
         if (nScore > nBestScore)
@@ -475,7 +767,7 @@ static int botSteer(BOTINFO *pBot, const BOTBODY *pBody, PLAYER *pPlayer, int tx
     return nBestAng;
 }
 
-static void botFindRoute(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo)
+static void botFindRoute(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo, const vec3_t *pStart)
 {
     BOTNAV *pNav = &pBot->nav;
     pNav->nRouteFrom = nFrom;
@@ -484,7 +776,7 @@ static void botFindRoute(BOTINFO *pBot, const BOTBODY *pBody, int nFrom, int nTo
     pNav->nNextSect = -1;
     pNav->nPortal = -1;
     int nLength = 0;
-    int nStep = botSearch(pBot, pBody, nFrom, nTo, &nLength);
+    int nStep = botSearch(pBot, pBody, nFrom, nTo, &nLength, pStart);
     if (nStep < 0)
         return;
     pNav->nNextSect = botQueue[nStep];
@@ -593,14 +885,19 @@ bool botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
     if (nSector >= 0 && nSector != nCur)
     {
         if (pNav->nRouteFrom != nCur || pNav->nRouteTo != nSector || pBot->nFrame-pNav->nRouteFrame > kBotRouteAge)
-            botFindRoute(pBot, &body, nCur, nSector);
+        {
+            vec3_t start = { pSprite->x, pSprite->y, pSprite->z+(body.nFloorDist<<2) };
+            botFindRoute(pBot, &body, nCur, nSector, &start);
+        }
         if (pNav->nNextSect >= 0)
         {
             nFlags = pNav->nPortalFlags;
             if (pNav->nPortal >= 0)
             {
                 vec2_t cross, approach;
-                botPortalCrossing(&body, pNav->nPortal, pSprite->x, pSprite->y, &cross, &approach);
+                if (!(nFlags & kBotPortalBridge)
+                    || botPortalBridge(&body, nCur, pNav->nPortal, pNav->nNextSect, pSprite->x, pSprite->y, &cross, &approach) < 0)
+                    botPortalCrossing(&body, pNav->nPortal, pSprite->x, pSprite->y, &cross, &approach);
                 pNav->crossing = cross;
                 tx = cross.x;
                 ty = cross.y;
@@ -699,7 +996,11 @@ bool botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
                 return true;
             }
             if (bOpen)
+            {
+                if (pNav->nDoorWait > 0)
+                    pBot->nDoorsOpened++;
                 pNav->nDoorWait = 0;
+            }
             if (nNow >= 0 && (nNow & kBotPortalJump))
                 pMove->bJump = nWallDist < body.nRadius+320;
         }
@@ -757,4 +1058,211 @@ int botNavRoamSector(BOTINFO *pBot, PLAYER *pPlayer)
             return nSector;
     }
     return -1;
+}
+
+// bot_debug 2: which parts of the map the route search can reach from the
+// start spots, and why it refuses the portals at the edge of that area.
+void botNavReport(PLAYER *pPlayer)
+{
+    BOTBODY body;
+    botGetBody(pPlayer, &body);
+    static char reached[(kMaxSectors+7)>>3];
+    memset(reached, 0, sizeof(reached));
+    for (int i = 0; i < kMaxPlayers; i++)
+    {
+        int nStart = gStartZone[i].sectnum;
+        if (nStart < 0 || nStart >= numsectors || TestBitString(reached, nStart))
+            continue;
+        botSearch(NULL, &body, nStart, -2, NULL);
+        for (int j = 0; j < kMaxSectors; j++)
+            if (TestBitString(botVisited, j))
+                SetBitString(reached, j);
+    }
+    int nReached = 0;
+    for (int i = 0; i < numsectors; i++)
+        nReached += TestBitString(reached, i) ? 1 : 0;
+    OSD_Printf("Bot nav report: %d of %d sectors reachable from the start spots (step %d, jump %d, height %d, crouch %d)\n",
+        nReached, numsectors, body.nStep, kBotJumpLift+body.nStep, body.nHeight, body.nCrouchHeight);
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        int nDest[3] = { botLinkDestination(gUpperLink[nSector]), botLinkDestination(gLowerLink[nSector]), botTeleportDestination(nSector) };
+        if (sector[nSector].type == kSectorTeleport || nDest[0] >= 0 || nDest[1] >= 0)
+            OSD_Printf("  link sector %d (type %d): down %d up %d teleport %d\n", nSector, (int)sector[nSector].type, nDest[0], nDest[1], nDest[2]);
+    }
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        for (int nWall = sector[nSector].wallptr; nWall < sector[nSector].wallptr+sector[nSector].wallnum; nWall++)
+        {
+            int nNext = wall[nWall].nextsector;
+            if (nNext < 0)
+                continue;
+            int nFlags = botPortalFlags(&body, nSector, nWall, nNext);
+            if (nFlags >= 0 && (nFlags & kBotPortalBridge))
+                OSD_Printf("  bridge %d -> %d (wall %d, flags %d)\n", nSector, nNext, nWall, nFlags);
+        }
+    }
+    // Traps: reachable sectors with no way back to the first start spot.
+    static char trapped[(kMaxSectors+7)>>3];
+    memset(trapped, 0, sizeof(trapped));
+    int nHome = gStartZone[0].sectnum;
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        if (!TestBitString(reached, nSector) || nSector == nHome)
+            continue;
+        botSearch(NULL, &body, nSector, -2, NULL);
+        if (!TestBitString(botVisited, nHome))
+        {
+            SetBitString(trapped, nSector);
+            OSD_Printf("  trap sector %d (floor %d, type %d)\n", nSector, (int)sector[nSector].floorz, (int)sector[nSector].type);
+        }
+    }
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        if (!TestBitString(trapped, nSector))
+            continue;
+        for (int nWall = sector[nSector].wallptr; nWall < sector[nSector].wallptr+sector[nSector].wallnum; nWall++)
+        {
+            int nNext = wall[nWall].nextsector;
+            if (nNext < 0 || TestBitString(trapped, nNext))
+                continue;
+            const char *pzWhy;
+            botPortalFlags(&body, nSector, nWall, nNext, &pzWhy);
+            int x = (wall[nWall].x+wall[wall[nWall].point2].x)>>1;
+            int y = (wall[nWall].y+wall[wall[nWall].point2].y)>>1;
+            OSD_Printf("  trap exit %d -> %d (wall %d at %d,%d, next type %d): %s, rise %d\n", nSector, nNext, nWall, x, y,
+                (int)sector[nNext].type, pzWhy, getflorzofslope(nSector, x, y)-getflorzofslope(nNext, x, y));
+        }
+    }
+    // And how the traps are entered.
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        if (!TestBitString(reached, nSector) || TestBitString(trapped, nSector))
+            continue;
+        for (int nWall = sector[nSector].wallptr; nWall < sector[nSector].wallptr+sector[nSector].wallnum; nWall++)
+        {
+            int nNext = wall[nWall].nextsector;
+            if (nNext < 0 || !TestBitString(trapped, nNext))
+                continue;
+            const char *pzWhy;
+            int nFlags = botPortalFlags(&body, nSector, nWall, nNext, &pzWhy);
+            int x = (wall[nWall].x+wall[wall[nWall].point2].x)>>1;
+            int y = (wall[nWall].y+wall[wall[nWall].point2].y)>>1;
+            OSD_Printf("  trap entry %d -> %d (wall %d at %d,%d): flags %d %s, rise %d\n", nSector, nNext, nWall, x, y,
+                nFlags, pzWhy, getflorzofslope(nSector, x, y)-getflorzofslope(nNext, x, y));
+        }
+    }
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        if (!TestBitString(reached, nSector))
+            continue;
+        for (int nWall = sector[nSector].wallptr; nWall < sector[nSector].wallptr+sector[nSector].wallnum; nWall++)
+        {
+            int nNext = wall[nWall].nextsector;
+            if (nNext < 0 || TestBitString(reached, nNext))
+                continue;
+            const char *pzWhy;
+            botPortalFlags(&body, nSector, nWall, nNext, &pzWhy);
+            int x = (wall[nWall].x+wall[wall[nWall].point2].x)>>1;
+            int y = (wall[nWall].y+wall[wall[nWall].point2].y)>>1;
+            OSD_Printf("  sector %d -> %d (wall %d at %d,%d, next type %d): %s, rise %d\n", nSector, nNext, nWall, x, y,
+                (int)sector[nNext].type, pzWhy, getflorzofslope(nSector, x, y)-getflorzofslope(nNext, x, y));
+        }
+    }
+}
+
+// bot_debug 3: draw the map from above as botnav.svg in the current
+// directory. Grey: reachable from the start spots, orange: no way back
+// from there, black: unreachable. Portals: green walkable, cyan bridge,
+// red refused. Blocking sprites are drawn by their footprint, start spots blue.
+void botNavDrawMap(PLAYER *pPlayer)
+{
+    BOTBODY body;
+    botGetBody(pPlayer, &body);
+    FILE *pFile = fopen("botnav.svg", "w");
+    if (!pFile)
+        return;
+    int x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+    for (int i = 0; i < numwalls; i++)
+    {
+        x0 = ClipHigh(x0, wall[i].x); y0 = ClipHigh(y0, wall[i].y);
+        x1 = ClipLow(x1, wall[i].x); y1 = ClipLow(y1, wall[i].y);
+    }
+    fprintf(pFile, "<svg xmlns='http://www.w3.org/2000/svg' viewBox='%d %d %d %d' width='2048' height='%d'>\n",
+        x0-512, y0-512, x1-x0+1024, y1-y0+1024, (int)(2048.0*(y1-y0+1024)/(x1-x0+1024)));
+    fprintf(pFile, "<rect x='%d' y='%d' width='%d' height='%d' fill='black'/>\n", x0-512, y0-512, x1-x0+1024, y1-y0+1024);
+    static char reached[(kMaxSectors+7)>>3];
+    memset(reached, 0, sizeof(reached));
+    for (int i = 0; i < kMaxPlayers; i++)
+    {
+        int nStart = gStartZone[i].sectnum;
+        if (nStart < 0 || nStart >= numsectors)
+            continue;
+        botSearch(NULL, &body, nStart, -2, NULL);
+        for (int j = 0; j < kMaxSectors; j++)
+            if (TestBitString(botVisited, j))
+                SetBitString(reached, j);
+    }
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        const char *pzFill = "#202020";
+        if (TestBitString(reached, nSector))
+        {
+            botSearch(NULL, &body, nSector, -2, NULL);
+            pzFill = TestBitString(botVisited, gStartZone[0].sectnum) ? "#606060" : "#b06000";
+        }
+        fprintf(pFile, "<path fill='%s' fill-rule='evenodd' d='", pzFill);
+        int nStart = sector[nSector].wallptr, nEnd = nStart+sector[nSector].wallnum;
+        int nLoop = nStart;
+        for (int nWall = nStart; nWall < nEnd; nWall++)
+        {
+            fprintf(pFile, "%s%d %d ", nWall == nLoop ? "M" : "L", wall[nWall].x, wall[nWall].y);
+            if (wall[nWall].point2 < nWall)
+            {
+                fprintf(pFile, "Z ");
+                nLoop = nWall+1;
+            }
+        }
+        fprintf(pFile, "'/>\n");
+        int cx = 0, cy = 0;
+        for (int nWall = nStart; nWall < nEnd; nWall++)
+        {
+            cx += wall[nWall].x;
+            cy += wall[nWall].y;
+        }
+        fprintf(pFile, "<text x='%d' y='%d' font-size='160' fill='white'>%d</text>\n", cx/ClipLow(nEnd-nStart, 1), cy/ClipLow(nEnd-nStart, 1), nSector);
+    }
+    for (int nSector = 0; nSector < numsectors; nSector++)
+    {
+        for (int nWall = sector[nSector].wallptr; nWall < sector[nSector].wallptr+sector[nSector].wallnum; nWall++)
+        {
+            walltype *pWall = &wall[nWall], *pWall2 = &wall[pWall->point2];
+            const char *pzColor = "white";
+            if (pWall->nextsector >= 0)
+            {
+                int nFlags = botPortalFlags(&body, nSector, nWall, pWall->nextsector);
+                pzColor = nFlags < 0 ? "red" : (nFlags & kBotPortalBridge) ? "cyan" : "#00c000";
+            }
+            // Offset each side of a portal a little so both directions show.
+            int dx = pWall2->x-pWall->x, dy = pWall2->y-pWall->y, nLength = ClipLow(ksqrt(dx*dx+dy*dy), 1);
+            int ox = -dy*24/nLength, oy = dx*24/nLength;
+            fprintf(pFile, "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='%s' stroke-width='24'/>\n",
+                pWall->x+ox, pWall->y+oy, pWall2->x+ox, pWall2->y+oy, pzColor);
+        }
+    }
+    for (int nSprite = 0; nSprite < kMaxSprites; nSprite++)
+    {
+        spritetype *pSprite = &sprite[nSprite];
+        if (pSprite->statnum >= kMaxStatus || !(pSprite->cstat & 1) || pSprite->statnum == kStatDude)
+            continue;
+        int nWidth = (tilesiz[pSprite->picnum].x*pSprite->xrepeat)>>2;
+        int nDepth = (pSprite->cstat & 48) == 32 ? (tilesiz[pSprite->picnum].y*pSprite->yrepeat)>>2 : 32;
+        fprintf(pFile, "<rect x='%d' y='%d' width='%d' height='%d' fill='%s' opacity='0.8' transform='rotate(%d %d %d)'/>\n",
+            pSprite->x-nWidth/2, pSprite->y-nDepth/2, nWidth, nDepth, (pSprite->cstat & 48) == 32 ? "yellow" : "magenta",
+            ((pSprite->cstat & 48) == 16 ? pSprite->ang*360/2048+90 : pSprite->ang*360/2048), (int)pSprite->x, (int)pSprite->y);
+    }
+    for (int i = 0; i < kMaxPlayers; i++)
+        fprintf(pFile, "<circle cx='%d' cy='%d' r='192' fill='#4060ff'/>\n", gStartZone[i].x, gStartZone[i].y);
+    fprintf(pFile, "</svg>\n");
+    fclose(pFile);
+    OSD_Printf("Wrote botnav.svg\n");
 }

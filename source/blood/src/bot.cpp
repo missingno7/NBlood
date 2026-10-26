@@ -73,8 +73,8 @@ const BOTSKILL gBotSkillInfo[kBotSkillMax+1] =
 static const char *botNames[] =
 {
     "Acolyte", "Fanatic", "Zealot", "Cheogh", "Shial", "Phantasm",
-    "Gargoyle", "Butcher", "Hellhound", "Bloat", "Mime", "Bone Eel",
-    "Gill Beast", "Cerberus", "Ophidian", "Nightwing",
+    "Gargoyle", "Butcher", "Hellhound", "Bloat", "Mime", "Boneeel",
+    "Gillbeast", "Cerberus", "Ophidian", "Nightwing",
 };
 
 struct BOTSTATS
@@ -249,6 +249,10 @@ void botLevelInit(void)
     }
     if (gBotAutopilot && gGameOptions.nGameType >= kGameTypeBloodBath && !gDemo.at1)
         botInitSlot(myconnectindex, gBotSkill, -1);
+    if (gBotDebug >= 2 && gPlayer[myconnectindex].pSprite)
+        botNavReport(&gPlayer[myconnectindex]);
+    if (gBotDebug >= 3 && gPlayer[myconnectindex].pSprite)
+        botNavDrawMap(&gPlayer[myconnectindex]);
     if (gBotSlots)
         OSD_Printf("Bots: %d in game, skill %d\n", gNetPlayers-numplayers, nSkill);
 }
@@ -282,9 +286,9 @@ static void botPrintStats(void)
         }
         BOTSTATS *pStats = &botStats[p];
         PLAYER *pPlayer = &gPlayer[p];
-        OSD_Printf("  %d %-10s frags %3d deaths %3d sectors %4d distance %7d escapes %3d avoids %3d weapon %d health %d\n",
+        OSD_Printf("  %d %-10s frags %3d deaths %3d sectors %4d distance %7d escapes %3d avoids %3d alt %4d doors %2d weapon %d health %d\n",
             p, gProfile[p].name, pPlayer->fragCount, pStats->nDeaths, pStats->nSectors, pStats->nDistance,
-            pStats->nEscapes, gBotInfo[p].nAvoids, pPlayer->curWeapon, pPlayer->pXSprite->health>>4);
+            pStats->nEscapes, gBotInfo[p].nAvoids, gBotInfo[p].nAltShots, gBotInfo[p].nDoorsOpened, pPlayer->curWeapon, pPlayer->pXSprite->health>>4);
     }
 }
 
@@ -314,7 +318,13 @@ static void botThink(int nPlayer, GINPUT *pInput)
     {
         // Respawn after a short, human-like pause.
         if (!pBot->nRespawnWait)
+        {
             botStats[nPlayer].nDeaths++;
+            if (gBotDebug)
+                OSD_Printf("bot %d died: sector %d %d above floor, weapon %d state %d, fragger %d (self %d)\n", nPlayer,
+                    (int)pSprite->sectnum, getflorzofslope(pSprite->sectnum, pSprite->x, pSprite->y)-pSprite->z,
+                    pPlayer->curWeapon, pPlayer->weaponState, pPlayer->fraggerId, (int)pSprite->index);
+        }
         pBot->nRespawnWait++;
         if (pBot->nRespawnWait > kBotFPS*3 || (pBot->nRespawnWait > kBotFPS && botRandRange(pBot, 32) == 0))
             pInput->keyFlags.action = 1;
@@ -454,6 +464,11 @@ static void botThink(int nPlayer, GINPUT *pInput)
         botStats[nPlayer].nEscapes++;
 
     botDodge(pBot, pPlayer, &move);
+    botNavSafeMove(pBot, pPlayer, &move);
+    if (gBotDebug && zvel[pSprite->index] > 0x40000 && getflorzofslope(pSprite->sectnum, pSprite->x, pSprite->y)-pSprite->z > (160<<8) && !pBot->bFalling)
+        OSD_Printf("bot %d falling: sector %d fight %d escape %d portal %d flags %d next %d stuck %d\n", nPlayer, (int)pSprite->sectnum,
+            pBot->bTargetVisible, pBot->nav.nEscape, pBot->nav.nPortal, pBot->nav.nPortalFlags, pBot->nav.nNextSect, pBot->nav.nStuck);
+    pBot->bFalling = zvel[pSprite->index] > 0x40000;
     botUseInventory(pBot, pPlayer, pInput);
 
     // Turn toward the enemy, or where we are going.
@@ -649,7 +664,7 @@ void botInitCommands(void)
         { "bot_count", "number of bots in the next BloodBath/Teams game (0-7)", (void *)&gBotCount, CVAR_INT|CVAR_NOSAVE, 0, kMaxPlayers-1 },
         { "bot_skill", "bot skill in the next game (0-4)", (void *)&gBotSkill, CVAR_INT|CVAR_NOSAVE, kBotSkillMin, kBotSkillMax },
         { "bot_autopilot", "debug: let bot AI control the local player too", (void *)&gBotAutopilot, CVAR_BOOL|CVAR_NOSAVE, 0, 1 },
-        { "bot_debug", "print bot state to the console every few seconds", (void *)&gBotDebug, CVAR_BOOL|CVAR_NOSAVE, 0, 1 },
+        { "bot_debug", "print bot state to the console every few seconds", (void *)&gBotDebug, CVAR_INT|CVAR_NOSAVE, 0, 3 },
         { "bot_testtime", "debug: print bot stats and quit after this many seconds of play", (void *)&gBotTestTime, CVAR_INT|CVAR_NOSAVE, 0, 36000 },
     };
     for (auto &cv : cvars_bot)

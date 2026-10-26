@@ -519,7 +519,35 @@ void botFight(BOTINFO *pBot, PLAYER *pPlayer, GINPUT *pInput, BOTMOVE *pMove, in
     int nAimDist = ClipLow(approxDist(tx-pSprite->x, ty-pSprite->y), 1);
     int nAimAng = getangle(tx-pSprite->x, ty-pSprite->y);
     int nAimSlope = divscale10(tz-pPlayer->zWeapon, nAimDist);
-    if (nWeapon == kWeaponTNT)
+
+    // Primary or alternate fire, decided per volley rather than per frame.
+    if (pBot->nAltUntil <= pBot->nFrame)
+    {
+        int nChance = botRandRange(pBot, 256);
+        bool bAlt = false;
+        switch (nWeapon)
+        {
+        case kWeaponShotgun:    // both barrels
+            bAlt = nDist < 2500 && pPlayer->ammoCount[2] >= 2;
+            break;
+        case kWeaponTommy:      // spread burst
+            bAlt = nDist < 3500 && pPlayer->ammoCount[3] >= 20;
+            break;
+        case kWeaponFlare:      // starburst flare
+            bAlt = nDist > 2000 && nDist < 9000 && pPlayer->ammoCount[1] >= 16 && nChance < 100;
+            break;
+        case kWeaponTesla:      // charged blast
+            bAlt = nDist < 8000 && pPlayer->ammoCount[7] >= 50 && nChance < 128;
+            break;
+        case kWeaponNapalm:     // napalm ball, thrown in an arc
+            bAlt = nDist > 3000 && nDist < 8000 && pPlayer->ammoCount[4] >= 12 && nChance < 100;
+            break;
+        }
+        pBot->bAltFire = bAlt;
+        pBot->nAltUntil = pBot->nFrame+kBotFPS+botRandRange(pBot, kBotFPS);
+    }
+    bool bAltFire = pBot->bAltFire;
+    if (nWeapon == kWeaponTNT || (nWeapon == kWeaponNapalm && bAltFire))
         nAimSlope -= ClipHigh(nAimDist/12, 1400);   // lob it
 
     // Aim wobble, reduced the longer we track the same target.
@@ -600,21 +628,11 @@ void botFight(BOTINFO *pBot, PLAYER *pPlayer, GINPUT *pInput, BOTMOVE *pMove, in
     }
     else if (bFire)
     {
-        bool bAlt = false;
-        switch (nWeapon)
+        if (bAltFire)
         {
-        case kWeaponShotgun:
-            bAlt = nDist < 1600 && pPlayer->ammoCount[2] >= 2;
-            break;
-        case kWeaponTommy:
-            bAlt = nDist < 2200 && pPlayer->ammoCount[3] > 50;
-            break;
-        case kWeaponTesla:
-            bAlt = nDist < 5000 && pPlayer->ammoCount[7] >= 60 && (botRand(pBot) & 15) == 0;
-            break;
-        }
-        if (bAlt)
             pInput->buttonFlags.shoot2 = 1;
+            pBot->nAltShots++;
+        }
         else
             pInput->buttonFlags.shoot = 1;
     }
@@ -650,17 +668,21 @@ void botFight(BOTINFO *pBot, PLAYER *pPlayer, GINPUT *pInput, BOTMOVE *pMove, in
     int nSide = (nAimAng+512)&kAngMask;
     int sx = mulscale30(nStrafe, Cos(nSide))>>4;
     int sy = mulscale30(nStrafe, Sin(nSide))>>4;
-    // Do not strafe into a wall.
+    // Do not strafe into a wall, nor at all on a bridge.
+    bool bBridge = botNavOnBridge(pPlayer);
     if (botNavProbe(pPlayer, getangle(sx, sy), 256) < 128)
     {
         sx = -sx;
         sy = -sy;
     }
-    pMove->dx += sx;
-    pMove->dy += sy;
+    if (!bBridge)
+    {
+        pMove->dx += sx;
+        pMove->dy += sy;
+    }
     pMove->nSpeed = 2048;
 
-    if (nDist > 600 && pPlayer->posture != kPostureSwim && pSkill->nStrafe > 128 && botRandRange(pBot, 200) == 0)
+    if (!bBridge && nDist > 600 && pPlayer->posture != kPostureSwim && pSkill->nStrafe > 128 && botRandRange(pBot, 200) == 0)
         pMove->bJump = true;
 }
 
@@ -668,6 +690,8 @@ void botDodge(BOTINFO *pBot, PLAYER *pPlayer, BOTMOVE *pMove)
 {
     const BOTSKILL *pSkill = &gBotSkillInfo[pBot->nSkill];
     spritetype *pSprite = pPlayer->pSprite;
+    if (botNavOnBridge(pPlayer))
+        return;
     for (int nSprite = headspritestat[kStatProjectile]; nSprite >= 0; nSprite = nextspritestat[nSprite])
     {
         spritetype *pMissile = &sprite[nSprite];
