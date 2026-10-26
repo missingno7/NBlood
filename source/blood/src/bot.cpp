@@ -188,7 +188,8 @@ static void botInitSlot(int nPlayer, int nSkill, int nName)
 {
     BOTINFO *pBot = &gBotInfo[nPlayer];
     memset(pBot, 0, sizeof(BOTINFO));
-    pBot->bActive = true;
+    // Only the host thinks for bots; elsewhere they are just inputs from it.
+    pBot->bActive = myconnectindex == connecthead || nPlayer == myconnectindex;
     pBot->nSkill = ClipRange(nSkill, kBotSkillMin, kBotSkillMax);
     pBot->nRand = 0x9e3779b9u ^ (gGameOptions.uMapCRC*2654435761u) ^ (uint32_t)(nPlayer*40503+1);
     if (!pBot->nRand)
@@ -248,7 +249,7 @@ void botLevelInit(void)
             botInitSlot(p, nSkill, nName++);
     }
     if (gBotAutopilot && gGameOptions.nGameType >= kGameTypeBloodBath && !gDemo.at1)
-        botInitSlot(myconnectindex, gBotSkill, -1);
+        botInitSlot(myconnectindex, kBotSkillDefault, -1); // a fixed yardstick for the bots
     if (gBotDebug >= 2 && gPlayer[myconnectindex].pSprite)
         botNavReport(&gPlayer[myconnectindex]);
     if (gBotDebug >= 3 && gPlayer[myconnectindex].pSprite)
