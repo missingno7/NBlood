@@ -39,6 +39,13 @@ If you have the GOG version of the game, do the following:
 ### Notes
 NBlood now uses nblood_cvars.cfg instead of settings.cfg. Please rename your settings.cfg if you need to retain settings from a previous version.
 
+### BloodBath bots
+Bots are ordinary players driven by AI through the same input as humans (the decision making is adapted from NetDuke32's DukeBot).
+* `nblood -bots 3 -botskill 2` opens the multiplayer setup with BOTS and BOT SKILL preset; pick a level and START GAME. Add `-map bb1.map` to start at once.
+* From the console: `bot_count 3` and `bot_skill 0-4` before starting a game (a local New Game then goes to the multiplayer setup), `addbot [skill]` and `removebot` during a local game, `botstats` for statistics.
+* Network games: the host sets the bot count in the multiplayer setup (or with `-bots`), bots run on the host and reach the clients as normal player input. Master/slave packet mode only; clients need a build with bot support.
+* Testing: `-botsim <seconds>` runs a local bot game without drawing and faster than real time, then prints statistics and quits (`bot_autopilot 1` is implied; set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy` for no window at all). `bot_debug 1-3` logs bot state, a reachability report and writes `botnav.svg`, a map of what the route search can walk. `-netlocal` makes a server listen on 127.0.0.1 only.
+
 ## PCExhumed
 A port of the PC version of Exhumed based on EDuke32.
 
