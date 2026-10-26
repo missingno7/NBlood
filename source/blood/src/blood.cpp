@@ -1265,6 +1265,7 @@ SWITCH switches[] = {
     { "botskill", 46, 1 },
     { "botsim", 47, 1 },
     { "netlocal", 48, 0 },
+    { "noinstancechecking", 49, 0 }, // handled in app_main
     { NULL, 0, 0 }
 };
 
@@ -1607,6 +1608,8 @@ void ParseOptions(void)
             break;
         case 48:
             gNetBindLocal = true;
+            break;
+        case 49:
             break;
         }
     }
