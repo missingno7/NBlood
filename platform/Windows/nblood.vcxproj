@@ -176,6 +176,9 @@
     <ClCompile Include="..\..\source\blood\src\barf.cpp" />
     <ClCompile Include="..\..\source\blood\src\blood.cpp" />
     <ClCompile Include="..\..\source\blood\src\callback.cpp" />
+    <ClCompile Include="..\..\source\blood\src\bot.cpp" />
+    <ClCompile Include="..\..\source\blood\src\botcombat.cpp" />
+    <ClCompile Include="..\..\source\blood\src\botnav.cpp" />
     <ClCompile Include="..\..\source\blood\src\choke.cpp" />
     <ClCompile Include="..\..\source\blood\src\common.cpp" />
     <ClCompile Include="..\..\source\blood\src\config.cpp" />
@@ -287,6 +290,8 @@
     <ClInclude Include="..\..\source\blood\src\barf.h" />
     <ClInclude Include="..\..\source\blood\src\blood.h" />
     <ClInclude Include="..\..\source\blood\src\callback.h" />
+    <ClInclude Include="..\..\source\blood\src\bot.h" />
+    <ClInclude Include="..\..\source\blood\src\botai.h" />
     <ClInclude Include="..\..\source\blood\src\choke.h" />
     <ClInclude Include="..\..\source\blood\src\common_game.h" />
     <ClInclude Include="..\..\source\blood\src\config.h" />

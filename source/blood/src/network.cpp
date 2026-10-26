@@ -28,6 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #endif
 #include "compat.h"
 #include "config.h"
+#include "bot.h"
 #include "controls.h"
 #include "globals.h"
 #include "network.h"
@@ -68,6 +69,8 @@ char gNetAddress[32];
 int gNetPort = kNetDefaultPort;
 
 const short kNetVersion = 0x215;
+// Games with bots announce themselves with a version older builds refuse.
+const short kNetVersionBots = 0x2b5;
 
 PKT_STARTGAME gPacketStartGame;
 
@@ -157,6 +160,7 @@ void netClientDisconnect(void)
 
 void netResetToSinglePlayer(void)
 {
+    botClearSlots();
     myconnectindex = connecthead = 0;
     gInitialNetPlayers = gNetPlayers = numplayers = 1;
     connectpoint2[0] = -1;
@@ -271,13 +275,13 @@ void netCheckSync(void)
     {
         for (int p = connecthead; p >= 0; p = connectpoint2[p])
         {
-            if (gCheckTail >= gCheckHead[p])
+            if (gCheckTail >= gCheckHead[p] && !botIsBot(p))
                 return;
         }
 
         for (int p = connecthead; p >= 0; p = connectpoint2[p])
         {
-            if (p != myconnectindex)
+            if (p != myconnectindex && !botIsBot(p))
             {
                 int status = memcmp(gCheckFifo[gCheckTail&255][p], gCheckFifo[gCheckTail&255][connecthead], 16);
                 if (status)
@@ -493,7 +497,7 @@ void netGetPackets(void)
         case 252:
             pPacket += 4;
             memcpy(&gPacketStartGame, pPacket, sizeof(PKT_STARTGAME));
-            if (gPacketStartGame.version != kNetVersion)
+            if (gPacketStartGame.version != kNetVersion && gPacketStartGame.version != kNetVersionBots)
                 ThrowError("\nThese versions of Blood cannot play together.\n");
             gStartNewGame = 1;
             break;
@@ -550,7 +554,7 @@ void netBroadcastNewGame(void)
 {
     if (numplayers < 2)
         return;
-    gPacketStartGame.version = kNetVersion;
+    gPacketStartGame.version = botStartInfoHasBots(gPacketStartGame.nBotInfo) ? kNetVersionBots : kNetVersion;
     char *pPacket = packet;
     PutPacketByte(pPacket, 252);
     PutPacketDWord(pPacket, myconnectindex);
@@ -600,7 +604,7 @@ void netWaitForEveryone(char a1)
         gameHandleEvents();
         faketimerhandler();
         for (p = connecthead; p >= 0; p = connectpoint2[p])
-            if (gPlayerReady[p] < gPlayerReady[myconnectindex])
+            if (gPlayerReady[p] < gPlayerReady[myconnectindex] && !botIsBot(p))
                 break;
         if (gRestartGame || gNetPlayers <= 1)
             break;
@@ -715,12 +719,14 @@ void netGetInput(void)
             return;
     GINPUT &input = gFifoInput[gNetFifoHead[myconnectindex]&255][myconnectindex];
     input = gNetInput;
+    botAutopilotInput(&input);
     gNetFifoHead[myconnectindex]++;
+    botGenerateInputs();
     if (gGameOptions.nGameType == kGameTypeSinglePlayer || numplayers == 1)
     {
         for (int p = connecthead; p >= 0; p = connectpoint2[p])
         {
-            if (p != myconnectindex)
+            if (p != myconnectindex && !botIsBot(p))
             {
                 GINPUT *pInput1 = &gFifoInput[(gNetFifoHead[p]-1)&255][p];
                 GINPUT *pInput2 = &gFifoInput[gNetFifoHead[p]&255][p];

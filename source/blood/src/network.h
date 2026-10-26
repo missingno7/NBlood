@@ -79,7 +79,7 @@ struct PKT_STARTGAME {
     short version;
     char gameType, difficulty, monsterSettings, weaponSettings, itemSettings, respawnSettings;
     char episodeId, levelId;
-    int unk;
+    int nBotInfo; // bot count and skill, see botPackStartInfo(); unused before bots and always 0 then
     char userMap, userMapName[BMAX_PATH];
     int weaponsV10x;
     bool bFriendlyFire;

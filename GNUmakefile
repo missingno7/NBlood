@@ -762,6 +762,9 @@ blood_game_objs := \
 	aizombf.cpp \
 	asound.cpp \
 	barf.cpp \
+	bot.cpp \
+	botcombat.cpp \
+	botnav.cpp \
 	callback.cpp \
 	choke.cpp \
 	common.cpp \

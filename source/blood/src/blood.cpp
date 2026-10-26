@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "asound.h"
 #include "db.h"
 #include "blood.h"
+#include "bot.h"
 #include "choke.h"
 #include "config.h"
 #include "controls.h"
@@ -749,6 +750,7 @@ void StartLevel(GAMEOPTIONS *pOpt)
     warpInit();
     actInit(false);
     evInit();
+    botSetupSlots(pOpt->nGameType >= kGameTypeBloodBath ? gPacketStartGame.nBotInfo : 0);
     for (int i = connecthead; i >= 0; i = connectpoint2[i])
     {
         if (!(pOpt->uGameFlags&kGameFlagContinuing)) // if new game
@@ -791,6 +793,7 @@ void StartLevel(GAMEOPTIONS *pOpt)
             pPlayer->lastWeapon = gPlayerTemp[i].lastWeapon;
         }
     }
+    botLevelInit();
     pOpt->uGameFlags &= ~(kGameFlagContinuing|kGameFlagEnding);
     scrSetDac();
     PreloadCache();
@@ -1258,6 +1261,8 @@ SWITCH switches[] = {
     { "conf", 43, 1 },
     { "noconsole", 43, 0 },
     { "s", 44, 1 },
+    { "bots", 45, 1 },
+    { "botskill", 46, 1 },
     { NULL, 0, 0 }
 };
 
@@ -1269,6 +1274,8 @@ void PrintHelp(void)
         "Files can be of type [grp|zip|map|def]\n"
         "\n"
         "-art [file.art]\tSpecify an art base file name\n"
+        "-bots [count]\tPlay BloodBath against this many bots (1-7)\n"
+        "-botskill [0-4]\tSkill of the bots; Default:2\n"
         "-cachesize #\tSet cache size in kB\n"
         "-cfg [file.cfg]\tUse an alternate configuration file\n"
         "-client [host]\tConnect to a multiplayer game\n"
@@ -1577,6 +1584,16 @@ void ParseOptions(void)
             gGameOptions.nDifficultyQuantity = gSkill;
             gGameOptions.nDifficultyHealth = gSkill;
             break;
+        case 45:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gBotCount = ClipRange(atoi(OptArgv[0]), 0, kMaxPlayers-1);
+            break;
+        case 46:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gBotSkill = ClipRange(atoi(OptArgv[0]), kBotSkillMin, kBotSkillMax);
+            break;
         }
     }
 #if 0
@@ -1727,6 +1744,7 @@ int app_main(int argc, char const * const * argv)
     OSD_SetVersion("Blood", 10, 0);
     OSD_SetParameters(0, 0, 0, 12, 2, 12, OSD_ERROR, OSDTEXT_RED, OSDTEXT_DARKRED, gamefunctions[gamefunc_Show_Console][0] == '\0' ? OSD_PROTECTED : 0);
     registerosdcommands();
+    botInitCommands();
 
     auto const hasSetupFilename = strcmp(SetupFilename, SETUPFILENAME);
 
@@ -1843,10 +1861,30 @@ int app_main(int argc, char const * const * argv)
     sndInit();
     sfxInit();
     gChoke.Init(518, playerHandChoke);
+    if (gBotCount > 0 && gNetMode == NETWORK_NONE)
+        gGameOptions.nGameType = kGameTypeBloodBath;
     if (bAddUserMap)
     {
         levelAddUserMap(gUserMapFilename);
         gStartNewGame = 1;
+        if (gGameOptions.nGameType != kGameTypeSinglePlayer && gNetMode == NETWORK_NONE)
+        {
+            // Same defaults as the multiplayer menu.
+            gPacketStartGame.gameType = gGameOptions.nGameType;
+            gPacketStartGame.episodeId = gGameOptions.nEpisode;
+            gPacketStartGame.levelId = gGameOptions.nLevel;
+            gPacketStartGame.difficulty = 2;
+            gPacketStartGame.monsterSettings = 0;
+            gPacketStartGame.weaponSettings = 1;
+            gPacketStartGame.itemSettings = 1;
+            gPacketStartGame.respawnSettings = 0;
+            gPacketStartGame.bFriendlyFire = true;
+            gPacketStartGame.bPlayerKeys = PLAYERKEYSMODE::LOSTONDEATH;
+            gPacketStartGame.weaponsV10x = 0;
+            gPacketStartGame.nBotInfo = botPackStartInfo();
+            Bstrncpyz(gPacketStartGame.userMapName, gUserMapFilename, sizeof(gPacketStartGame.userMapName));
+            gPacketStartGame.userMap = 1;
+        }
     }
     SetupMenus();
     videoSetViewableArea(0, 0, xdim - 1, ydim - 1);

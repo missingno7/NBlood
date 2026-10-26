@@ -26,6 +26,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "fx_man.h"
 #include "music.h"
 #include "blood.h"
+#include "bot.h"
 #include "demo.h"
 #include "config.h"
 #include "gamemenu.h"
@@ -2896,7 +2897,7 @@ void StartNetGame(CGameMenuItemChain *pItem)
     ////
     gPacketStartGame.weaponsV10x = itemNetStart10.at20;
     ////
-    gPacketStartGame.unk = 0;
+    gPacketStartGame.nBotInfo = botPackStartInfo();
     Bstrncpy(gPacketStartGame.userMapName, zUserMapName, sizeof(zUserMapName));
     gPacketStartGame.userMap = gPacketStartGame.userMapName[0] != 0;
 
