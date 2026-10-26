@@ -64,6 +64,7 @@ bool bOutOfSync = false;
 bool ready2send = false;
 
 NETWORKMODE gNetMode = NETWORK_NONE;
+bool gNetBindLocal = false; // -netlocal: serve on the loopback interface only
 char gNetAddress[32];
 // PORT-TODO: Use different port?
 int gNetPort = kNetDefaultPort;
@@ -294,6 +295,7 @@ void netCheckSync(void)
                             pBuffer += sprintf(pBuffer, " %d", i);
                     }
                     viewSetErrorMessage(buffer);
+                    LOG_F(WARNING, "%s at frame %d", buffer, gCheckTail*8);
                     bOutOfSync = 1;
                 }
             }
@@ -719,7 +721,7 @@ void netGetInput(void)
             return;
     GINPUT &input = gFifoInput[gNetFifoHead[myconnectindex]&255][myconnectindex];
     input = gNetInput;
-    botAutopilotInput(&input);
+    botLocalInput(&input);
     gNetFifoHead[myconnectindex]++;
     botGenerateInputs();
     if (gGameOptions.nGameType == kGameTypeSinglePlayer || numplayers == 1)
@@ -904,6 +906,8 @@ void netInitialize(bool bConsole)
         memset(gNetPlayerPeer, 0, sizeof(gNetPlayerPeer));
         ENetEvent event;
         gNetENetAddress.host = ENET_HOST_ANY;
+        if (gNetBindLocal)
+            enet_address_set_host(&gNetENetAddress, "127.0.0.1");
         gNetENetAddress.port = gNetPort;
         gNetENetServer = enet_host_create(&gNetENetAddress, 8, BLOOD_ENET_CHANNEL_MAX, 0, 0);
         if (!gNetENetServer)

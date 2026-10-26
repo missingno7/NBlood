@@ -1263,6 +1263,8 @@ SWITCH switches[] = {
     { "s", 44, 1 },
     { "bots", 45, 1 },
     { "botskill", 46, 1 },
+    { "botsim", 47, 1 },
+    { "netlocal", 48, 0 },
     { NULL, 0, 0 }
 };
 
@@ -1276,6 +1278,7 @@ void PrintHelp(void)
         "-art [file.art]\tSpecify an art base file name\n"
         "-bots [count]\tPlay BloodBath against this many bots (1-7)\n"
         "-botskill [0-4]\tSkill of the bots; Default:2\n"
+        "-botsim [seconds]\tTest: bots only, no drawing, faster than real time\n"
         "-cachesize #\tSet cache size in kB\n"
         "-cfg [file.cfg]\tUse an alternate configuration file\n"
         "-client [host]\tConnect to a multiplayer game\n"
@@ -1594,6 +1597,17 @@ void ParseOptions(void)
                 ThrowError("Missing argument");
             gBotSkill = ClipRange(atoi(OptArgv[0]), kBotSkillMin, kBotSkillMax);
             break;
+        case 47:
+            if (OptArgc < 1)
+                ThrowError("Missing argument");
+            gBotSimTime = gBotTestTime = ClipRange(atoi(OptArgv[0]), 1, 36000);
+            gBotAutopilot = 1;
+            bQuickStart = 1;
+            bNoDemo = 1;
+            break;
+        case 48:
+            gNetBindLocal = true;
+            break;
         }
     }
 #if 0
@@ -1852,6 +1866,14 @@ int app_main(int argc, char const * const * argv)
 
     LOG_F(INFO, "Initializing network users");
     netInitialize(true);
+    if (gBotSimTime)
+    {
+        // Nothing is drawn: smallest window, software renderer.
+        gSetup.fullscreen = 0;
+        gSetup.xdim = 320;
+        gSetup.ydim = 200;
+        gSetup.bpp = 8;
+    }
     scrSetGameMode(gSetup.fullscreen, gSetup.xdim, gSetup.ydim, gSetup.bpp);
     scrSetGamma(gGamma);
     gGameMessageMgr.SetState(gMessageState);
@@ -1867,7 +1889,7 @@ int app_main(int argc, char const * const * argv)
     {
         levelAddUserMap(gUserMapFilename);
         gStartNewGame = 1;
-        if (gGameOptions.nGameType != kGameTypeSinglePlayer && gNetMode == NETWORK_NONE)
+        if (gGameOptions.nGameType != kGameTypeSinglePlayer && gNetMode != NETWORK_CLIENT)
         {
             // Same defaults as the multiplayer menu.
             gPacketStartGame.gameType = gGameOptions.nGameType;
@@ -1884,6 +1906,7 @@ int app_main(int argc, char const * const * argv)
             gPacketStartGame.nBotInfo = botPackStartInfo();
             Bstrncpyz(gPacketStartGame.userMapName, gUserMapFilename, sizeof(gPacketStartGame.userMapName));
             gPacketStartGame.userMap = 1;
+            netBroadcastNewGame();
         }
     }
     SetupMenus();
@@ -1940,6 +1963,25 @@ RESTART:
     while (!gQuitGame)
     {
         bool bDraw;
+        if (gGameStarted && gBotSimTime && numplayers == 1)
+        {
+            // -botsim: run frames back to back and draw nothing.
+            for (int i = 0; i < kTicsPerSec && !gQuitGame && !gStartNewGame; i++)
+            {
+                if (gEndGameMgr.at0)
+                    gEndGameMgr.Finish();
+                gNetInput = {};
+                netGetInput();
+                gNetFifoClock += kTicsPerFrame;
+                while (gNetFifoHead[myconnectindex]-gNetFifoTail > 0 && !gStartNewGame && !gQuitGame)
+                    ProcessFrame();
+            }
+            totalclock = gNetFifoClock;
+            gameHandleEvents();
+            if (gStartNewGame)
+                StartLevel(&gGameOptions);
+            continue;
+        }
         if (gGameStarted)
         {
             char gameUpdate = false;

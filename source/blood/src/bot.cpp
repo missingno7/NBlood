@@ -42,6 +42,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gameutil.h"
 #include "globals.h"
 #include "levels.h"
+#include "menu.h"
 #include "network.h"
 #include "player.h"
 #include "seq.h"
@@ -54,6 +55,7 @@ int32_t gBotSkill = kBotSkillDefault;
 int32_t gBotAutopilot = 0;
 int32_t gBotDebug = 0;
 int32_t gBotTestTime = 0;
+int32_t gBotSimTime = 0;
 uint8_t gBotSlots = 0;
 
 BOTINFO gBotInfo[kMaxPlayers];
@@ -193,7 +195,8 @@ static void botInitSlot(int nPlayer, int nSkill, int nName)
         pBot->nRand = 1;
     pBot->nTarget = -1;
     pBot->nItem = -1;
-    pBot->nLastItem = -1;
+    for (int i = 0; i < ARRAY_SSIZE(pBot->nBadItem); i++)
+        pBot->nBadItem[i] = -1;
     pBot->nHurtBy = -1;
     pBot->nRoamSect = -1;
     botNavReset(pBot);
@@ -272,12 +275,16 @@ static void botPrintStats(void)
     for (int p = connecthead; p >= 0; p = connectpoint2[p])
     {
         if (!gBotInfo[p].bActive)
+        {
+            // Not thought for here (a human, or a bot on a client): game state only.
+            OSD_Printf("  %d %-10s frags %3d%s\n", p, gProfile[p].name, gPlayer[p].fragCount, botIsBot(p) ? " (bot)" : "");
             continue;
+        }
         BOTSTATS *pStats = &botStats[p];
         PLAYER *pPlayer = &gPlayer[p];
-        OSD_Printf("  %d %-10s frags %3d deaths %3d sectors %4d distance %7d escapes %3d weapon %d health %d\n",
+        OSD_Printf("  %d %-10s frags %3d deaths %3d sectors %4d distance %7d escapes %3d avoids %3d weapon %d health %d\n",
             p, gProfile[p].name, pPlayer->fragCount, pStats->nDeaths, pStats->nSectors, pStats->nDistance,
-            pStats->nEscapes, pPlayer->curWeapon, pPlayer->pXSprite->health>>4);
+            pStats->nEscapes, gBotInfo[p].nAvoids, pPlayer->curWeapon, pPlayer->pXSprite->health>>4);
     }
 }
 
@@ -318,7 +325,6 @@ static void botThink(int nPlayer, GINPUT *pInput)
         pBot->nRespawnWait = 0;
         pBot->nTarget = -1;
         pBot->nItem = -1;
-        pBot->nLastItem = -1;
         pBot->nRoamSect = -1;
         pBot->nFireFrames = 0;
         botNavReset(pBot);
@@ -419,7 +425,19 @@ static void botThink(int nPlayer, GINPUT *pInput)
                 gy = cy/nWalls;
             }
         }
-        botNavMove(pBot, pPlayer, gx, gy, gz, gs, &move);
+        if (!botNavMove(pBot, pPlayer, gx, gy, gz, gs, &move))
+        {
+            // No way there for now: want something else.
+            if (pItem && gs == pItem->sectnum)
+                botGiveUpItem(pBot);
+            else if (bHunt && pBot->nTarget >= 0)
+            {
+                pBot->nSeenFrame[pBot->nTarget] = 0;
+                pBot->nTarget = -1;
+            }
+            else
+                pBot->nRoamSect = -1;
+        }
         if (bHunt && approxDist(gx-pSprite->x, gy-pSprite->y) < 5000 && move.nFaceAng < 0)
             move.nFaceAng = getangle(gx-pSprite->x, gy-pSprite->y);
         int nExpect = pBot->nTarget >= 0 ? approxDist(gx-pSprite->x, gy-pSprite->y) : 3000;
@@ -500,16 +518,16 @@ void botGenerateInputs(void)
             gNetFifoHead[p]++;
         }
     }
+}
+
+void botLocalInput(GINPUT *pInput)
+{
     if (gBotTestTime > 0 && gGameStarted && gLevelTime >= gBotTestTime*kBotFPS)
     {
         botPrintStats();
         gBotTestTime = 0;
         gQuitGame = true;
     }
-}
-
-void botAutopilotInput(GINPUT *pInput)
-{
     if (!gBotAutopilot || !gBotInfo[myconnectindex].bActive || gDemo.at1)
         return;
     KEYFLAGS keep = pInput->keyFlags;
@@ -605,6 +623,25 @@ static int osdcmd_botstats(osdcmdptr_t UNUSED(parm))
     return OSDCMD_OK;
 }
 
+// Setting bot_count from the console outside a game turns the local
+// "New Game" into a BloodBath setup, as -bots does on the command line.
+static int botCvarSet(osdcmdptr_t parm)
+{
+    int nResult = osdcmd_cvar_set(parm);
+    if (nResult != OSDCMD_OK || parm->numparms < 1)
+        return nResult;
+    if (!Bstrcasecmp(parm->name, "bot_count") || !Bstrcasecmp(parm->name, "bot_skill"))
+    {
+        MenuSetBotOptions(gBotCount, gBotSkill);
+        if (!Bstrcasecmp(parm->name, "bot_count") && gNetMode == NETWORK_NONE && !gGameStarted)
+        {
+            gGameOptions.nGameType = gBotCount > 0 ? kGameTypeBloodBath : kGameTypeSinglePlayer;
+            UpdateNetworkMenus();
+        }
+    }
+    return nResult;
+}
+
 void botInitCommands(void)
 {
     static osdcvardata_t cvars_bot[] =
@@ -616,7 +653,7 @@ void botInitCommands(void)
         { "bot_testtime", "debug: print bot stats and quit after this many seconds of play", (void *)&gBotTestTime, CVAR_INT|CVAR_NOSAVE, 0, 36000 },
     };
     for (auto &cv : cvars_bot)
-        OSD_RegisterCvar(&cv, osdcmd_cvar_set);
+        OSD_RegisterCvar(&cv, botCvarSet);
     OSD_RegisterFunction("addbot", "addbot [skill]: adds a bot to the current local BloodBath game", osdcmd_addbot);
     OSD_RegisterFunction("removebot", "removebot: removes a bot from the current local game", osdcmd_removebot);
     OSD_RegisterFunction("botstats", "botstats: prints bot statistics", osdcmd_botstats);

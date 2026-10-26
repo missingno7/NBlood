@@ -392,6 +392,19 @@ static bool botCanSeeItem(PLAYER *pPlayer, spritetype *pItem)
     return cansee(pSprite->x, pSprite->y, pPlayer->zView, pSprite->sectnum, pItem->x, pItem->y, pItem->z-(4<<8), pItem->sectnum) != 0;
 }
 
+void botGiveUpItem(BOTINFO *pBot)
+{
+    if (pBot->nItem < 0)
+        return;
+    int i = pBot->nBadHead++ % ARRAY_SSIZE(pBot->nBadItem);
+    pBot->nBadItem[i] = pBot->nItem;
+    pBot->nBadUntil[i] = pBot->nFrame+kBotFPS*20;
+    pBot->nItem = -1;
+    pBot->nItemScore = 0;
+    pBot->nItemFail = 0;
+    pBot->nItemCooldown = kBotFPS/2;
+}
+
 void botUpdateItemGoal(BOTINFO *pBot, PLAYER *pPlayer, bool bNeedy)
 {
     spritetype *pSprite = pPlayer->pSprite;
@@ -399,14 +412,14 @@ void botUpdateItemGoal(BOTINFO *pBot, PLAYER *pPlayer, bool bNeedy)
         pBot->nItemCooldown--;
     if (pBot->nItem >= 0)
     {
-        if (!botItemValid(pBot->nItem) || pBot->nItemFail > kBotFPS*6 || botItemScore(pPlayer, &sprite[pBot->nItem]) <= 0)
+        if (!botItemValid(pBot->nItem) || botItemScore(pPlayer, &sprite[pBot->nItem]) <= 0)
         {
-            pBot->nLastItem = pBot->nItem;
             pBot->nItem = -1;
             pBot->nItemScore = 0;
             pBot->nItemFail = 0;
-            pBot->nItemCooldown = kBotFPS/2;
         }
+        else if (pBot->nItemFail > kBotFPS*6)
+            botGiveUpItem(pBot);
     }
     if (pBot->nItemCooldown > 0)
         return;
@@ -417,7 +430,12 @@ void botUpdateItemGoal(BOTINFO *pBot, PLAYER *pPlayer, bool bNeedy)
     int nCandValue[4] = { 0, 0, 0, 0 };
     for (int nSprite = headspritestat[kStatItem]; nSprite >= 0; nSprite = nextspritestat[nSprite])
     {
-        if (nSprite == pBot->nLastItem || !botItemValid(nSprite))
+        if (!botItemValid(nSprite))
+            continue;
+        bool bBad = false;
+        for (int i = 0; i < ARRAY_SSIZE(pBot->nBadItem); i++)
+            bBad |= pBot->nBadItem[i] == nSprite && pBot->nBadUntil[i] > pBot->nFrame;
+        if (bBad)
             continue;
         spritetype *pItem = &sprite[nSprite];
         int nScore = botItemScore(pPlayer, pItem);

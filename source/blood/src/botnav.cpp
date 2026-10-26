@@ -89,11 +89,15 @@ static bool botAvoided(BOTNAV *pNav, int nWall, int nFrame)
     return false;
 }
 
-static void botAvoid(BOTINFO *pBot, int nWall)
+static void botAvoid(BOTINFO *pBot, int nWall, const char *pzWhy)
 {
     BOTNAV *pNav = &pBot->nav;
     if (nWall < 0)
         return;
+    pBot->nAvoids++;
+    if (gBotDebug)
+        OSD_Printf("bot %d: avoiding wall %d (sector %d -> %d, flags %d): %s\n", int(pBot-gBotInfo), nWall,
+            sectorofwall(nWall), (int)wall[nWall].nextsector, pNav->nPortalFlags, pzWhy);
     int i = pNav->nAvoidHead++ % ARRAY_SSIZE(pNav->nAvoidWall);
     pNav->nAvoidWall[i] = nWall;
     pNav->nAvoidUntil[i] = pBot->nFrame+kBotAvoidFrames;
@@ -527,13 +531,43 @@ static void botCheckProgress(BOTINFO *pBot, PLAYER *pPlayer, BOTMOVE *pMove)
         break;
     default:
         // This portal does not work for us at the moment.
-        botAvoid(pBot, pNav->nPortal);
+        botAvoid(pBot, pNav->nPortal, "no progress");
         pNav->nStuck = 0;
         break;
     }
 }
 
-void botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector, BOTMOVE *pMove)
+// What the route search sees around a bot that cannot get out of a sector.
+static void botNavDump(BOTINFO *pBot, PLAYER *pPlayer, const BOTBODY *pBody, int nGoal, const char *pzWhy)
+{
+    if (!gBotDebug)
+        return;
+    spritetype *pSprite = pPlayer->pSprite;
+    BOTNAV *pNav = &pBot->nav;
+    int nSector = pSprite->sectnum;
+    sectortype *pSector = &sector[nSector];
+    OSD_Printf("bot %d nav (%s): at %d,%d,%d sector %d (type %d floor %d ceil %d) goal %d next %d portal %d flags %d\n",
+        pPlayer->nPlayer, pzWhy, (int)pSprite->x, (int)pSprite->y, (int)pSprite->z, nSector, (int)pSector->type,
+        (int)pSector->floorz, (int)pSector->ceilingz, nGoal, pNav->nNextSect, pNav->nPortal, pNav->nPortalFlags);
+    OSD_Printf("  body radius %d height %d crouch %d floordist %d ceildist %d\n",
+        pBody->nRadius, pBody->nHeight, pBody->nCrouchHeight, pBody->nFloorDist, pBody->nCeilDist);
+    for (int nWall = pSector->wallptr; nWall < pSector->wallptr+pSector->wallnum; nWall++)
+    {
+        int nNext = wall[nWall].nextsector;
+        if (nNext < 0)
+            continue;
+        int x = (wall[nWall].x+wall[wall[nWall].point2].x)>>1;
+        int y = (wall[nWall].y+wall[wall[nWall].point2].y)>>1;
+        int nFromCeil, nFromFloor, nToCeil, nToFloor;
+        getzsofslope(nSector, x, y, &nFromCeil, &nFromFloor);
+        getzsofslope(nNext, x, y, &nToCeil, &nToFloor);
+        OSD_Printf("  wall %d -> %d cstat %d flags %d rise %d window %d nexttype %d\n", nWall, nNext, (int)wall[nWall].cstat,
+            botPortalFlags(pBody, nSector, nWall, nNext), nFromFloor-nToFloor,
+            ClipHigh(nFromFloor, nToFloor)-ClipLow(nFromCeil, nToCeil), (int)sector[nNext].type);
+    }
+}
+
+bool botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector, BOTMOVE *pMove)
 {
     spritetype *pSprite = pPlayer->pSprite;
     BOTNAV *pNav = &pBot->nav;
@@ -549,7 +583,7 @@ void botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
         pMove->dy = Sin(pNav->nEscapeAng)>>16;
         if (pNav->nEscape == 4)
             pMove->bJump = true;
-        return;
+        return true;
     }
 
     int tx = x, ty = y;     // where we head
@@ -593,6 +627,26 @@ void botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
                 tx = ax = cx;
                 ty = ay = cy;
             }
+            // Moving about without ever leaving the sector: this way does
+            // not work for us right now.
+            if (pNav->nStallSect != nCur)
+            {
+                pNav->nStallSect = nCur;
+                pNav->nStallFrames = 0;
+            }
+            else if (++pNav->nStallFrames > kBotFPS*10)
+            {
+                botNavDump(pBot, pPlayer, &body, nSector, "stalled");
+                botAvoid(pBot, pNav->nPortal, "stalled in sector");
+                pNav->nStallFrames = 0;
+            }
+        }
+        else
+        {
+            if (pNav->nRouteFrame == pBot->nFrame)
+                botNavDump(pBot, pPlayer, &body, nSector, "no route");
+            botCheckProgress(pBot, pPlayer, pMove);
+            return false;
         }
     }
 
@@ -639,10 +693,10 @@ void botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
                 pNav->nCheckFrame = pBot->nFrame;
                 if (pNav->nDoorWait > kBotFPS*((nFlags & kBotPortalLift) ? 10 : 5))
                 {
-                    botAvoid(pBot, pNav->nPortal);
+                    botAvoid(pBot, pNav->nPortal, "did not open");
                     pNav->nDoorWait = 0;
                 }
-                return;
+                return true;
             }
             if (bOpen)
                 pNav->nDoorWait = 0;
@@ -663,6 +717,7 @@ void botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector
     }
 
     botCheckProgress(pBot, pPlayer, pMove);
+    return true;
 }
 
 // Somewhere worth a look: sectors holding pickups or start spots, chosen at

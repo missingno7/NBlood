@@ -60,5 +60,6 @@ extern char zUserMapName[BMAX_PATH];
 void drawLoadingScreen(int nTile);
 void SetupMenus(void);
 void UpdateNetworkMenus(void);
+void MenuSetBotOptions(int nCount, int nSkill);
 void QuickSaveGame(void);
 void QuickLoadGame(void);

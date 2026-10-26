@@ -77,6 +77,9 @@ struct BOTNAV
     // Local steering memory, keeps detours from flip-flopping.
     int nSteerAng;
     int nSteerUntil;
+    // Time spent trying to leave the current sector along the route.
+    int nStallSect;
+    int nStallFrames;
 };
 
 struct BOTINFO
@@ -101,7 +104,9 @@ struct BOTINFO
     // Pickups.
     int nItem;
     int nItemScore;
-    int nLastItem;
+    int nBadItem[4];            // pickups we failed to reach, ignored for a while
+    int nBadUntil[4];
+    int nBadHead;
     int nItemFail;
     int nItemCooldown;
 
@@ -121,6 +126,7 @@ struct BOTINFO
     int nStrafeSign;
     int nStrafeUntil;
     int nJumpWait;
+    int nAvoids;
 
     BOTNAV nav;
 };
@@ -148,7 +154,8 @@ void botGetExtents(PLAYER *pPlayer, int *pTop, int *pBottom);
 
 // botnav.cpp
 void botNavReset(BOTINFO *pBot);
-void botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector, BOTMOVE *pMove);
+// Returns false when there is currently no known way to nSector.
+bool botNavMove(BOTINFO *pBot, PLAYER *pPlayer, int x, int y, int z, int nSector, BOTMOVE *pMove);
 int botNavProbe(PLAYER *pPlayer, int nAng, int nDist, int *pHit = NULL);
 int botNavRoamSector(BOTINFO *pBot, PLAYER *pPlayer);
 bool botNavReachable(PLAYER *pPlayer, int nSector);
@@ -157,6 +164,7 @@ bool botNavReachable(PLAYER *pPlayer, int nSector);
 bool botCanSeePlayer(PLAYER *pPlayer, PLAYER *pOther);
 void botUpdateTargets(BOTINFO *pBot, PLAYER *pPlayer);
 void botUpdateItemGoal(BOTINFO *pBot, PLAYER *pPlayer, bool bNeedy);
+void botGiveUpItem(BOTINFO *pBot);
 bool botNeedsItems(PLAYER *pPlayer);
 void botFight(BOTINFO *pBot, PLAYER *pPlayer, GINPUT *pInput, BOTMOVE *pMove, int *pAimAng, int *pAimSlope);
 void botSelectWeapon(BOTINFO *pBot, PLAYER *pPlayer, GINPUT *pInput, int nDist);

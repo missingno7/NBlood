@@ -48,6 +48,9 @@ extern int32_t gBotSkill;
 // Debug: let the AI drive the local player too (bot-versus-bot smoke tests).
 extern int32_t gBotAutopilot;
 extern int32_t gBotDebug;
+extern int32_t gBotTestTime;
+// -botsim: simulate without drawing, as fast as possible.
+extern int32_t gBotSimTime;
 
 // Bit n set: slot n is occupied by a bot in the current game. Identical on
 // all peers, derived from the start-game packet.
@@ -70,8 +73,8 @@ void botSetupSlots(int nInfo);
 void botLevelInit(void);
 // Host only: put this frame's input for every bot into the FIFO.
 void botGenerateInputs(void);
-// bot_autopilot: replace the local player's input with the AI's.
-void botAutopilotInput(GINPUT *pInput);
+// Every peer, every input frame: bot_autopilot and bot_testtime.
+void botLocalInput(GINPUT *pInput);
 // Remove all bot slots (leaving a game, returning to single player).
 void botClearSlots(void);
 

@@ -142,6 +142,11 @@ const char *zWeaponStrings[] =
     "Respawn with Markers",
 };
 
+const char *zBotCountStrings[] =
+{
+    "NONE", "1", "2", "3", "4", "5", "6", "7",
+};
+
 const char *zItemStrings[] =
 {
     "Do not Respawn",
@@ -334,17 +339,19 @@ CGameMenuItemTitle itemNetStartUserMapTitle("USER MAP", 1, 160, 20, 2038);
 CGameMenuFileSelect menuMultiUserMap("", 3, 0, 0, 0, "./", "*.map", zUserMapName);
 
 CGameMenuItemMultiplayerTitle itemNetStartTitle("MULTIPLAYER", 1, 160, 20, 2038);
-CGameMenuItemZCycle itemNetStart1("GAME:", 3, 66, 60, 180, 0, 0, zNetGameTypes, 3, 0);
-CGameMenuItemZCycle itemNetStart2("EPISODE:", 3, 66, 70, 180, 0, SetupNetLevels, NULL, 0, 0);
-CGameMenuItemZCycle itemNetStart3("LEVEL:", 3, 66, 80, 180, 0, ClearUserMapNameOnLevelChange, NULL, 0, 0);
-CGameMenuItemZCycle itemNetStart4("DIFFICULTY:", 3, 66, 90, 180, 0, 0, zDiffStrings, 5, 0);
-CGameMenuItemZCycle itemNetStart5("MONSTERS:", 3, 66, 100, 180, 0, 0, zMonsterStrings, 3, 0);
-CGameMenuItemZCycle itemNetStart6("WEAPONS:", 3, 66, 110, 180, 0, 0, zWeaponStrings, 4, 0);
-CGameMenuItemZCycle itemNetStart7("ITEMS:", 3, 66, 120, 180, 0, 0, zItemStrings, 3, 0);
-CGameMenuItemZBool itemNetStart8("FRIENDLY FIRE:", 3, 66, 130, 180, true, 0, NULL, NULL);
-CGameMenuItemZCycle itemNetStart9("PLAYER KEYS:", 3, 66, 140, 180, 0, 0, zPlayerKeysStrings, 3, 0);
-CGameMenuItemZBool itemNetStart10("V1.0x WEAPONS BALANCE:", 3, 66, 150, 180, false, 0, NULL, NULL);
-CGameMenuItemChain itemNetStart11("USER MAP", 3, 66, 160, 180, 0, &menuMultiUserMaps, 0, NULL, 0);
+CGameMenuItemZCycle itemNetStart1("GAME:", 3, 66, 40, 180, 0, 0, zNetGameTypes, 3, 0);
+CGameMenuItemZCycle itemNetStart2("EPISODE:", 3, 66, 50, 180, 0, SetupNetLevels, NULL, 0, 0);
+CGameMenuItemZCycle itemNetStart3("LEVEL:", 3, 66, 60, 180, 0, ClearUserMapNameOnLevelChange, NULL, 0, 0);
+CGameMenuItemZCycle itemNetStart4("DIFFICULTY:", 3, 66, 70, 180, 0, 0, zDiffStrings, 5, 0);
+CGameMenuItemZCycle itemNetStart5("MONSTERS:", 3, 66, 80, 180, 0, 0, zMonsterStrings, 3, 0);
+CGameMenuItemZCycle itemNetStart6("WEAPONS:", 3, 66, 90, 180, 0, 0, zWeaponStrings, 4, 0);
+CGameMenuItemZCycle itemNetStart7("ITEMS:", 3, 66, 100, 180, 0, 0, zItemStrings, 3, 0);
+CGameMenuItemZBool itemNetStart8("FRIENDLY FIRE:", 3, 66, 110, 180, true, 0, NULL, NULL);
+CGameMenuItemZCycle itemNetStart9("PLAYER KEYS:", 3, 66, 120, 180, 0, 0, zPlayerKeysStrings, 3, 0);
+CGameMenuItemZBool itemNetStart10("V1.0x WEAPONS BALANCE:", 3, 66, 130, 180, false, 0, NULL, NULL);
+CGameMenuItemChain itemNetStart11("USER MAP", 3, 66, 140, 180, 0, &menuMultiUserMaps, 0, NULL, 0);
+CGameMenuItemZCycle itemNetStartBots("BOTS:", 3, 66, 150, 180, 0, 0, zBotCountStrings, kMaxPlayers, 0);
+CGameMenuItemZCycle itemNetStartBotSkill("BOT SKILL:", 3, 66, 160, 180, 0, 0, zDiffStrings, 5, 0);
 CGameMenuItemChain itemNetStart12("START GAME", 1, 66, 175, 280, 0, 0, -1, StartNetGame, 0);
 
 CGameMenuItemText itemLoadingText("LOADING...", 1, 160, 100, 1);
@@ -1071,6 +1078,8 @@ void SetupNetStartMenu(void)
     menuNetStart.Add(&itemNetStart9, false);
     menuNetStart.Add(&itemNetStart10, false);
     menuNetStart.Add(&itemNetStart11, false);
+    menuNetStart.Add(&itemNetStartBots, false);
+    menuNetStart.Add(&itemNetStartBotSkill, false);
     menuNetStart.Add(&itemNetStart12, false);
     menuMultiUserMaps.Add(&itemNetStartUserMapTitle, true);
     menuMultiUserMaps.Add(&menuMultiUserMap, true);
@@ -1079,6 +1088,8 @@ void SetupNetStartMenu(void)
     itemNetStart5.SetTextIndex(0);
     itemNetStart6.SetTextIndex(1);
     itemNetStart7.SetTextIndex(1);
+    itemNetStartBots.SetTextIndex(ClipRange(gBotCount, 0, kMaxPlayers-1));
+    itemNetStartBotSkill.SetTextIndex(ClipRange(gBotSkill, kBotSkillMin, kBotSkillMax));
     menuNetStart.Add(&itemBloodQAV, false);
 }
 
@@ -1669,6 +1680,12 @@ void SetupMenus(void)
     SetupControlsMenu();
     SetupJoystickMenu();
     SetupNetworkMenu();
+}
+
+void MenuSetBotOptions(int nCount, int nSkill)
+{
+    itemNetStartBots.SetTextIndex(ClipRange(nCount, 0, kMaxPlayers-1));
+    itemNetStartBotSkill.SetTextIndex(ClipRange(nSkill, kBotSkillMin, kBotSkillMax));
 }
 
 void UpdateNetworkMenus(void)
@@ -2897,6 +2914,8 @@ void StartNetGame(CGameMenuItemChain *pItem)
     ////
     gPacketStartGame.weaponsV10x = itemNetStart10.at20;
     ////
+    gBotCount = itemNetStartBots.m_nFocus;
+    gBotSkill = itemNetStartBotSkill.m_nFocus;
     gPacketStartGame.nBotInfo = botPackStartInfo();
     Bstrncpy(gPacketStartGame.userMapName, zUserMapName, sizeof(zUserMapName));
     gPacketStartGame.userMap = gPacketStartGame.userMapName[0] != 0;
